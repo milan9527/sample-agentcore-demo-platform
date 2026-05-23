@@ -97,8 +97,8 @@ const envSchema = z.object({
   LITELLM_BASE_URL: z.string().optional(),
   LITELLM_API_KEY: z.string().optional(),
 
-  // Agent Runtime selection: "claude" (default), "agentcore", or "openclaw"
-  AGENT_RUNTIME: z.enum(['claude', 'agentcore', 'openclaw']).optional().default('claude'),
+  // Agent Runtime selection: "claude" (default), "agentcore", "openclaw", or "berriai"
+  AGENT_RUNTIME: z.enum(['claude', 'agentcore', 'openclaw', 'berriai']).optional().default('claude'),
 
   // Process role: controls which components start in this process.
   // "all" (default) = API + workers + gateways (single-process, local dev / EC2)
@@ -109,6 +109,14 @@ const envSchema = z.object({
 
   // OpenClaw on AgentCore (when AGENT_RUNTIME=openclaw)
   OPENCLAW_AGENTCORE_RUNTIME_ARN: z.string().optional(),
+
+  // BerriAI litellm-agent-platform (self-hosted K8s sandbox, when AGENT_RUNTIME=berriai)
+  BERRIAI_API_URL: z.string().optional(),
+  BERRIAI_API_KEY: z.string().optional(),
+  BERRIAI_NAMESPACE: z.string().optional().default('agent-sandboxes'),
+  BERRIAI_SANDBOX_IMAGE: z.string().optional(),
+  BERRIAI_TIMEOUT_SECONDS: z.string().optional().default('3600').transform(Number),
+  BERRIAI_WORKSPACE_SYNC: z.enum(['s3', 'volume']).optional().default('s3'),
 
   // AgentCore Registry (agent/skill/MCP registration + A2A + semantic search)
   AGENTCORE_REGISTRY_ENABLED: z.string().optional(),
@@ -271,6 +279,15 @@ export const config = {
 
   openclaw: {
     agentCoreRuntimeArn: env.OPENCLAW_AGENTCORE_RUNTIME_ARN,
+  },
+
+  berriai: {
+    apiUrl: env.BERRIAI_API_URL,
+    apiKey: env.BERRIAI_API_KEY,
+    namespace: env.BERRIAI_NAMESPACE,
+    sandboxImage: env.BERRIAI_SANDBOX_IMAGE,
+    timeoutSeconds: env.BERRIAI_TIMEOUT_SECONDS,
+    workspaceSync: env.BERRIAI_WORKSPACE_SYNC,
   },
 
   vectorMemory: {
