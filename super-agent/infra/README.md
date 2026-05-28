@@ -2,12 +2,24 @@
 
 ## 概述
 
-本项目提供两种部署方式：
+本项目提供三种部署方式：
 
-- **一键部署**（推荐）：`deploy-full.sh` 自动完成 CDK 基础设施 + 代码部署 + AgentCore 容器，约 20-30 分钟
+- **ECS 一键部署**（推荐）：`deploy-full-ecs.sh` 使用 ECS Fargate 运行后端，无需 SSH/EC2，约 15-20 分钟
+- **EC2 一键部署**：`deploy-full.sh` 使用 EC2 实例运行后端，需要 SSH Key，约 20-30 分钟
 - **分步部署**：手动执行 CDK、`deploy.sh`、AgentCore 各阶段
 
-### 架构
+### 架构（ECS 模式）
+
+```
+用户 → CloudFront → S3 (前端静态文件)
+                  → ALB → ECS Fargate (API /api/*, WebSocket /ws/*)
+                              → Node.js 后端 (port 3000)
+                              → RDS PostgreSQL
+                              → ElastiCache Redis
+                              → Bedrock AgentCore Runtime (容器化 Agent)
+```
+
+### 架构（EC2 模式）
 
 ```
 用户 → CloudFront → S3 (前端静态文件)
@@ -20,22 +32,23 @@
 
 ## 前置条件
 
-| 工具 | 用途 |
-|------|------|
-| AWS CLI v2 | 基础设施操作 |
-| SSM Session Manager 插件 | SSH 隧道（不需要公网 SSH） |
-| Node.js 22+ | 前后端构建 |
-| Docker (buildx, ARM64) | AgentCore 容器构建，Apple Silicon 原生支持 |
-| EC2 Key Pair | 在目标 region 创建，本地有 `.pem` 私钥 |
+| 工具 | 用途 | ECS 模式 | EC2 模式 |
+|------|------|:--------:|:--------:|
+| AWS CLI v2 | 基础设施操作 | ✅ | ✅ |
+| Node.js 22+ | 前端构建 | ✅ | ✅ |
+| Docker (buildx, ARM64) | 后端 + AgentCore 容器构建 | ✅ | ✅ |
+| SSM Session Manager 插件 | SSH 隧道 | — | ✅ |
+| EC2 Key Pair | SSH 访问 | — | ✅ |
 
 确认 AWS 身份：
 
 ```bash
 aws sts get-caller-identity
-aws ec2 describe-key-pairs --query "KeyPairs[].KeyName" --region us-west-2
 ```
 
-## 一键部署（推荐）
+## ECS 一键部署（推荐）
+
+ECS 模式使用 Fargate 运行后端容器，无需管理 EC2 实例、SSH Key 或 Nginx。
 
 ### 带自定义域名（CloudFront CDN）
 
@@ -50,6 +63,106 @@ aws route53 list-hosted-zones --query "HostedZones[].{Name:Name,Id:Id}" --output
 ```bash
 cd /path/to/super-agent
 
+./infra/scripts/deploy-full-ecs.sh \
+  --stack SuperAgentProd \
+  --region ap-northeast-1 \
+  --domain app.example.com \
+  --hosted-zone-id Z01234567890ABC
+```
+
+### 无域名部署（ALB 直连）
+
+```bash
+./infra/scripts/deploy-full-ecs.sh --stack SuperAgentDev --region us-west-2
+```
+
+### 可选参数
+
+```bash
+--stack <name>          # Stack 名称（默认 SuperAgent），不同 stack 完全隔离
+--region <region>       # AWS Region（默认 us-west-2）
+--domain <domain>       # 自定义域名（需配合 --hosted-zone-id）
+--hosted-zone-id <id>   # Route53 Hosted Zone ID
+--bedrock-ak <key>      # 跨账号 Bedrock 凭证（可选）
+--bedrock-sk <secret>   # 跨账号 Bedrock 凭证（可选）
+--skip-cdk              # 跳过基础设施（已有 stack 时用）
+--skip-agentcore        # 跳过 AgentCore 容器部署
+--skip-frontend         # 跳过前端构建
+--skip-backend          # 跳过后端构建
+```
+
+### ECS 部署流程（4 个阶段）
+
+**Phase 1: CDK Deploy**
+- 创建 VPC Security Groups、ECS Cluster、ALB
+- RDS PostgreSQL 16.6、ElastiCache Redis 7.1
+- S3 桶（Avatar、Skills、Workspace、Frontend）
+- CloudFront + ACM 证书 + Route53 ALIAS
+- IAM Roles（ECS Task Execution + Task Role）
+- ECS Service（初始 desiredCount=0，等待真实镜像）
+
+**Phase 2: Backend Deploy**
+- 构建后端 Docker 镜像（ARM64）→ 推送到 ECR
+- 从 SecretsManager 获取 RDS 凭证
+- 通过 ECS run-task 执行 Prisma 迁移 + 数据库 seed
+- 注册 ECS Task Definition（含所有环境变量）
+- 更新 ECS Service → 等待服务稳定
+- 首次部署自动创建 admin 用户：`admin@example.com` / `Admin1234!`
+
+**Phase 3: Frontend Deploy**
+- 构建前端（Vite）→ S3 sync + CloudFront 失效
+
+**Phase 4: AgentCore Setup**
+- 创建 ECR 仓库，构建推送 AgentCore ARM64 Docker 镜像
+- 创建 IAM Execution Role（Bedrock、S3、ECR、Browser、Code Interpreter 权限）
+- 创建 Bedrock AgentCore Runtime（使用 global inference profile）
+- 更新 ECS Task Definition 启用 AgentCore 模式
+
+### ECS 部署完成后
+
+访问 `https://app.example.com`（或 ALB DNS），使用 `admin@example.com` / `Admin1234!` 登录。
+
+查看后端日志：
+
+```bash
+aws logs tail /super-agent/ecs-backend --region <region> --follow
+```
+
+> **重要**：首次登录后请立即修改 admin 密码。
+
+### ECS 增量部署
+
+```bash
+# 只部署代码（跳过 CDK 和 AgentCore）
+./infra/scripts/deploy-full-ecs.sh \
+  --stack SuperAgentProd --skip-cdk --skip-agentcore
+
+# 只更新后端
+./infra/scripts/deploy-full-ecs.sh \
+  --stack SuperAgentProd --skip-cdk --skip-agentcore --skip-frontend
+
+# 只更新前端
+./infra/scripts/deploy-full-ecs.sh \
+  --stack SuperAgentProd --skip-cdk --skip-agentcore --skip-backend
+```
+
+---
+
+## EC2 一键部署
+
+### 带自定义域名（CloudFront CDN）
+
+需要 Route53 托管的域名和 EC2 Key Pair：
+
+```bash
+aws ec2 describe-key-pairs --query "KeyPairs[].KeyName" --region us-west-2
+```
+
+执行部署：
+
+```bash
+cd /path/to/super-agent
+
 ./infra/scripts/deploy-full.sh ~/Downloads/my-key.pem \
   --stack SuperAgentProd \
   --region us-west-2 \
@@ -57,7 +170,7 @@ cd /path/to/super-agent
   --hosted-zone-id Z01234567890ABC
 ```
 
-### 可选参数
+### EC2 可选参数
 
 ```bash
 --stack <name>          # Stack 名称（默认 SuperAgent），不同 stack 完全隔离
@@ -70,7 +183,7 @@ cd /path/to/super-agent
 --skip-backend          # 跳过后端构建
 ```
 
-### 部署流程（3 个阶段）
+### EC2 部署流程（3 个阶段）
 
 **Phase 1: CDK Deploy**
 - 创建 VPC Security Groups、EC2 (t4g.small ARM64)、EIP
@@ -92,7 +205,7 @@ cd /path/to/super-agent
 - 创建 Bedrock AgentCore Runtime
 - 更新 EC2 `.env` 启用 AgentCore 模式
 
-### 部署完成后
+### EC2 部署完成后
 
 访问 `https://app.example.com`，使用 `admin@example.com` / `Admin1234!` 登录。
 
@@ -168,6 +281,19 @@ sudo bash /path/to/infra/scripts/setup-litellm.sh
 
 ### 查看日志
 
+**ECS 模式：**
+
+```bash
+# CloudWatch Logs（推荐）
+aws logs tail /super-agent/ecs-backend --region <region> --follow
+
+# 或通过 ECS Exec 进入容器
+TASK_ARN=$(aws ecs list-tasks --cluster <cluster-name> --service-name <service-name> --region <region> --query "taskArns[0]" --output text)
+aws ecs execute-command --cluster <cluster-name> --task $TASK_ARN --container backend --interactive --command "/bin/sh" --region <region>
+```
+
+**EC2 模式：**
+
 ```bash
 # 通过 SSM 连接
 aws ssm start-session --target <InstanceId> --region us-west-2
@@ -185,6 +311,18 @@ tail -f /var/log/nginx/error.log
 
 ### 重启服务
 
+**ECS 模式：**
+
+```bash
+# 强制新部署（拉取最新镜像）
+aws ecs update-service --cluster <cluster-name> --service <service-name> --force-new-deployment --region <region>
+
+# 等待稳定
+aws ecs wait services-stable --cluster <cluster-name> --services <service-name> --region <region>
+```
+
+**EC2 模式：**
+
 ```bash
 sudo systemctl restart backend
 sudo systemctl status backend
@@ -192,7 +330,14 @@ sudo systemctl status backend
 
 ### 环境变量
 
-生产环境变量在 `/opt/super-agent/.env`（systemd EnvironmentFile）。
+**ECS 模式：** 环境变量在 ECS Task Definition 中管理。更新方式：
+
+```bash
+# 重新运行 deploy 脚本（会注册新 task definition 并更新 service）
+./infra/scripts/deploy-full-ecs.sh --stack <StackName> --skip-cdk --skip-frontend
+```
+
+**EC2 模式：** 生产环境变量在 `/opt/super-agent/.env`（systemd EnvironmentFile）。
 `deploy.sh` 的合并策略是"已有值不覆盖"，手动添加的变量不会被后续部署覆盖。
 
 ### AgentCore ↔ Claude 模式切换
@@ -212,25 +357,36 @@ sudo systemctl restart backend
 ```bash
 cd agentcore
 docker buildx build --platform linux/arm64 \
-  -t <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/super-agent-agentcore:latest \
+  -t <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/super-agent-agentcore:latest \
   --load .
-docker push <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/super-agent-agentcore:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/super-agent-agentcore:latest
 
 # 通知 AgentCore 拉取新镜像（⚠️ --environment-variables 是全量替换，必须传完整）
+# 注意：ANTHROPIC_MODEL 必须使用 global inference profile（跨区域可用）
 aws bedrock-agentcore-control update-agent-runtime \
   --agent-runtime-id <runtime-id> \
   --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:latest"}}' \
-  --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-execution-role" \
+  --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-role-<StackName>" \
   --network-configuration '{"networkMode":"PUBLIC"}' \
-  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-6-v1","AWS_REGION":"us-west-2","WORKSPACE_S3_REGION":"us-west-2"}' \
-  --region us-west-2
+  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"global.anthropic.claude-opus-4-6-v1","AWS_REGION":"<REGION>","WORKSPACE_S3_REGION":"<REGION>"}' \
+  --region <REGION>
 ```
+
+> **模型 ID 注意事项**：
+> - 使用 `global.anthropic.*` 前缀的 inference profile（所有区域可用）
+> - 不要使用 `us.anthropic.*`（仅 US 区域）或裸模型名（如 `claude-sonnet-4-6`）
+> - 可用 `aws bedrock list-inference-profiles --region <region>` 查看当前区域支持的 profile
 
 ## 销毁环境
 
 ```bash
 cd infra
+
+# EC2 模式
 npx cdk destroy -c stackName=SuperAgentProd --region us-west-2 --force
+
+# ECS 模式
+npx cdk destroy -c stackName=SuperAgentProd -c deployTarget=ecs --region us-west-2 --force
 ```
 
 CDK destroy 后需要手动清理：
@@ -240,17 +396,23 @@ CDK destroy 后需要手动清理：
 aws s3 rb s3://<avatar-bucket-name> --force
 aws s3 rb s3://<skills-bucket-name> --force
 
+# ECR 仓库
+aws ecr delete-repository --repository-name super-agent-agentcore --force --region <REGION>
+aws ecr delete-repository --repository-name super-agent-backend --force --region <REGION>  # ECS 模式
+
 # AgentCore 资源（不在 CDK 管理范围）
-aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <id> --region us-west-2
-aws ecr delete-repository --repository-name super-agent-agentcore --force --region us-west-2
+aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <id> --region <REGION>
 aws iam delete-role-policy --role-name super-agent-agentcore-role-<StackName> --policy-name agentcore-permissions-<StackName>
 aws iam delete-role --role-name super-agent-agentcore-role-<StackName>
 ```
 
 ## 已知注意事项
 
+- **Bedrock 模型 ID**：必须使用 `global.anthropic.*` inference profile（如 `global.anthropic.claude-sonnet-4-6`），不要使用 `us.anthropic.*`（仅 US 区域）或裸 Anthropic API 名称
+- **ECS 模式 — Prisma 迁移**：由于 RDS 不可公网访问，迁移通过 ECS run-task 在 VPC 内执行；`prisma.config.ts` 中的 `dotenv/config` 在生产镜像中不可用，部署脚本会自动重写配置
+- **ECS 模式 — 初始 desiredCount=0**：CDK 创建 ECS Service 时使用占位镜像，desiredCount 设为 0 避免健康检查失败；部署脚本推送真实镜像后设为 1
 - **EC2 UserData 耗时**：首次创建 EC2 约需 3-5 分钟完成 bootstrap，`deploy-full.sh` 会自动等待
-- **CloudFront Origin 占位符**：CDK 创建时 EC2 IP 未知，使用占位符域名；`deploy-full.sh` 会在 Phase 1 后自动替换为实际 EC2 公网 DNS
+- **CloudFront Origin**：ECS 模式直接使用 ALB DNS 作为 origin（无占位符）；EC2 模式使用占位符，`deploy-full.sh` 会自动替换
 - **`DnsValidatedCertificate` 废弃警告**：CDK 会输出 deprecation warning，功能正常，未来版本需迁移到 `acm.Certificate`
-- **npm ci fallback**：如果 `package-lock.json` 与 `package.json` 不同步，部署脚本会自动 fallback 到 `npm install`
 - **S3 桶 RETAIN 策略**：Avatar 和 Skills 桶设为 RETAIN，CDK destroy 不会删除，需手动清理
+- **所有资源同 VPC**：ECS tasks、RDS、ElastiCache、ALB 必须在同一 VPC 内，安全组规则控制互访
