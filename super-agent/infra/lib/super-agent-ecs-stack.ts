@@ -249,7 +249,7 @@ export class SuperAgentEcsStack extends cdk.Stack {
 
     // CloudWatch log group for backend container
     const backendLogGroup = new logs.LogGroup(this, 'BackendLogGroup', {
-      logGroupName: '/super-agent/ecs-backend',
+      logGroupName: `/super-agent/${id.toLowerCase()}/ecs-backend`,
       retention: logs.RetentionDays.ONE_MONTH,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });

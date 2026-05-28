@@ -274,7 +274,7 @@ task_def = {
         "logConfiguration": {
             "logDriver": "awslogs",
             "options": {
-                "awslogs-group": "/super-agent/ecs-backend",
+                "awslogs-group": "/super-agent/${STACK_NAME,,}/ecs-backend",
                 "awslogs-region": "$REGION",
                 "awslogs-stream-prefix": "migrate",
                 "awslogs-create-group": "true"
@@ -320,7 +320,7 @@ PYEOF
   if [ "$MIGRATE_EXIT" = "0" ]; then
     echo "  Migrations completed successfully."
   else
-    echo "  WARNING: Migration task exited with code $MIGRATE_EXIT (check logs: /super-agent/ecs-backend/migrate)"
+    echo "  WARNING: Migration task exited with code $MIGRATE_EXIT (check logs: /super-agent/${STACK_NAME,,}/ecs-backend/migrate)"
   fi
 
   # --- 2d-2: Seed database and set admin password ---
@@ -431,7 +431,7 @@ task_def = {
         'logConfiguration': {
             'logDriver': 'awslogs',
             'options': {
-                'awslogs-group': '/super-agent/ecs-backend',
+                'awslogs-group': '/super-agent/${STACK_NAME,,}/ecs-backend',
                 'awslogs-region': '$REGION',
                 'awslogs-stream-prefix': 'backend',
                 'awslogs-create-group': 'true'
@@ -784,5 +784,5 @@ fi
 echo "  ALB:        $ALB_DNS"
 echo "  ECS:        $ECS_CLUSTER_NAME / $ECS_SERVICE_NAME"
 [ "$SKIP_AGENTCORE" = false ] && echo "  AgentCore:  $RUNTIME_ARN"
-echo "  Logs:       aws logs tail /super-agent/ecs-backend --region $REGION --follow"
+echo "  Logs:       aws logs tail /super-agent/${STACK_NAME,,}/ecs-backend --region $REGION --follow"
 echo "============================================="
