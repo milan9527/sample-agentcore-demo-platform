@@ -40,6 +40,16 @@ COPY package.json package-lock.json tsconfig.json ./
 COPY prisma ./prisma
 COPY src ./src
 
+# Copy built-in skills directory
+COPY skills ./skills
+
+# Copy connector-packages (used by connector-registry service)
+COPY connector-packages ./connector-packages
+
+# Copy industry-packs if present in build context (placed by deploy script)
+# The deploy script ensures this directory exists (may be empty)
+COPY industry-packs-build ./industry-packs-build
+
 # Generate Prisma client
 RUN npx prisma generate
 
@@ -83,8 +93,18 @@ COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 # Copy built application
 COPY --from=builder /app/dist ./dist
 
+# Copy built-in skills directory (used by workspace-manager for built-in skills)
+COPY --from=builder /app/skills ./skills
+
+# Copy connector-packages (used by connector-registry service at runtime)
+COPY --from=builder /app/connector-packages ./connector-packages
+
+# Copy industry-packs (used by pack-deploy service for workflow/skill provisioning)
+# Path must resolve to /app/../industry-packs = /industry-packs
+COPY --from=builder /app/industry-packs-build /industry-packs
+
 # Set ownership to non-root user
-RUN chown -R backend:nodejs /app
+RUN chown -R backend:nodejs /app && chown -R backend:nodejs /industry-packs
 
 # Switch to non-root user
 USER backend

@@ -216,6 +216,8 @@ if [ "$SKIP_BACKEND" = false ]; then
   # Copy industry-packs into build context if available
   if [ -d "$PROJECT_ROOT/industry-packs" ]; then
     cp -r "$PROJECT_ROOT/industry-packs" ./industry-packs-build
+  else
+    mkdir -p ./industry-packs-build
   fi
 
   IMAGE_TAG="$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD 2>/dev/null || echo 'latest')"
@@ -325,26 +327,43 @@ PYEOF
 
   # --- 2d-2: Seed database and set admin password ---
   echo "  [2d-2] Seeding database..."
-  SEED_CMD='cat > prisma.config.ts << EOF
+
+  # Use python to safely build the JSON overrides (avoids shell quoting/newline issues)
+  SEED_OVERRIDES_FILE="/tmp/ecs-seed-overrides.json"
+  DATABASE_URL_FOR_SEED="$DATABASE_URL"
+  export DATABASE_URL_FOR_SEED
+  python3 << 'PYEOF'
+import json, os
+
+db_url = os.environ.get("DATABASE_URL_FOR_SEED", "")
+
+cmd = """cat > prisma.config.ts << 'HEREDOC'
 import { defineConfig } from "prisma/config";
-export default defineConfig({
-  schema: "prisma/schema.prisma",
-  migrations: { path: "prisma/migrations" },
-  datasource: { url: process.env.DATABASE_URL },
-});
-EOF
+export default defineConfig({ schema: "prisma/schema.prisma", migrations: { path: "prisma/migrations" }, datasource: { url: process.env.DATABASE_URL } });
+HEREDOC
 npx tsx prisma/seed.ts 2>&1 || echo "(Seed skipped - may already exist)"
-echo "Setting admin password..."
-echo '"'"'const b=require("bcryptjs");const{Client}=require("pg");(async()=>{const h=await b.hash("Admin1234!",10);const c=new Client({connectionString:process.env.DATABASE_URL});await c.connect();const r=await c.query("UPDATE profiles SET password_hash=$1 WHERE username=$2",[h,"admin@example.com"]);console.log("Updated:",r.rowCount);await c.end()})()'"'"' > /app/setpw.cjs && node /app/setpw.cjs'
+echo 'const b=require("bcryptjs");const{Client}=require("pg");(async()=>{const h=await b.hash("Admin1234!",10);const c=new Client({connectionString:process.env.DATABASE_URL});await c.connect();const r=await c.query("UPDATE profiles SET password_hash=$1 WHERE username=$2",[h,"admin@example.com"]);console.log("Updated:",r.rowCount);await c.end()})()' > /app/setpw.cjs && node /app/setpw.cjs"""
+
+overrides = {
+    "containerOverrides": [{
+        "name": "migrate",
+        "command": ["sh", "-c", cmd],
+        "environment": [{"name": "DATABASE_URL", "value": db_url}]
+    }]
+}
+with open("/tmp/ecs-seed-overrides.json", "w") as f:
+    json.dump(overrides, f)
+PYEOF
 
   SEED_TASK_ID=$(aws ecs run-task \
     --cluster "$ECS_CLUSTER_NAME" \
     --task-definition "$MIGRATE_TASK_ARN" \
     --launch-type FARGATE \
     --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
-    --overrides "{\"containerOverrides\":[{\"name\":\"migrate\",\"entryPoint\":[\"sh\",\"-c\"],\"command\":[\"$SEED_CMD\"],\"environment\":[{\"name\":\"DATABASE_URL\",\"value\":\"$DATABASE_URL\"}]}]}" \
+    --overrides "file://$SEED_OVERRIDES_FILE" \
     --region "$REGION" \
     --query "tasks[0].taskArn" --output text)
+  rm -f "$SEED_OVERRIDES_FILE"
   echo "  Seed task started: $SEED_TASK_ID"
   aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER_NAME" --tasks "$SEED_TASK_ID" --region "$REGION" 2>/dev/null || true
   echo "  Seed complete. Admin login: admin@example.com / Admin1234!"

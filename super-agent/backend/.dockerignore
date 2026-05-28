@@ -29,6 +29,9 @@ vitest.config.ts
 # Documentation
 *.md
 !README.md
+!skills/**/*.md
+!industry-packs-build/**/*.md
+!connector-packages/**/*.md
 
 # OS files
 .DS_Store
