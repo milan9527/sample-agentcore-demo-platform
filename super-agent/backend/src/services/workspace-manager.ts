@@ -798,6 +798,7 @@ export class WorkspaceManager {
         env: {
           AWS_REGION: agentcoreRegion,
           FASTMCP_LOG_LEVEL: 'ERROR',
+          BROWSER_IDENTIFIER: process.env.AGENTCORE_BROWSER_IDENTIFIER || 'public_browser_webauth-piLpCAcEYA',
         },
       };
     }

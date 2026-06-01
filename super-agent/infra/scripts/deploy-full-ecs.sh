@@ -385,6 +385,38 @@ PYEOF
   # --- 2f: Register new ECS task definition ---
   echo "  [2f] Registering ECS task definition..."
 
+  # If skipping AgentCore setup, try to preserve existing AgentCore env vars from current task def
+  EXISTING_AGENT_RUNTIME="claude"
+  EXISTING_AGENTCORE_RUNTIME_ARN=""
+  EXISTING_AGENTCORE_EXECUTION_ROLE_ARN=""
+  EXISTING_AGENTCORE_BROWSER_IDENTIFIER=""
+  if [ "$SKIP_AGENTCORE" = true ]; then
+    EXISTING_ENV=$(aws ecs describe-task-definition \
+      --task-definition "${ECS_TASK_FAMILY:-super-agent-backend}" --region "$REGION" \
+      --query "taskDefinition.containerDefinitions[0].environment" --output json 2>/dev/null || echo "[]")
+    EXISTING_AGENT_RUNTIME=$(echo "$EXISTING_ENV" | python3 -c "
+import sys, json
+env = {e['name']: e['value'] for e in json.load(sys.stdin)}
+print(env.get('AGENT_RUNTIME', 'claude'))
+" 2>/dev/null || echo "claude")
+    EXISTING_AGENTCORE_RUNTIME_ARN=$(echo "$EXISTING_ENV" | python3 -c "
+import sys, json
+env = {e['name']: e['value'] for e in json.load(sys.stdin)}
+print(env.get('AGENTCORE_RUNTIME_ARN', ''))
+" 2>/dev/null || echo "")
+    EXISTING_AGENTCORE_EXECUTION_ROLE_ARN=$(echo "$EXISTING_ENV" | python3 -c "
+import sys, json
+env = {e['name']: e['value'] for e in json.load(sys.stdin)}
+print(env.get('AGENTCORE_EXECUTION_ROLE_ARN', ''))
+" 2>/dev/null || echo "")
+    EXISTING_AGENTCORE_BROWSER_IDENTIFIER=$(echo "$EXISTING_ENV" | python3 -c "
+import sys, json
+env = {e['name']: e['value'] for e in json.load(sys.stdin)}
+print(env.get('AGENTCORE_BROWSER_IDENTIFIER', ''))
+" 2>/dev/null || echo "")
+    echo "  Preserving existing AGENT_RUNTIME=$EXISTING_AGENT_RUNTIME"
+  fi
+
   # Build environment JSON array
   ENV_JSON=$(python3 -c "
 import json
@@ -407,11 +439,21 @@ env = {
     'CLAUDE_CODE_USE_BEDROCK': '1',
     'CLAUDE_MODEL': 'global.anthropic.claude-sonnet-4-6',
     'AGENT_WORKSPACE_BASE_DIR': '/app/workspaces',
-    'AGENT_RUNTIME': 'claude',
+    'AGENT_RUNTIME': '$EXISTING_AGENT_RUNTIME',
     'AGENTCORE_WORKSPACE_S3_BUCKET': '$WORKSPACE_BUCKET',
     'RAG_ENABLED': 'true',
     'JWT_SECRET': '$JWT_SECRET',
 }
+# Preserve AgentCore vars if they existed
+agentcore_arn = '$EXISTING_AGENTCORE_RUNTIME_ARN'
+agentcore_role = '$EXISTING_AGENTCORE_EXECUTION_ROLE_ARN'
+agentcore_browser = '$EXISTING_AGENTCORE_BROWSER_IDENTIFIER'
+if agentcore_arn:
+    env['AGENTCORE_RUNTIME_ARN'] = agentcore_arn
+if agentcore_role:
+    env['AGENTCORE_EXECUTION_ROLE_ARN'] = agentcore_role
+if agentcore_browser:
+    env['AGENTCORE_BROWSER_IDENTIFIER'] = agentcore_browser
 # Add Cognito vars if applicable
 cognito_pool = '${COGNITO_USER_POOL_ID:-}'
 if cognito_pool:
@@ -645,7 +687,7 @@ if [ "$SKIP_AGENTCORE" = false ]; then
             \"bedrock-agentcore:ConnectBrowserLiveViewStream\",
             \"bedrock-agentcore:UpdateBrowserStream\"
           ],
-          \"Resource\": \"arn:aws:bedrock-agentcore:*:*:browser/*\"
+          \"Resource\": [\"arn:aws:bedrock-agentcore:*:*:browser/*\", \"arn:aws:bedrock-agentcore:*:*:browser-custom/*\"]
         },
         {
           \"Sid\": \"CodeInterpreter\",
@@ -674,6 +716,49 @@ if [ "$SKIP_AGENTCORE" = false ]; then
     --load .
   docker push "$AGENTCORE_ECR_URI:latest"
   echo "  Image pushed: $AGENTCORE_ECR_URI:latest"
+
+  # --- 4c-2: Create AgentCore Browser with web bot auth ---
+  echo "  [4c-2] Ensuring AgentCore Browser (web bot auth enabled)..."
+  ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
+  BROWSER_NAME="${STACK_NAME}_browser_webauth"
+  BROWSER_ID=$(aws bedrock-agentcore-control list-browsers --region "$REGION" \
+    --query "browserSummaries[?name=='${BROWSER_NAME}'].browserId" \
+    --output text 2>/dev/null || echo "")
+
+  if [ -z "$BROWSER_ID" ] || [ "$BROWSER_ID" = "None" ]; then
+    echo "  Creating new browser: $BROWSER_NAME"
+    BROWSER_OUTPUT=$(aws bedrock-agentcore-control create-browser \
+      --name "$BROWSER_NAME" \
+      --execution-role-arn "$ROLE_ARN" \
+      --network-configuration '{"networkMode":"PUBLIC"}' \
+      --browser-signing '{"enabled":true}' \
+      --description "Browser with web bot auth for $STACK_NAME" \
+      --region "$REGION" --output json 2>&1)
+    BROWSER_ID=$(echo "$BROWSER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['browserId'])" 2>/dev/null || echo "")
+    if [ -n "$BROWSER_ID" ] && [ "$BROWSER_ID" != "None" ]; then
+      echo "  Browser created: $BROWSER_ID"
+    else
+      echo "  WARNING: Failed to create browser. Output: $BROWSER_OUTPUT"
+      BROWSER_ID=""
+    fi
+  else
+    echo "  Browser already exists: $BROWSER_ID"
+  fi
+
+  # Wait for browser to be READY
+  if [ -n "$BROWSER_ID" ] && [ "$BROWSER_ID" != "None" ]; then
+    echo "  Waiting for browser to be READY..."
+    for i in $(seq 1 12); do
+      BR_STATUS=$(aws bedrock-agentcore-control get-browser \
+        --browser-id "$BROWSER_ID" --region "$REGION" \
+        --query 'status' --output text 2>/dev/null || echo "UNKNOWN")
+      [ "$BR_STATUS" = "READY" ] && echo "  Browser is READY." && break
+      echo "  Attempt $i/12 - status: $BR_STATUS, waiting 5s..."
+      sleep 5
+    done
+  fi
+  AGENTCORE_BROWSER_ID="${BROWSER_ID:-}"
+  echo "  AGENTCORE_BROWSER_ID=$AGENTCORE_BROWSER_ID"
 
   # --- 4d: Create or Update AgentCore Runtime ---
   echo "  [4d] Creating/updating AgentCore Runtime..."
@@ -749,6 +834,9 @@ env['AGENT_RUNTIME'] = 'agentcore'
 env['AGENTCORE_RUNTIME_ARN'] = '$RUNTIME_ARN'
 env['AGENTCORE_EXECUTION_ROLE_ARN'] = '$ROLE_ARN'
 env['AGENTCORE_WORKSPACE_S3_BUCKET'] = '$WORKSPACE_BUCKET_NAME'
+browser_id = '$AGENTCORE_BROWSER_ID'
+if browser_id:
+    env['AGENTCORE_BROWSER_IDENTIFIER'] = browser_id
 container['environment'] = [{'name': k, 'value': v} for k, v in env.items()]
 
 # Build register-task-definition input (remove read-only fields)
