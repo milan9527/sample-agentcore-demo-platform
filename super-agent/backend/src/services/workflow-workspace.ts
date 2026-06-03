@@ -73,6 +73,8 @@ export async function provisionWorkflowWorkspace(
           id: s.id, name: s.name, hashId: s.hash_id,
           s3Bucket: s.s3_bucket, s3Prefix: s.s3_prefix,
           localPath: meta?.localPath as string | undefined,
+          description: s.description ?? (meta?.description as string | undefined),
+          body: meta?.body as string | undefined,
         });
       }
     }
@@ -84,6 +86,8 @@ export async function provisionWorkflowWorkspace(
         id: s.id, name: s.name, hashId: s.hash_id,
         s3Bucket: s.s3_bucket, s3Prefix: s.s3_prefix,
         localPath: meta?.localPath as string | undefined,
+        description: s.description ?? (meta?.description as string | undefined),
+        body: meta?.body as string | undefined,
       });
     }
   }
@@ -119,7 +123,7 @@ export async function provisionWorkflowWorkspace(
     scopeId: scope.id,
     agents: agents.map(a => ({ id: a.id, name: a.name, displayName: a.display_name, role: a.role })),
     skills: Array.from(skillMap.values()),
-    scopeSkillNames: scopeLevelSkills.map(s => s.name),
+    scopeSkillNames: Array.from(skillMap.values()).map(s => s.name),
   };
 }
 

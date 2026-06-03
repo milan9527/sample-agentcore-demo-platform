@@ -329,14 +329,17 @@ function serializePlanToMissionBrief(
   lines.push('You MUST output the text markers for every step transition, even if the MCP tools are available.');
   lines.push('');
   lines.push('## Execution Rules', '');
-  lines.push('- NEVER simulate, mock, or pretend to execute an external API call. If a step requires');
-  lines.push('  an external service (e.g. SendGrid, Slack, GitHub API) and no matching skill or tool');
-  lines.push('  is available, call `workflow_step_failed` with a clear message like:');
-  lines.push('  "Required integration not available: SendGrid. Install the SendGrid skill to enable this step."');
+  lines.push('- The skills listed in "Available API Skills" are INSTALLED in this workspace as SKILL.md files.');
+  lines.push('  Read them (in `.claude/skills/`) to understand the methodology, then execute the step');
+  lines.push('  by following the skill\'s instructions. These are operational guides, not external API endpoints.');
+  lines.push('- When a skill describes data processing, analysis, or report generation, execute it by');
+  lines.push('  performing the analysis and producing the output as described in the skill document.');
+  lines.push('- NEVER simulate or fabricate real external API calls (e.g. actually sending emails via SendGrid,');
+  lines.push('  posting to Slack, or calling a third-party REST API) if no tool/MCP server for that service exists.');
   lines.push('- NEVER fabricate API responses, email delivery confirmations, or inbox polling results.');
-  lines.push('- If a step depends on a real-time external event (e.g. waiting for an email reply),');
-  lines.push('  and no integration exists to monitor that event, fail the step with a clear explanation.');
-  lines.push('- Only use tools and skills that are actually available in the workspace.');
+  lines.push('- If a step explicitly requires calling an external third-party service that has no corresponding');
+  lines.push('  tool or MCP server available, fail the step with a clear explanation.');
+  lines.push('- Only use tools that are actually available in the workspace.');
   lines.push('');
   lines.push('Please proceed through the steps in dependency order.');
 

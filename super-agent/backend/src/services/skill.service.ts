@@ -296,8 +296,8 @@ export class SkillService {
       const skillMdPath = join(skillDir, 'SKILL.md');
       await writeFile(skillMdPath, content, 'utf-8');
       
-      // Update metadata with the new local path
-      const newMetadata = { ...metadata, localPath: skillDir };
+      // Update metadata with the new local path AND persist body for ECS/ephemeral environments
+      const newMetadata = { ...metadata, localPath: skillDir, body: content };
       await skillRepository.update(skillId, organizationId, { metadata: newMetadata });
       return true;
     }
@@ -306,6 +306,10 @@ export class SkillService {
     const skillMdPath = join(localPath, 'SKILL.md');
     await mkdir(dirname(skillMdPath), { recursive: true });
     await writeFile(skillMdPath, content, 'utf-8');
+
+    // Also persist body in metadata for resilience in containerized environments
+    const newMetadata = { ...metadata, body: content };
+    await skillRepository.update(skillId, organizationId, { metadata: newMetadata });
     return true;
   }
 
