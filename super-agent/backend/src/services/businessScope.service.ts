@@ -392,6 +392,20 @@ export class BusinessScopeService {
     return updated.config_version;
   }
 
+  /**
+   * Bump config_version on ALL non-deleted scopes in an org.
+   * Used when an org-level change (e.g. installing an org-wide skill) must
+   * invalidate every session workspace so they re-materialize on next message.
+   * Returns the number of scopes bumped.
+   */
+  async bumpAllConfigVersions(organizationId: string): Promise<number> {
+    const { count } = await prisma.business_scopes.updateMany({
+      where: { organization_id: organizationId, deleted_at: null },
+      data: { config_version: { increment: 1 } },
+    });
+    return count;
+  }
+
   // ============================================================================
   // AgentCore Runtime Methods
   // ============================================================================

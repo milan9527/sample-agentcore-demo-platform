@@ -12,6 +12,7 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as efs from 'aws-cdk-lib/aws-efs';
 import { Construct } from 'constructs';
 
 /**
@@ -25,13 +26,15 @@ import { Construct } from 'constructs';
  *   User Pool + App Client + initial admin user.
  *
  * Optional CDN layer (enableCdn=true):
- *   S3 frontend bucket, CloudFront distribution, ACM certificate,
- *   Route53 ALIAS record, OAC.
+ *   S3 frontend bucket, CloudFront distribution (serving S3 static + proxying
+ *   /api/* and /ws/* to the ALB), OAC. When a custom domain is provided it also
+ *   adds an ACM certificate + Route53 ALIAS; otherwise the app is served on the
+ *   default *.cloudfront.net domain with the CloudFront-managed certificate.
  *
  * Context parameters:
  *   enableCdn     - "true" to deploy CloudFront (default: "false")
- *   domainName    - custom domain, e.g. "app.example.com" (required if enableCdn)
- *   hostedZoneId  - Route53 hosted zone ID (required if enableCdn)
+ *   domainName    - OPTIONAL custom domain, e.g. "app.example.com" (requires hostedZoneId)
+ *   hostedZoneId  - Route53 hosted zone ID (only with domainName)
  *   authMode      - "cognito" | "local" (default: "local")
  *   deployTarget  - "ecs" to use this stack (checked in bin/app.ts)
  */
@@ -44,8 +47,12 @@ export class SuperAgentEcsStack extends cdk.Stack {
     const hostedZoneId = this.node.tryGetContext('hostedZoneId') as string | undefined;
     const authMode = (this.node.tryGetContext('authMode') as string) || 'local';
 
-    if (enableCdn && (!domainName || !hostedZoneId)) {
-      throw new Error('enableCdn=true requires domainName and hostedZoneId context values');
+    // A custom domain requires a Route53 hosted zone (for ACM validation + ALIAS).
+    // Without a domain, CloudFront is served on its default *.cloudfront.net name
+    // using the CloudFront-managed certificate — no ACM/Route53 needed.
+    const useCustomDomain = enableCdn && !!domainName && !!hostedZoneId;
+    if (domainName && !hostedZoneId) {
+      throw new Error('domainName requires hostedZoneId (Route53 zone for ACM + ALIAS). Omit both to use the default *.cloudfront.net domain.');
     }
 
     // =========================================================================
@@ -73,7 +80,48 @@ export class SuperAgentEcsStack extends cdk.Stack {
     // =========================================================================
     // VPC
     // =========================================================================
-    const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
+    // By default create a NEW dedicated VPC with cross-AZ PUBLIC + PRIVATE(NAT)
+    // subnets. This is the clean, self-contained layout AgentCore needs: the
+    // runtime runs in a PRIVATE_WITH_EGRESS subnet (NAT egress, no public IP) and
+    // the EFS mount targets live in the same private subnets — no reliance on a
+    // default VPC's ad-hoc subnet routing.
+    //
+    // Context overrides:
+    //   -c vpcId=<id>      → import an existing VPC instead of creating one
+    //   -c createVpc=false → import the account's default VPC
+    //   -c azCount=<n>     → number of AZs (default 3)
+    const vpcId = this.node.tryGetContext('vpcId') as string | undefined;
+    const createVpc = this.node.tryGetContext('createVpc') !== 'false' && !vpcId;
+    const azCount = parseInt((this.node.tryGetContext('azCount') as string) || '3', 10);
+
+    let vpc: ec2.IVpc;
+    if (vpcId) {
+      vpc = ec2.Vpc.fromLookup(this, 'AppVpc', { vpcId });
+    } else if (createVpc) {
+      // AgentCore-supported AZs in us-east-1 are use1-az1/az2/az4 = us-east-1a/b/c.
+      // Pin the VPC to those AZ names so the runtime always lands in a supported AZ.
+      const supportedAzs = (this.node.tryGetContext('vpcAzs') as string | undefined)
+        ?.split(',').map(s => s.trim()).filter(Boolean)
+        ?? (this.region === 'us-east-1'
+            ? ['us-east-1a', 'us-east-1b', 'us-east-1c'].slice(0, azCount)
+            : undefined);
+
+      // NAT gateways: default to 1 (shared across AZs) to conserve EIPs/cost;
+      // override with -c natGateways=<n> for per-AZ HA. All private subnets in
+      // all AZs still get NAT egress (routed to the single NAT).
+      const natGateways = parseInt((this.node.tryGetContext('natGateways') as string) || '1', 10);
+      vpc = new ec2.Vpc(this, 'AppVpc', {
+        ipAddresses: ec2.IpAddresses.cidr('10.20.0.0/16'),
+        ...(supportedAzs ? { availabilityZones: supportedAzs } : { maxAzs: azCount }),
+        natGateways,
+        subnetConfiguration: [
+          { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 20 },
+          { name: 'Private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 20 },
+        ],
+      });
+    } else {
+      vpc = ec2.Vpc.fromLookup(this, 'AppVpc', { isDefault: true });
+    }
 
     // =========================================================================
     // Security Groups
@@ -114,11 +162,56 @@ export class SuperAgentEcsStack extends cdk.Stack {
     redisSg.addIngressRule(ecsSg, ec2.Port.tcp(6379), 'Redis from ECS');
 
     // =========================================================================
+    // EFS — shared workspace/skills storage (AGENTCORE_STORAGE=efs)
+    // =========================================================================
+    // Created in CloudFormation (not the deploy script) so the filesystem,
+    // access point, mount targets and NFS SG are all managed declaratively.
+    // The ECS backend task and the AgentCore runtime both mount the access
+    // point at /mnt/efs. AgentCore VPC runtimes are only supported in a subset
+    // of AZs (us-east-1: use1-az1/az2/az4), and the runtime's subnets must have
+    // an EFS mount target — so we place a mount target in the supported-AZ
+    // subnets. `agentcoreAzIds` context lets other regions override.
+    const efsSg = new ec2.SecurityGroup(this, 'EfsSG', {
+      vpc,
+      description: 'NFS 2049 for super-agent EFS workspaces',
+      allowAllOutbound: true,
+    });
+    // Allow NFS from the ECS tasks, the AgentCore runtime ENIs (which use the
+    // EFS SG), and self.
+    efsSg.addIngressRule(ecsSg, ec2.Port.tcp(2049), 'NFS from ECS tasks');
+    efsSg.addIngressRule(efsSg, ec2.Port.tcp(2049), 'NFS from EFS/runtime ENIs');
+
+    const fileSystem = new efs.FileSystem(this, 'WorkspacesEfs', {
+      vpc,
+      securityGroup: efsSg,
+      encrypted: true,
+      performanceMode: efs.PerformanceMode.GENERAL_PURPOSE,
+      throughputMode: efs.ThroughputMode.ELASTIC,
+      // Keep workspace data across stack updates; destroy only on stack delete.
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      // Mount targets go in PRIVATE_WITH_EGRESS (NAT-routed) subnets. This is
+      // REQUIRED for the AgentCore runtime: its ENIs get no public IP, so they
+      // reach Bedrock/AWS endpoints only via a NAT gateway. IGW-only "public"
+      // subnets would make the runtime health check time out. The ECS backend
+      // runs in public subnets but can still mount cross-AZ within the same VPC.
+      // Fall back to public subnets only if the VPC has no private subnets.
+      vpcSubnets: vpc.privateSubnets.length > 0
+        ? { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }
+        : { subnetType: ec2.SubnetType.PUBLIC },
+    });
+
+    const efsAccessPoint = fileSystem.addAccessPoint('WorkspacesAp', {
+      path: '/workspaces',
+      createAcl: { ownerUid: '1000', ownerGid: '1000', permissions: '0755' },
+      posixUser: { uid: '1000', gid: '1000' },
+    });
+
+    // =========================================================================
     // RDS PostgreSQL
     // =========================================================================
     const dbInstance = new rds.DatabaseInstance(this, 'SuperAgentDB', {
       engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_6,
+        version: rds.PostgresEngineVersion.VER_16_9,
       }),
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
       vpc,
@@ -209,9 +302,19 @@ export class SuperAgentEcsStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
 
-    // Bedrock model invocation
+    // Bedrock model invocation + model listing.
+    // List* is required so the chat/agent model picker can enumerate available
+    // Bedrock models (backend calls ListFoundationModels / ListInferenceProfiles);
+    // without it the Bedrock provider's model dropdown is empty.
     taskRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+      actions: [
+        'bedrock:InvokeModel',
+        'bedrock:InvokeModelWithResponseStream',
+        'bedrock:ListFoundationModels',
+        'bedrock:ListInferenceProfiles',
+        'bedrock:GetFoundationModel',
+        'bedrock:GetInferenceProfile',
+      ],
       resources: ['*'],
     }));
 
@@ -420,17 +523,22 @@ export class SuperAgentEcsStack extends cdk.Stack {
       });
       frontendBucket.grantReadWrite(taskRole);
 
-      // ACM certificate (must be us-east-1 for CloudFront)
-      const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
-        hostedZoneId: hostedZoneId!,
-        zoneName: domainName!.split('.').slice(1).join('.'),
-      });
+      // ACM certificate + hosted zone only when a custom domain is used.
+      // Without a domain, CloudFront serves its default *.cloudfront.net cert.
+      let certificate: acm.ICertificate | undefined;
+      let hostedZone: route53.IHostedZone | undefined;
+      if (useCustomDomain) {
+        hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
+          hostedZoneId: hostedZoneId!,
+          zoneName: domainName!.split('.').slice(1).join('.'),
+        });
 
-      const certificate = new acm.DnsValidatedCertificate(this, 'Certificate', {
-        domainName: domainName!,
-        hostedZone,
-        region: 'us-east-1', // CloudFront requires us-east-1
-      });
+        certificate = new acm.DnsValidatedCertificate(this, 'Certificate', {
+          domainName: domainName!,
+          hostedZone,
+          region: 'us-east-1', // CloudFront requires us-east-1
+        });
+      }
 
       // OAC for S3
       new cloudfront.CfnOriginAccessControl(this, 'OAC', {
@@ -442,8 +550,8 @@ export class SuperAgentEcsStack extends cdk.Stack {
         },
       });
 
-      // CloudFront distribution — S3 for static, ALB for API/WS
-      // Use ALB DNS as the API origin (deploy script updates placeholder if needed)
+      // CloudFront distribution — S3 for static, ALB for API/WS.
+      // ALB DNS is known at synth time, so wire it directly (no placeholder).
       const albOrigin = new origins.HttpOrigin(alb.loadBalancerDnsName, {
         protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
         httpPort: 80,
@@ -455,8 +563,9 @@ export class SuperAgentEcsStack extends cdk.Stack {
           viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
           cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         },
-        domainNames: [domainName!],
-        certificate,
+        // Only set custom domain + cert when provided; otherwise use the
+        // CloudFront default domain and managed certificate.
+        ...(useCustomDomain ? { domainNames: [domainName!], certificate } : {}),
         defaultRootObject: 'index.html',
         errorResponses: [
           { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html', ttl: cdk.Duration.seconds(0) },
@@ -480,12 +589,14 @@ export class SuperAgentEcsStack extends cdk.Stack {
         allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
       });
 
-      // Route53 ALIAS → CloudFront
-      new route53.ARecord(this, 'DnsAlias', {
-        zone: hostedZone,
-        recordName: domainName!,
-        target: route53.RecordTarget.fromAlias(new route53targets.CloudFrontTarget(distribution)),
-      });
+      // Route53 ALIAS → CloudFront (only when a custom domain is used)
+      if (useCustomDomain && hostedZone) {
+        new route53.ARecord(this, 'DnsAlias', {
+          zone: hostedZone,
+          recordName: domainName!,
+          target: route53.RecordTarget.fromAlias(new route53targets.CloudFrontTarget(distribution)),
+        });
+      }
     }
 
     // =========================================================================
@@ -513,6 +624,19 @@ export class SuperAgentEcsStack extends cdk.Stack {
       value: vpc.publicSubnets.map(s => s.subnetId).join(','),
     });
     new cdk.CfnOutput(this, 'EcsSecurityGroup', { value: ecsSg.securityGroupId });
+    new cdk.CfnOutput(this, 'VpcId', { value: vpc.vpcId });
+    // Private (NAT-routed) subnets — the AgentCore runtime MUST run here so its
+    // ENI has NAT egress to Bedrock. Falls back to public if the VPC has none.
+    new cdk.CfnOutput(this, 'AgentcoreSubnets', {
+      value: (vpc.privateSubnets.length > 0 ? vpc.privateSubnets : vpc.publicSubnets)
+        .map(s => s.subnetId).join(','),
+    });
+
+    // Outputs — EFS (consumed by deploy-full-ecs.sh for backend mount + AgentCore runtime)
+    new cdk.CfnOutput(this, 'EfsFileSystemId', { value: fileSystem.fileSystemId });
+    new cdk.CfnOutput(this, 'EfsAccessPointId', { value: efsAccessPoint.accessPointId });
+    new cdk.CfnOutput(this, 'EfsAccessPointArn', { value: efsAccessPoint.accessPointArn });
+    new cdk.CfnOutput(this, 'EfsSecurityGroup', { value: efsSg.securityGroupId });
 
     // Outputs — Cognito (only when authMode=cognito)
     if (userPool && appClient && cognitoDomainFull) {

@@ -279,6 +279,22 @@ export class SkillRepository {
   }
 
   /**
+   * Find org-level skills: active skills marked `metadata.orgLevel = true`.
+   * These are installed org-wide (e.g. from the Tools marketplace) and are
+   * auto-included in every scope's workspace regardless of scope/agent binding.
+   */
+  async findOrgLevelSkills(organizationId: string): Promise<SkillEntity[]> {
+    return prisma.skills.findMany({
+      where: {
+        organization_id: organizationId,
+        status: 'active',
+        metadata: { path: ['orgLevel'], equals: true },
+      },
+      orderBy: { name: 'asc' },
+    }) as Promise<SkillEntity[]>;
+  }
+
+  /**
    * Find an existing fork of a skill for a specific scope.
    */
   async findScopeFork(organizationId: string, parentSkillId: string, ownerScopeId: string): Promise<SkillEntity | null> {

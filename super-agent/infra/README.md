@@ -16,7 +16,8 @@
                               → Node.js 后端 (port 3000)
                               → RDS PostgreSQL
                               → ElastiCache Redis
-                              → Bedrock AgentCore Runtime (容器化 Agent)
+                              → EFS (/mnt/efs 共享工作区，与 AgentCore 同挂)
+                              → Bedrock AgentCore Runtime (容器化 Agent，private-NAT 子网)
 ```
 
 ### 架构（EC2 模式）
@@ -34,7 +35,7 @@
 
 | 工具 | 用途 | ECS 模式 | EC2 模式 |
 |------|------|:--------:|:--------:|
-| AWS CLI v2 | 基础设施操作 | ✅ | ✅ |
+| AWS CLI **≥ 2.36** | 基础设施操作（EFS 模式的 `--filesystem-configurations` 需要 2.36+）| ✅ | ✅ |
 | Node.js 22+ | 前端构建 | ✅ | ✅ |
 | Docker (buildx, ARM64) | 后端 + AgentCore 容器构建 | ✅ | ✅ |
 | SSM Session Manager 插件 | SSH 隧道 | — | ✅ |
@@ -70,10 +71,13 @@ cd /path/to/super-agent
   --hosted-zone-id Z01234567890ABC
 ```
 
-### 无域名部署（ALB 直连）
+### 无域名部署（CloudFront 默认域名）
+
+省略 `--domain`/`--hosted-zone-id`，应用会挂在自动生成的 `*.cloudfront.net` 域名上
+（不创建 Route53/ACM，CloudFront 把 `/api/*`、`/ws/*` 反代到 ALB）。部署结束会打印访问 URL。
 
 ```bash
-./infra/scripts/deploy-full-ecs.sh --stack SuperAgentDev --region us-west-2
+./infra/scripts/deploy-full-ecs.sh --stack SuperAgentDev --region us-east-1
 ```
 
 ### 可选参数
@@ -81,8 +85,11 @@ cd /path/to/super-agent
 ```bash
 --stack <name>          # Stack 名称（默认 SuperAgent），不同 stack 完全隔离
 --region <region>       # AWS Region（默认 us-west-2）
---domain <domain>       # 自定义域名（需配合 --hosted-zone-id）
---hosted-zone-id <id>   # Route53 Hosted Zone ID
+--domain <domain>       # 可选自定义域名（需配合 --hosted-zone-id）；省略则用 CloudFront 默认域名
+--hosted-zone-id <id>   # Route53 Hosted Zone ID（仅配合 --domain）
+--vpc-id <id>           # 导入已有 VPC（默认新建专属 VPC）
+--use-default-vpc       # 使用账号默认 VPC（默认新建专属 VPC）
+--agentcore-storage <efs|s3>  # AgentCore 工作区存储（默认 efs）
 --bedrock-ak <key>      # 跨账号 Bedrock 凭证（可选）
 --bedrock-sk <secret>   # 跨账号 Bedrock 凭证（可选）
 --skip-cdk              # 跳过基础设施（已有 stack 时用）
@@ -91,21 +98,28 @@ cd /path/to/super-agent
 --skip-backend          # 跳过后端构建
 ```
 
+> **VPC**：默认**新建专属 VPC**（10.20.0.0/16，跨 AZ 的 public + private-NAT 子网，锁定在
+> AgentCore 支持的 AZ；us-east-1 = us-east-1a/b/c）。AgentCore Runtime 跑在 private 子网
+> （需 NAT 出口，无公网 IP），EFS 挂载目标也在 private 子网。用 `--vpc-id` 或
+> `--use-default-vpc` 覆盖。
+
 ### ECS 部署流程（4 个阶段）
 
 **Phase 1: CDK Deploy**
-- 创建 VPC Security Groups、ECS Cluster、ALB
-- RDS PostgreSQL 16.6、ElastiCache Redis 7.1
+- （默认）新建专属 VPC：跨 AZ 的 public + private-NAT 子网 + NAT 网关（默认 1 个，`-c natGateways=<n>` 可调）
+- Security Groups、ECS Cluster、ALB
+- RDS PostgreSQL 16.9、ElastiCache Redis 7.1
 - S3 桶（Avatar、Skills、Workspace、Frontend）
-- CloudFront + ACM 证书 + Route53 ALIAS
-- IAM Roles（ECS Task Execution + Task Role）
+- **EFS**（文件系统 + access point `/workspaces` uid/gid 1000 + private 子网内的挂载目标 + NFS 安全组）
+- CloudFront（默认域名，或配合 `--domain` 时加 ACM 证书 + Route53 ALIAS）
+- IAM Roles（ECS Task Execution + Task Role，含 Bedrock Invoke/List、EFS、S3 权限）
 - ECS Service（初始 desiredCount=0，等待真实镜像）
 
 **Phase 2: Backend Deploy**
-- 构建后端 Docker 镜像（ARM64）→ 推送到 ECR
+- 构建后端 Docker 镜像（ARM64，含 LibreOffice + CJK 字体用于文档转 PDF）→ 推送到 ECR
 - 从 SecretsManager 获取 RDS 凭证
-- 通过 ECS run-task 执行 Prisma 迁移 + 数据库 seed
-- 注册 ECS Task Definition（含所有环境变量）
+- 通过 ECS run-task 执行 Prisma 迁移 + `seed.ts`（org / admin / 5 业务域 / 7 agent / model_providers）+ `seed-showcase-from-packs.ts`（行业大赏 showcase 数据）
+- 注册 ECS Task Definition（含所有环境变量；JWT_SECRET 跨部署复用，不会登出用户）
 - 更新 ECS Service → 等待服务稳定
 - 首次部署自动创建 admin 用户：`admin@example.com` / `Admin1234!`
 
@@ -114,18 +128,20 @@ cd /path/to/super-agent
 
 **Phase 4: AgentCore Setup**
 - 创建 ECR 仓库，构建推送 AgentCore ARM64 Docker 镜像
-- 创建 IAM Execution Role（Bedrock、S3、ECR、Browser、Code Interpreter 权限）
-- 创建 Bedrock AgentCore Runtime（使用 global inference profile）
+- 创建 IAM Execution Role（Bedrock、S3、ECR、Browser、Code Interpreter、EFS 权限）
+- 创建/确保 AgentCore Browser（web-bot-auth，非致命：失败也不阻断部署）
+- 创建 Bedrock AgentCore Runtime（EFS 模式：VPC 网络用 private-NAT 子网 + 挂载 EFS access point 到 `/mnt/efs`；默认模型 `us.anthropic.claude-opus-4-8` + `CLAUDE_CODE_DISABLE_THINKING=1`）
 - 更新 ECS Task Definition 启用 AgentCore 模式
 
 ### ECS 部署完成后
 
-访问 `https://app.example.com`（或 ALB DNS），使用 `admin@example.com` / `Admin1234!` 登录。
+访问脚本结尾打印的 URL（自定义域名，或 `https://xxxx.cloudfront.net`），使用
+`admin@example.com` / `Admin1234!` 登录。
 
-查看后端日志：
+查看后端日志（日志组以 stack 名为前缀）：
 
 ```bash
-aws logs tail /super-agent/ecs-backend --region <region> --follow
+aws logs tail /super-agent/<stack-lowercase>/ecs-backend --region <region> --follow
 ```
 
 > **重要**：首次登录后请立即修改 admin 密码。
@@ -187,7 +203,7 @@ cd /path/to/super-agent
 
 **Phase 1: CDK Deploy**
 - 创建 VPC Security Groups、EC2 (t4g.small ARM64)、EIP
-- RDS PostgreSQL 16.6、ElastiCache Redis 7.1
+- RDS PostgreSQL 16.9、ElastiCache Redis 7.1
 - S3 桶（Avatar、Skills、Workspace、Frontend）
 - CloudFront + ACM 证书 + Route53 ALIAS
 - IAM Role（EC2 + AgentCore）
@@ -284,8 +300,8 @@ sudo bash /path/to/infra/scripts/setup-litellm.sh
 **ECS 模式：**
 
 ```bash
-# CloudWatch Logs（推荐）
-aws logs tail /super-agent/ecs-backend --region <region> --follow
+# CloudWatch Logs（推荐；日志组以 stack 名为前缀）
+aws logs tail /super-agent/<stack-lowercase>/ecs-backend --region <region> --follow
 
 # 或通过 ECS Exec 进入容器
 TASK_ARN=$(aws ecs list-tasks --cluster <cluster-name> --service-name <service-name> --region <region> --query "taskArns[0]" --output text)
@@ -361,21 +377,22 @@ docker buildx build --platform linux/arm64 \
   --load .
 docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/super-agent-agentcore:latest
 
-# 通知 AgentCore 拉取新镜像（⚠️ --environment-variables 是全量替换，必须传完整）
-# 注意：ANTHROPIC_MODEL 必须使用 global inference profile（跨区域可用）
+# 通知 AgentCore 拉取新镜像（⚠️ --environment-variables 是全量替换，必须传完整；
+# EFS 模式下还必须带 --network-configuration 的 VPC/子网 与 --filesystem-configurations，
+# 否则会退化成 PUBLIC 且丢失 EFS 挂载。最省事是直接重跑 deploy 脚本的 Phase 4。）
 aws bedrock-agentcore-control update-agent-runtime \
   --agent-runtime-id <runtime-id> \
   --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:latest"}}' \
   --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-role-<StackName>" \
   --network-configuration '{"networkMode":"PUBLIC"}' \
-  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"global.anthropic.claude-opus-4-6-v1","AWS_REGION":"<REGION>","WORKSPACE_S3_REGION":"<REGION>"}' \
+  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_DISABLE_THINKING":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","WORKSPACE_S3_REGION":"<REGION>"}' \
   --region <REGION>
 ```
 
 > **模型 ID 注意事项**：
-> - 使用 `global.anthropic.*` 前缀的 inference profile（所有区域可用）
-> - 不要使用 `us.anthropic.*`（仅 US 区域）或裸模型名（如 `claude-sonnet-4-6`）
-> - 可用 `aws bedrock list-inference-profiles --region <region>` 查看当前区域支持的 profile
+> - 默认使用 `us.anthropic.claude-opus-4-8`（配合 `CLAUDE_CODE_DISABLE_THINKING=1`，否则 CLI 发送的 `thinking.type.enabled` 会被 Opus 拒绝导致 agent 退出）
+> - 也可用 `global.anthropic.*` inference profile；用 `aws bedrock list-inference-profiles --region <region>` 查看当前区域支持的 profile
+> - Seed 会把 Bedrock provider 的 `default_model_id` 设为同一模型，后端每次调用都会显式带上
 
 ## AgentCore 存储模式（本地文件 / S3 / EFS）
 
@@ -423,9 +440,9 @@ aws bedrock-agentcore-control update-agent-runtime \
   --agent-runtime-id <runtime-id> \
   --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:latest"}}' \
   --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-role-<StackName>" \
-  --network-configuration '{"networkMode":"VPC","networkModeConfig":{"subnets":["<私有子网,需有NAT出口+EFS挂载目标>"],"securityGroups":["<允许2049的SG>"]}}' \
+  --network-configuration '{"networkMode":"VPC","networkModeConfig":{"subnets":["<private-NAT 子网,同 AZ 有 EFS 挂载目标>"],"securityGroups":["<允许2049的SG>"]}}' \
   --filesystem-configurations '[{"efsAccessPoint":{"accessPointArn":"<access-point-arn>","mountPath":"/mnt/efs"}}]' \
-  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","AGENT_WORKSPACE_BASE_DIR":"/mnt/efs"}' \
+  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_DISABLE_THINKING":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","AGENT_WORKSPACE_BASE_DIR":"/mnt/efs"}' \
   --region <REGION>
 
 # S3 模式：PUBLIC + 无 filesystem-configurations
@@ -434,18 +451,22 @@ aws bedrock-agentcore-control update-agent-runtime \
   --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:latest"}}' \
   --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-role-<StackName>" \
   --network-configuration '{"networkMode":"PUBLIC"}' \
-  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","WORKSPACE_S3_REGION":"<REGION>"}' \
+  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_DISABLE_THINKING":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","WORKSPACE_S3_REGION":"<REGION>"}' \
   --region <REGION>
 ```
 
-### EFS 模式的前置资源（deploy 脚本会自动按名字幂等创建）
+### EFS 模式的前置资源（ECS 模式由 CDK 在 CloudFormation 中创建）
 
-- **EFS 文件系统**（Name 标签 `super-agent-workspaces-efs`）
-- **access point**（Name 标签 `super-agent-workspaces-ap`，根目录 `/workspaces`，POSIX uid/gid **1000:1000**，与容器 `node` 用户一致）
-- **挂载目标**：必须在 runtime 所用子网的**每个 AZ** 各有一个；且这些子网要有出口（NAT）访问 Bedrock/ECR
-- **安全组**（`super-agent-efs-nfs`）：放行 TCP **2049**
-- **执行角色 IAM**：`elasticfilesystem:ClientMount`、`ClientWrite`（带 access point 条件）、`DescribeAccessPoints`、`DescribeMountTargets`
-- **ECS 后端任务**：任务定义需加 EFS volume + mountPoint 到 `/mnt/efs`，任务角色也需上述 EFS 权限
+`deploy-full-ecs.sh` 下这些资源由 CDK 栈（`super-agent-ecs-stack.ts`）声明式创建，脚本从
+stack 输出读取，无需手工建：
+
+- **EFS 文件系统** + **access point**（根目录 `/workspaces`，POSIX uid/gid **1000:1000**，与容器 `node` 用户一致）
+- **挂载目标**：建在 **private-NAT 子网**（EFS 按 AZ 生效，覆盖该 AZ 全部子网）；runtime 在同 AZ 的 private 子网即可挂载并有 NAT 出口
+- **NFS 安全组**：放行 TCP **2049**（来自 ECS SG 与自身）
+- **执行/任务角色 IAM**：`elasticfilesystem:ClientMount`、`ClientWrite`（带 access point 条件）、`DescribeAccessPoints`、`DescribeMountTargets`
+- **ECS 后端任务**：任务定义加 EFS volume + mountPoint 到 `/mnt/efs`（部署脚本 Phase 4 注入）
+
+> EC2 模式（`deploy-full.sh`）仍由脚本按 Name 标签幂等创建 EFS，不走 CDK。
 
 ### 在后端主机手动挂载 EFS
 
@@ -490,11 +511,11 @@ aws iam delete-role --role-name super-agent-agentcore-role-<StackName>
 
 ## 已知注意事项
 
-- **Bedrock 模型 ID**：必须使用 `global.anthropic.*` inference profile（如 `global.anthropic.claude-sonnet-4-6`），不要使用 `us.anthropic.*`（仅 US 区域）或裸 Anthropic API 名称
-- **ECS 模式 — Prisma 迁移**：由于 RDS 不可公网访问，迁移通过 ECS run-task 在 VPC 内执行；`prisma.config.ts` 中的 `dotenv/config` 在生产镜像中不可用，部署脚本会自动重写配置
-- **ECS 模式 — 初始 desiredCount=0**：CDK 创建 ECS Service 时使用占位镜像，desiredCount 设为 0 避免健康检查失败；部署脚本推送真实镜像后设为 1
-- **EC2 UserData 耗时**：首次创建 EC2 约需 3-5 分钟完成 bootstrap，`deploy-full.sh` 会自动等待
-- **CloudFront Origin**：ECS 模式直接使用 ALB DNS 作为 origin（无占位符）；EC2 模式使用占位符，`deploy-full.sh` 会自动替换
-- **`DnsValidatedCertificate` 废弃警告**：CDK 会输出 deprecation warning，功能正常，未来版本需迁移到 `acm.Certificate`
+- **Bedrock 模型 ID**：默认 `us.anthropic.claude-opus-4-8`（配合 `CLAUDE_CODE_DISABLE_THINKING=1`）；`global.anthropic.*` inference profile 也可用。`aws bedrock list-inference-profiles` 查看当前区域支持的 profile
+- **AgentCore Runtime 必须在 private-NAT 子网**：runtime ENI 无公网 IP，只能经 NAT 出口访问 Bedrock；用 IGW-only 的 public 子网会导致 health check 超时。deploy 脚本从 `AgentcoreSubnets` stack 输出取 private 子网
+- **EFS 一次性调优**：EFS 挂载是**按 AZ**（不是按子网），挂载目标在某 AZ 的任一子网即可服务该 AZ 的全部子网；CloudFormation **无法**原地把挂载目标在同 AZ 内换子网（1-per-AZ 限制），全新 VPC 首次部署无此问题
+- **ECS 模式 — Prisma 迁移/seed**：RDS 不可公网访问，迁移与 seed 通过 ECS run-task 在 VPC 内执行；镜像已把 `tsx`+`dotenv` 放进生产依赖，`prisma.config.ts` 由脚本重写（不依赖 `dotenv/config`）
+- **ECS 模式 — 初始 desiredCount=0**：CDK 创建 ECS Service 时用占位镜像，desiredCount=0 避免健康检查失败；部署脚本推送真实镜像后设为 1
+- **CloudFront Origin**：ECS 模式直接用 ALB DNS 作为 origin；`/api/*`、`/ws/*` 反代到 ALB，静态文件走 S3（OAC）
 - **S3 桶 RETAIN 策略**：Avatar 和 Skills 桶设为 RETAIN，CDK destroy 不会删除，需手动清理
-- **所有资源同 VPC**：ECS tasks、RDS、ElastiCache、ALB 必须在同一 VPC 内，安全组规则控制互访
+- **所有资源同 VPC**：ECS tasks、RDS、ElastiCache、ALB、EFS、AgentCore Runtime 在同一 VPC，安全组规则控制互访

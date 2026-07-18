@@ -23,6 +23,33 @@ const DEFAULT_TOOLS = [
 
 const s3 = new S3Client({ region: process.env.WORKSPACE_S3_REGION ?? 'us-east-1' });
 
+/**
+ * Discover local plugins cloned into {cwd}/.claude/plugins/{name}/.
+ * A valid plugin root contains a .claude-plugin/plugin.json manifest. Returns
+ * absolute paths suitable for the SDK `plugins: [{ type: 'local', path }]` option.
+ * Mode-agnostic: cwd is the EFS shared mount or the S3-restored /workspace.
+ */
+function discoverLocalPlugins(cwd: string): string[] {
+  const pluginsDir = `${cwd}/.claude/plugins`;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(pluginsDir, { withFileTypes: true });
+  } catch {
+    return []; // no plugins dir
+  }
+  const found: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = `${pluginsDir}/${entry.name}`;
+    if (fs.existsSync(`${dir}/.claude-plugin/plugin.json`)) {
+      found.push(dir);
+    } else {
+      console.warn(`[agent-runner] Skipping "${entry.name}": no .claude-plugin/plugin.json manifest`);
+    }
+  }
+  return found;
+}
+
 // ---------------------------------------------------------------------------
 // SDK Hooks for S3 sync (replaces file-watcher.ts)
 // ---------------------------------------------------------------------------
@@ -371,6 +398,17 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
 
   if (payload.mcp_servers && Object.keys(payload.mcp_servers).length > 0) {
     baseOptions.mcpServers = payload.mcp_servers;
+  }
+
+  // Local plugins: the backend clones scope-bound plugins into
+  // {workspace}/.claude/plugins/{name}/. Discover them from cwd (works in both
+  // EFS and S3 mode — the dir is on the shared mount or the restored workspace)
+  // and pass them to the SDK so the agent actually loads them. A valid plugin
+  // dir has a .claude-plugin/plugin.json manifest.
+  const pluginPaths = discoverLocalPlugins(cwd);
+  if (pluginPaths.length > 0) {
+    baseOptions.plugins = pluginPaths.map(p => ({ type: 'local' as const, path: p }));
+    console.log(`[agent-runner] Loaded ${pluginPaths.length} local plugin(s): ${pluginPaths.join(', ')}`);
   }
 
   const bucket = payload.workspace_s3_bucket;

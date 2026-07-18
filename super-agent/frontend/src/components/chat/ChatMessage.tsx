@@ -53,6 +53,34 @@ function isFileWriteTool(name: string): boolean {
     lower.includes('save_file')
 }
 
+/** Normalize an absolute/agent-reported path to a workspace-relative path. */
+function normalizeToWorkspaceRelative(val: string): string {
+  let normalized = val
+  // Strip common absolute prefixes that agents use:
+  //   /workspace/documents/file.md → documents/file.md
+  //   /mnt/efs/<org>/<user>/<scope>/sessions/<id>/app/x.pptx → app/x.pptx
+  //   /tmp/workspaces/<id>/<id>/documents/file.md → documents/file.md
+  //   /home/user/documents/file.md → documents/file.md
+  const prefixPatterns = [
+    /^\/workspace\//,                                                  // /workspace/rest
+    /^\/mnt\/efs\/[^/]+\/[^/]+\/[^/]+\/sessions\/[^/]+\//,             // EFS per-user session dir
+    /^\/mnt\/efs\/[^/]+\/[^/]+\/sessions\/[^/]+\//,                    // EFS (no userId) session dir
+    /^\/tmp\/workspaces\/[^/]+\/[^/]+\//,                              // /tmp/workspaces/agentId/sessionId/rest
+    /^\/tmp\/workspaces\/[^/]+\//,                                     // /tmp/workspaces/agentId/rest
+    /^\/workspaces\/[^/]+\/[^/]+\//,                                   // /workspaces/agentId/sessionId/rest
+    /^\/workspaces\/[^/]+\//,                                          // /workspaces/agentId/rest
+    /^\/home\/[^/]+\//,                                               // /home/user/rest
+  ]
+  for (const pattern of prefixPatterns) {
+    if (pattern.test(normalized)) {
+      normalized = normalized.replace(pattern, '')
+      break
+    }
+  }
+  // Strip leading ./ or /
+  return normalized.replace(/^\.\//, '').replace(/^\//, '')
+}
+
 /** Extract file path from tool_use input */
 function extractFilePath(input: Record<string, unknown>): string | null {
   // Common field names for file path in various tool schemas
@@ -60,63 +88,88 @@ function extractFilePath(input: Record<string, unknown>): string | null {
   for (const field of pathFields) {
     const val = input[field]
     if (typeof val === 'string' && val.length > 0) {
-      let normalized = val
-
-      // Strip common absolute prefixes that agents use:
-      // /workspace/documents/file.md → documents/file.md
-      // /tmp/workspaces/<id>/<id>/documents/file.md → documents/file.md
-      // /home/user/documents/file.md → documents/file.md
-      const prefixPatterns = [
-        /^\/workspace\//,                              // /workspace/rest
-        /^\/tmp\/workspaces\/[^/]+\/[^/]+\//,         // /tmp/workspaces/agentId/sessionId/rest
-        /^\/tmp\/workspaces\/[^/]+\//,                 // /tmp/workspaces/agentId/rest
-        /^\/workspaces\/[^/]+\/[^/]+\//,              // /workspaces/agentId/sessionId/rest
-        /^\/workspaces\/[^/]+\//,                     // /workspaces/agentId/rest
-        /^\/home\/[^/]+\//,                           // /home/user/rest
-      ]
-      for (const pattern of prefixPatterns) {
-        if (pattern.test(normalized)) {
-          normalized = normalized.replace(pattern, '')
-          break
-        }
-      }
-
-      // Strip leading ./ or /
-      normalized = normalized.replace(/^\.\//, '').replace(/^\//, '')
-      return normalized
+      return normalizeToWorkspaceRelative(val)
     }
   }
   return null
 }
 
-/** Extract artifacts from content blocks (file write tool_use followed by successful tool_result) */
+/**
+ * "Output" file extensions — deliverables the user actually wants to preview.
+ * Scripts (.py, .sh, .js…) that merely produce these are lower priority.
+ */
+const OUTPUT_EXTENSIONS = new Set([
+  'pptx', 'ppt', 'pdf', 'xlsx', 'xls', 'csv', 'docx', 'doc',
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp',
+  'md', 'txt', 'html', 'htm', 'json', 'zip',
+])
+const SCRIPT_EXTENSIONS = new Set(['py', 'sh', 'js', 'ts', 'rb', 'pl', 'bash'])
+
+function extOf(p: string): string {
+  return p.split('.').pop()?.toLowerCase() ?? ''
+}
+
+/**
+ * Extract file paths mentioned in assistant text (e.g. "已生成 app/x.pptx" or
+ * `app/x.pptx`). Catches deliverables produced via Bash/scripts that never show
+ * up as a Write tool_use. Only keeps paths that carry a known file extension.
+ */
+function extractPathsFromText(text: string): string[] {
+  const found: string[] = []
+  // Match backticked paths and bare path-like tokens containing a dot-extension.
+  const re = /`([^`\n]+?\.[a-zA-Z0-9]{1,5})`|(?:^|[\s(（"'"：:])((?:\/|\.\/|[\w.-]+\/)?[\w./-]+\.[a-zA-Z0-9]{1,5})/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const raw = (m[1] || m[2] || '').trim()
+    if (!raw) continue
+    const norm = normalizeToWorkspaceRelative(raw)
+    if (norm && OUTPUT_EXTENSIONS.has(extOf(norm))) found.push(norm)
+  }
+  return found
+}
+
+/**
+ * Extract artifacts a message produced. Combines two signals so deliverables
+ * created by scripts (e.g. python make_ppt.py → app/x.pptx run via Bash) are
+ * surfaced, not just files written by a Write tool:
+ *   1. successful file-write tool_use blocks
+ *   2. file paths named in the assistant's text (output extensions only)
+ * When real output files (pptx/pdf/xlsx/…) are present, intermediate scripts
+ * (.py/.sh/…) are dropped so the preview points at the actual deliverable.
+ */
 function extractArtifacts(content: ContentBlock[]): ArtifactInfo[] {
-  const artifacts: ArtifactInfo[] = []
   const seenPaths = new Set<string>()
+  const collected: ArtifactInfo[] = []
+  const add = (path: string) => {
+    if (!path || seenPaths.has(path)) return
+    seenPaths.add(path)
+    collected.push({ path, name: path.split('/').pop() || path })
+  }
 
   for (let i = 0; i < content.length; i++) {
     const block = content[i]
-    if (block.type !== 'tool_use') continue
-    if (!isFileWriteTool(block.name)) continue
-
-    const path = extractFilePath(block.input as Record<string, unknown>)
-    if (!path) continue
-
-    // Check if there's a successful tool_result after this
-    const resultBlock = content.slice(i + 1).find(
-      b => b.type === 'tool_result' && b.tool_use_id === block.id
-    )
-    if (resultBlock && resultBlock.type === 'tool_result' && resultBlock.is_error) continue
-
-    // Deduplicate
-    if (seenPaths.has(path)) continue
-    seenPaths.add(path)
-
-    const name = path.split('/').pop() || path
-    artifacts.push({ path, name })
+    // 1) File-write tool calls with a successful result.
+    if (block.type === 'tool_use' && isFileWriteTool(block.name)) {
+      const path = extractFilePath(block.input as Record<string, unknown>)
+      if (!path) continue
+      const resultBlock = content.slice(i + 1).find(
+        b => b.type === 'tool_result' && b.tool_use_id === block.id
+      )
+      if (resultBlock && resultBlock.type === 'tool_result' && resultBlock.is_error) continue
+      add(path)
+    }
+    // 2) File paths named in assistant text (catches Bash/script-produced files).
+    if (block.type === 'text' && 'text' in block && typeof block.text === 'string') {
+      for (const p of extractPathsFromText(block.text)) add(p)
+    }
   }
 
-  return artifacts
+  // Prefer real deliverables: if any output-type file is present, drop scripts.
+  const hasOutput = collected.some(a => OUTPUT_EXTENSIONS.has(extOf(a.path)))
+  if (hasOutput) {
+    return collected.filter(a => !SCRIPT_EXTENSIONS.has(extOf(a.path)))
+  }
+  return collected
 }
 
 /**

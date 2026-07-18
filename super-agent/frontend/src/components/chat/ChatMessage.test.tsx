@@ -84,4 +84,29 @@ describe('ChatMessage', () => {
     expect(resultBlock).toHaveAttribute('data-error', 'true');
     expect(screen.getByText('Error')).toBeInTheDocument();
   });
+
+  it('surfaces a script-produced output file named in text, dropping the script', () => {
+    // Agent writes make_ppt.py (Write) then runs it via Bash to produce a .pptx.
+    const content: ContentBlock[] = [
+      { type: 'tool_use', id: 'w1', name: 'Write', input: { file_path: 'app/make_ppt.py' } },
+      { type: 'tool_result', tool_use_id: 'w1', content: 'ok', is_error: false },
+      { type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'python app/make_ppt.py' } },
+      { type: 'tool_result', tool_use_id: 'b1', content: 'done', is_error: false },
+      { type: 'text', text: '已生成两页 PPT：app/mobile_support.pptx' },
+    ];
+    render(<ChatMessage content={content} />);
+    // The deliverable is surfaced...
+    expect(screen.getByText('mobile_support.pptx')).toBeInTheDocument();
+    // ...and the intermediate script is not shown as an artifact.
+    expect(screen.queryByText('make_ppt.py')).not.toBeInTheDocument();
+  });
+
+  it('keeps a Write-created document as an artifact', () => {
+    const content: ContentBlock[] = [
+      { type: 'tool_use', id: 'w1', name: 'Write', input: { file_path: '/workspace/documents/report.md' } },
+      { type: 'tool_result', tool_use_id: 'w1', content: 'ok', is_error: false },
+    ];
+    render(<ChatMessage content={content} />);
+    expect(screen.getByText('report.md')).toBeInTheDocument();
+  });
 });

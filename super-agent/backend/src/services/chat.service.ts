@@ -417,9 +417,10 @@ export class ChatService {
     const { skillService: scopeSkillService } = await import('./skill.service.js');
     const { documentGroupRepository: docGroupRepo } = await import('../repositories/document-group.repository.js');
 
-    const [agentsWithSkills, scopeLevelSkills, scopeMcpServers, scopePlugins, rawDocGroups] = await Promise.all([
+    const [agentsWithSkills, scopeLevelSkills, orgLevelSkills, scopeMcpServers, scopePlugins, rawDocGroups] = await Promise.all([
       this.businessScopeService.getScopeAgentsWithSkills(scopeId, organizationId),
       scopeSkillService.getScopeLevelSkills(organizationId, scopeId),
+      scopeSkillService.getOrgLevelSkills(organizationId),
       this.loadScopeMcpServers(scopeId),
       this.loadScopePlugins(scopeId),
       docGroupRepo.getGroupsForScope(scopeId),
@@ -448,8 +449,10 @@ export class ChatService {
       }
     }
 
-    // Scope-level skills
-    for (const skill of scopeLevelSkills) {
+    // Scope-level + org-level skills. Org-level skills (installed org-wide from
+    // the Tools marketplace, marked metadata.orgLevel) are auto-included in every
+    // scope so "install once → all agents can use it".
+    for (const skill of [...scopeLevelSkills, ...orgLevelSkills]) {
       if (!skillMap.has(skill.id)) {
         const meta = skill.metadata as Record<string, unknown> | null;
         skillMap.set(skill.id, {

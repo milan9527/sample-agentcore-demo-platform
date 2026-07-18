@@ -444,6 +444,32 @@ async function main() {
   ]);
   console.log(`Created ${mcpServers.length} MCP servers`);
 
+  // Create Model Providers
+  // The chat/agent model picker is populated from model_providers rows. Without
+  // at least one enabled row the dropdown is empty and no model can be selected.
+  // Seed the Amazon Bedrock org-default (no credentials needed — uses the task
+  // role's Bedrock access). LiteLLM/other providers are added by users in
+  // Settings → Models (they require a gateway base_url + API key credential).
+  console.log('Creating model providers...');
+  const modelProviders = await Promise.all([
+    prisma.model_providers.upsert({
+      where: { unique_provider_name_per_org: { organization_id: orgId, name: 'Amazon Bedrock' } },
+      update: {},
+      create: {
+        organization_id: orgId,
+        name: 'Amazon Bedrock',
+        type: 'bedrock',
+        // Default model: Claude Opus 4.8. Works with the container's Claude Code
+        // CLI when CLAUDE_CODE_DISABLE_THINKING=1 is set on the runtime.
+        default_model_id: 'us.anthropic.claude-opus-4-8',
+        is_org_default: true,
+        status: 'active',
+        created_by: userId,
+      },
+    }),
+  ]);
+  console.log(`Created ${modelProviders.length} model providers`);
+
   // Create Documents
   console.log('Creating documents...');
   const documents = await Promise.all([

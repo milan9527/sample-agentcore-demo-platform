@@ -254,6 +254,28 @@ export class SkillService {
   }
 
   /**
+   * Get org-level skills (installed org-wide via `metadata.orgLevel = true`).
+   * These are auto-included in every scope workspace.
+   */
+  async getOrgLevelSkills(organizationId: string): Promise<SkillEntity[]> {
+    return skillRepository.findOrgLevelSkills(organizationId);
+  }
+
+  /**
+   * Mark a skill as org-level so it is auto-included in every scope's workspace,
+   * then invalidate all scope workspaces so existing sessions re-materialize it.
+   * Used when a skill is installed from the global Tools marketplace (no session).
+   */
+  async markSkillOrgLevel(organizationId: string, skillId: string): Promise<void> {
+    const skill = await skillRepository.findById(skillId, organizationId);
+    if (!skill) throw AppError.notFound(`Skill with ID ${skillId} not found`);
+
+    const metadata = { ...(skill.metadata as Record<string, unknown> ?? {}), orgLevel: true };
+    await skillRepository.update(skillId, organizationId, { metadata });
+    await businessScopeService.bumpAllConfigVersions(organizationId);
+  }
+
+  /**
    * Get all skills from all agents in a business scope (via agent_skills).
    * Returns deduplicated skill entities.
    */

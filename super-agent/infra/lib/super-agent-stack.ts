@@ -114,7 +114,7 @@ export class SuperAgentStack extends cdk.Stack {
     // =========================================================================
     const dbInstance = new rds.DatabaseInstance(this, 'SuperAgentDB', {
       engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_6,
+        version: rds.PostgresEngineVersion.VER_16_9,
       }),
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
       vpc,

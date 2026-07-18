@@ -86,6 +86,17 @@ export async function resolveModel(
     return { provider: 'bedrock', modelId: selection?.modelId };
   }
 
+  // Safety net: a selection with a providerId but NO modelId falls back to the
+  // provider's default_model_id below. This is how "picked provider A but chat
+  // used provider B's model" happened — a stale providerId-only scope/agent
+  // default. Log it so the effective model is always traceable, and it's clear
+  // the fallback is the *resolved* provider's own default (never another's).
+  if (selection?.providerId && !selection?.modelId) {
+    console.warn(
+      `[resolveModel] providerId-only selection (no modelId): provider="${provider.name}" (${provider.type}) → falling back to its default_model_id="${provider.default_model_id ?? '(none)'}"`,
+    );
+  }
+
   if (provider.type === 'litellm') {
     let apiKey: string | undefined;
     if (provider.credential_id) {

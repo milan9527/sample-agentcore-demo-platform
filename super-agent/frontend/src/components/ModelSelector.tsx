@@ -52,7 +52,15 @@ export function ModelSelector({
       )}
       <select
         value={providerId}
-        onChange={(e) => onChange({ providerId: e.target.value || undefined, modelId: undefined })}
+        onChange={(e) => {
+          // When switching provider, default the model to that provider's own
+          // default_model_id (not undefined). A providerId-only selection would
+          // otherwise resolve, at runtime, to whatever default_model_id the
+          // provider happens to have — surfacing as the wrong model in chat.
+          const pid = e.target.value || undefined
+          const chosen = providers.find(p => p.id === pid)
+          onChange({ providerId: pid, modelId: chosen?.default_model_id || undefined })
+        }}
         disabled={disabled}
         className="w-full px-3 py-2 text-sm bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-blue-500 focus:outline-none appearance-none cursor-pointer disabled:opacity-50"
       >

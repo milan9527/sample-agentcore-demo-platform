@@ -22,8 +22,10 @@ export AWS_PAGER=""
 # Options:
 #   --stack <name>          CloudFormation stack name (default: SuperAgent)
 #   --region <region>       AWS region (default: us-west-2)
-#   --domain <domain>       Custom domain for CloudFront (requires --hosted-zone-id)
-#   --hosted-zone-id <id>   Route53 hosted zone ID
+#   --domain <domain>       OPTIONAL custom domain for CloudFront (requires
+#                           --hosted-zone-id). Omit both to serve the app on the
+#                           auto-generated *.cloudfront.net domain (no Route53/ACM).
+#   --hosted-zone-id <id>   Route53 hosted zone ID (only with --domain)
 #   --bedrock-ak <key>      Bedrock AWS Access Key (cross-account, optional)
 #   --bedrock-sk <secret>   Bedrock AWS Secret Key (cross-account, optional)
 #   --skip-cdk              Skip CDK deploy (reuse existing stack)
@@ -45,12 +47,13 @@ export AWS_PAGER=""
 #   - One mount target per ECS subnet AZ
 #
 # Examples:
-#   # Full deploy with custom domain:
+#   # Full deploy on the CloudFront default domain (NO custom domain / Route53):
+#   ./deploy-full-ecs.sh --stack SuperAgent48 --region us-east-1
+#   # → users access the app at the printed https://xxxx.cloudfront.net URL
+#
+#   # Full deploy with a custom domain:
 #   ./deploy-full-ecs.sh --stack SuperAgent36 --region ap-northeast-1 \
 #     --domain app36.zhangwangshu.com --hosted-zone-id Z0941803Z9XESANM6GCQ
-#
-#   # Full deploy, IP-only (no custom domain):
-#   ./deploy-full-ecs.sh
 #
 #   # Redeploy code only (stack + AgentCore already exist):
 #   ./deploy-full-ecs.sh --skip-cdk
@@ -68,6 +71,8 @@ SKIP_AGENTCORE=false
 SKIP_FRONTEND=false
 SKIP_BACKEND=false
 AGENTCORE_STORAGE="efs"
+IMPORT_VPC_ID=""
+USE_DEFAULT_VPC=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,6 +87,8 @@ while [[ $# -gt 0 ]]; do
     --skip-frontend)    SKIP_FRONTEND=true; shift ;;
     --skip-backend)     SKIP_BACKEND=true; shift ;;
     --agentcore-storage) AGENTCORE_STORAGE="$2"; shift 2 ;;
+    --vpc-id)           IMPORT_VPC_ID="$2"; shift 2 ;;
+    --use-default-vpc)  USE_DEFAULT_VPC=true; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -96,6 +103,30 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 BACKEND_ECR_REPO="super-agent-backend"
 BACKEND_ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$BACKEND_ECR_REPO"
 AGENTCORE_ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/super-agent-agentcore"
+
+# AgentCore-supported AZ IDs (the runtime + EFS mount targets must live here).
+# Overridable via env for regions beyond us-east-1.
+if [ -z "${AGENTCORE_SUPPORTED_AZIDS:-}" ]; then
+  case "$REGION" in
+    us-east-1) AGENTCORE_SUPPORTED_AZIDS="use1-az1,use1-az2,use1-az4" ;;
+    *)         AGENTCORE_SUPPORTED_AZIDS="" ;;  # empty = no AZ filter
+  esac
+fi
+export AGENTCORE_SUPPORTED_AZIDS
+
+# VPC strategy (default: create a NEW dedicated VPC via CDK with cross-AZ
+# public + private-NAT subnets in AgentCore-supported AZs). Override with:
+#   --vpc-id <id>   import an existing VPC (skips VPC creation)
+#   --use-default-vpc   import the account's default VPC
+# These map to CDK context (createVpc / vpcId). No CLI subnet discovery needed —
+# CDK builds the layout and the deploy reads subnets from stack outputs.
+if [ "$USE_DEFAULT_VPC" = true ]; then
+  echo "  VPC: importing account default VPC"
+elif [ -n "$IMPORT_VPC_ID" ]; then
+  echo "  VPC: importing $IMPORT_VPC_ID"
+else
+  echo "  VPC: creating a new dedicated VPC (public + private-NAT, AgentCore AZs)"
+fi
 
 echo "============================================="
 echo "  Super Agent Full Deploy (ECS)"
@@ -117,6 +148,13 @@ if [ "$SKIP_CDK" = false ]; then
   npm install
 
   CDK_ARGS="-c stackName=$STACK_NAME -c enableCdn=true -c deployTarget=ecs"
+
+  # VPC: import an explicit VPC, import default, or (default) create a new one.
+  if [ -n "$IMPORT_VPC_ID" ]; then
+    CDK_ARGS="$CDK_ARGS -c vpcId=$IMPORT_VPC_ID"
+  elif [ "$USE_DEFAULT_VPC" = true ]; then
+    CDK_ARGS="$CDK_ARGS -c createVpc=false"
+  fi
 
   if [ -n "$DOMAIN_NAME" ] && [ -n "$HOSTED_ZONE_ID" ]; then
     CDK_ARGS="$CDK_ARGS -c domainName=$DOMAIN_NAME -c hostedZoneId=$HOSTED_ZONE_ID"
@@ -160,6 +198,7 @@ REDIS_ENDPOINT=$(get_output "RedisEndpoint")
 REDIS_PORT_OUTPUT=$(get_output "RedisPort")
 FRONTEND_BUCKET=$(get_output "FrontendBucketName")
 CF_DIST_ID=$(get_output "CloudFrontDistributionId")
+CF_DOMAIN=$(get_output "CloudFrontDomainName")
 COGNITO_USER_POOL_ID=$(get_output "CognitoUserPoolId")
 COGNITO_CLIENT_ID=$(get_output "CognitoClientId")
 COGNITO_DOMAIN=$(get_output "CognitoDomainUrl")
@@ -173,6 +212,15 @@ ECS_TASK_ROLE_ARN=$(get_output "EcsTaskRoleArn")
 ALB_DNS=$(get_output "AlbDnsName")
 ECS_SUBNETS=$(get_output "EcsSubnets")
 ECS_SG=$(get_output "EcsSecurityGroup")
+VPC_ID=$(get_output "VpcId")
+# Private NAT-routed subnets for the AgentCore runtime (needs egress, no public IP).
+AGENTCORE_SUBNETS=$(get_output "AgentcoreSubnets")
+
+# EFS outputs (created by the CDK stack in EFS mode; empty in s3 mode)
+EFS_ID=$(get_output "EfsFileSystemId")
+EFS_AP_ID=$(get_output "EfsAccessPointId")
+EFS_AP_ARN=$(get_output "EfsAccessPointArn")
+EFS_SG=$(get_output "EfsSecurityGroup")
 
 echo "  DBEndpoint:       $DB_ENDPOINT"
 echo "  AuthMode:         $AUTH_MODE"
@@ -184,6 +232,18 @@ echo "  ECS Service:      $ECS_SERVICE_NAME"
 echo "  ALB DNS:          $ALB_DNS"
 [ -n "$DOMAIN_NAME" ] && echo "  DomainName:       $DOMAIN_NAME"
 [ -n "$CF_DIST_ID" ]  && echo "  CloudFrontDistId: $CF_DIST_ID"
+[ -n "$CF_DOMAIN" ]   && echo "  CloudFrontDomain: $CF_DOMAIN"
+
+# Public URL users hit: custom domain > CloudFront domain > ALB (no CDN).
+# CloudFront proxies /api/* and /ws/* to the ALB, so a single origin serves all.
+if [ -n "$DOMAIN_NAME" ]; then
+  APP_URL="https://$DOMAIN_NAME"
+elif [ -n "$CF_DOMAIN" ]; then
+  APP_URL="https://$CF_DOMAIN"
+else
+  APP_URL="http://$ALB_DNS"
+fi
+echo "  App URL:          $APP_URL"
 
 # =========================================================================
 # Fix CloudFront ALB origin (replace placeholder with actual ALB DNS)
@@ -268,8 +328,8 @@ if [ "$SKIP_BACKEND" = false ]; then
   # --- 2d: Run Prisma migrations via ECS run-task (RDS is not publicly accessible) ---
   echo "  [2d] Running Prisma migrations via ECS task..."
 
-  # Register a one-off migration task definition
-  # Note: We rewrite prisma.config.ts without dotenv (not installed in prod image)
+  # Register a one-off migration task definition (uses the freshly-built backend
+  # image, which now ships tsx + dotenv as prod deps so `npx tsx prisma/seed.ts` runs).
   MIGRATE_TASK_JSON=$(python3 << PYEOF
 import json
 task_def = {
@@ -362,12 +422,17 @@ import { defineConfig } from "prisma/config";
 export default defineConfig({ schema: "prisma/schema.prisma", migrations: { path: "prisma/migrations" }, datasource: { url: process.env.DATABASE_URL } });
 HEREDOC
 npx tsx prisma/seed.ts 2>&1 || echo "(Seed skipped - may already exist)"
+npx tsx prisma/seed-showcase-from-packs.ts 2>&1 || echo "(Showcase seed skipped or not available)"
 echo 'const b=require("bcryptjs");const{Client}=require("pg");(async()=>{const h=await b.hash("Admin1234!",10);const c=new Client({connectionString:process.env.DATABASE_URL});await c.connect();const r=await c.query("UPDATE profiles SET password_hash=$1 WHERE username=$2",[h,"admin@example.com"]);console.log("Updated:",r.rowCount);await c.end()})()' > /app/setpw.cjs && node /app/setpw.cjs"""
 
 overrides = {
     "containerOverrides": [{
         "name": "migrate",
-        "command": ["sh", "-c", cmd],
+        # The migrate task definition's entryPoint is already ["sh","-c"], so the
+        # command override must be a SINGLE shell-string arg. Passing
+        # ["sh","-c",cmd] would double-wrap (sh -c sh -c cmd → runs `sh` no-op,
+        # exits 0) and silently skip the seed + admin-password step.
+        "command": [cmd],
         "environment": [{"name": "DATABASE_URL", "value": db_url}]
     }]
 }
@@ -391,16 +456,37 @@ PYEOF
   # --- 2e: Determine environment variables for ECS task ---
   echo "  [2e] Configuring ECS task environment..."
 
-  # Determine CORS and APP_URL
+  # Determine CORS and APP_URL — prefer custom domain, then CloudFront, then ALB.
+  # Browsers hit the CloudFront domain, so CORS must allow it (not the ALB).
   if [ -n "$DOMAIN_NAME" ]; then
     APP_URL="https://$DOMAIN_NAME"
-    CORS_VALUE="https://$DOMAIN_NAME"
+  elif [ -n "$CF_DOMAIN" ]; then
+    APP_URL="https://$CF_DOMAIN"
   else
     APP_URL="http://$ALB_DNS"
-    CORS_VALUE="http://$ALB_DNS"
   fi
+  CORS_VALUE="$APP_URL"
 
-  JWT_SECRET=$(openssl rand -hex 32)
+  # JWT_SECRET must be STABLE across deploys, otherwise every deploy invalidates
+  # all issued tokens and logs everyone out. Reuse the value from the currently
+  # running task definition if present; only generate a fresh one on first deploy.
+  JWT_SECRET=""
+  EXISTING_TASKDEF=$(aws ecs describe-services --cluster "$ECS_CLUSTER_NAME" \
+    --services "$ECS_SERVICE_NAME" --region "$REGION" \
+    --query 'services[0].taskDefinition' --output text 2>/dev/null || echo "")
+  if [ -n "$EXISTING_TASKDEF" ] && [ "$EXISTING_TASKDEF" != "None" ]; then
+    JWT_SECRET=$(aws ecs describe-task-definition --task-definition "$EXISTING_TASKDEF" \
+      --region "$REGION" \
+      --query "taskDefinition.containerDefinitions[0].environment[?name=='JWT_SECRET'].value | [0]" \
+      --output text 2>/dev/null || echo "")
+    [ "$JWT_SECRET" = "None" ] && JWT_SECRET=""
+  fi
+  if [ -z "$JWT_SECRET" ]; then
+    JWT_SECRET=$(openssl rand -hex 32)
+    echo "  Generated a new JWT_SECRET (first deploy)."
+  else
+    echo "  Reusing existing JWT_SECRET (sessions preserved across deploy)."
+  fi
 
   # --- 2f: Register new ECS task definition ---
   echo "  [2f] Registering ECS task definition..."
@@ -569,12 +655,7 @@ if [ "$SKIP_FRONTEND" = false ]; then
   echo ""
   echo "=== Phase 3: Build & Deploy Frontend ==="
 
-  # Determine APP_URL for frontend build
-  if [ -n "$DOMAIN_NAME" ]; then
-    APP_URL="https://$DOMAIN_NAME"
-  else
-    APP_URL="http://$ALB_DNS"
-  fi
+  # APP_URL was derived once from stack outputs (custom domain > CloudFront > ALB).
 
   cd "$PROJECT_ROOT/frontend"
 
@@ -650,111 +731,35 @@ if [ "$SKIP_AGENTCORE" = false ]; then
       --description "Execution role for Super Agent AgentCore containers ($STACK_NAME)"
   fi
 
-  # --- 4b-efs: Ensure EFS infrastructure (EFS mode only) ---
+  # --- 4b-efs: EFS is created by the CDK stack (CloudFormation) ---
+  # The filesystem, access point, mount targets (one per AZ) and NFS SG are all
+  # defined in super-agent-ecs-stack.ts and surfaced as stack outputs. Here we
+  # only validate they exist and build the IAM statement for the AgentCore role.
   # EFS is ADDITIVE to S3: the skills bucket (and, in s3 mode, the workspace
-  # bucket) remain in use. In efs mode we mount a shared access point at
-  # /mnt/efs on both the AgentCore runtime and the ECS backend task.
-  EFS_ID=""
-  EFS_AP_ID=""
-  EFS_AP_ARN=""
-  EFS_SG=""
+  # bucket) remain in use. In efs mode the access point mounts at /mnt/efs on
+  # both the AgentCore runtime and the ECS backend task.
   EFS_STATEMENT=""
   if [ "$AGENTCORE_STORAGE" = "efs" ]; then
-    echo "  [4b-efs] Ensuring EFS infrastructure..."
-    EFS_FS_NAME="super-agent-workspaces-efs"
-    EFS_AP_NAME="super-agent-workspaces-ap"
-    EFS_SG_NAME="super-agent-efs-nfs"
-
-    # Resolve the VPC id from the first ECS subnet
-    FIRST_SUBNET="${ECS_SUBNETS%%,*}"
-    if [ -z "$FIRST_SUBNET" ]; then
-      echo "  ERROR: EcsSubnets stack output is empty; cannot provision EFS." >&2
+    echo "  [4b-efs] Using EFS from CloudFormation stack outputs..."
+    if [ -z "$EFS_ID" ] || [ "$EFS_ID" = "None" ] || [ -z "$EFS_AP_ID" ] || [ "$EFS_AP_ID" = "None" ]; then
+      echo "  ERROR: EFS stack outputs missing (EfsFileSystemId/EfsAccessPointId)." >&2
+      echo "         Re-run WITHOUT --skip-cdk so the CDK stack creates EFS, or check the stack." >&2
       exit 1
     fi
-    VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$FIRST_SUBNET" --region "$REGION" \
-      --query "Subnets[0].VpcId" --output text)
-    echo "    VPC: $VPC_ID"
-
-    # 1) Look up (or create) the EFS filesystem by Name tag
-    EFS_ID=$(aws efs describe-file-systems --region "$REGION" \
-      --query "FileSystems[?Name=='$EFS_FS_NAME'].FileSystemId | [0]" --output text 2>/dev/null || echo "")
-    if [ -z "$EFS_ID" ] || [ "$EFS_ID" = "None" ]; then
-      echo "    Creating EFS filesystem $EFS_FS_NAME..."
-      EFS_ID=$(aws efs create-file-system --region "$REGION" \
-        --encrypted --performance-mode generalPurpose --throughput-mode elastic \
-        --tags "Key=Name,Value=$EFS_FS_NAME" \
-        --query "FileSystemId" --output text)
-      echo "    Waiting for EFS $EFS_ID to become available..."
-      for i in $(seq 1 30); do
-        FS_STATE=$(aws efs describe-file-systems --file-system-id "$EFS_ID" --region "$REGION" \
-          --query "FileSystems[0].LifeCycleState" --output text 2>/dev/null || echo "unknown")
-        [ "$FS_STATE" = "available" ] && break
-        echo "    Attempt $i/30 - EFS state: $FS_STATE, waiting 5s..."
-        sleep 5
-      done
+    # Prefer the CDK access point ARN; fall back to constructing it.
+    if [ -z "$EFS_AP_ARN" ] || [ "$EFS_AP_ARN" = "None" ]; then
+      EFS_AP_ARN="arn:aws:elasticfilesystem:$REGION:$ACCOUNT_ID:access-point/$EFS_AP_ID"
     fi
     echo "    EFS_ID: $EFS_ID"
-
-    # 2) Ensure NFS security group (inbound 2049 from ECS SG + itself)
-    EFS_SG=$(aws ec2 describe-security-groups --region "$REGION" \
-      --filters "Name=group-name,Values=$EFS_SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
-      --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "")
-    if [ -z "$EFS_SG" ] || [ "$EFS_SG" = "None" ]; then
-      echo "    Creating security group $EFS_SG_NAME..."
-      EFS_SG=$(aws ec2 create-security-group --region "$REGION" \
-        --group-name "$EFS_SG_NAME" --vpc-id "$VPC_ID" \
-        --description "NFS 2049 for super-agent EFS workspaces" \
-        --query "GroupId" --output text)
-    fi
-    echo "    EFS_SG: $EFS_SG"
-    # Ingress from the ECS service SG (idempotent; tolerate Duplicate)
-    if [ -n "$ECS_SG" ] && [ "$ECS_SG" != "None" ]; then
-      aws ec2 authorize-security-group-ingress --region "$REGION" \
-        --group-id "$EFS_SG" --protocol tcp --port 2049 --source-group "$ECS_SG" \
-        2>/dev/null || echo "    (ingress from ECS_SG already present)"
-    fi
-    # Ingress from itself (covers runtime ENIs that use the EFS SG)
-    aws ec2 authorize-security-group-ingress --region "$REGION" \
-      --group-id "$EFS_SG" --protocol tcp --port 2049 --source-group "$EFS_SG" \
-      2>/dev/null || echo "    (ingress from self already present)"
-
-    # 3) Ensure one mount target per ECS subnet AZ
-    IFS=',' read -ra EFS_SUBNET_ARR <<< "$ECS_SUBNETS"
-    for SUBNET in "${EFS_SUBNET_ARR[@]}"; do
-      [ -z "$SUBNET" ] && continue
-      SUBNET_AZ=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --region "$REGION" \
-        --query "Subnets[0].AvailabilityZone" --output text 2>/dev/null || echo "")
-      # Is there already a mount target in this AZ?
-      EXISTING_MT_AZ=$(aws efs describe-mount-targets --file-system-id "$EFS_ID" --region "$REGION" \
-        --query "MountTargets[?AvailabilityZoneName=='$SUBNET_AZ'].MountTargetId | [0]" \
-        --output text 2>/dev/null || echo "")
-      if [ -n "$EXISTING_MT_AZ" ] && [ "$EXISTING_MT_AZ" != "None" ]; then
-        echo "    Mount target already exists in $SUBNET_AZ ($EXISTING_MT_AZ)"
-        continue
-      fi
-      echo "    Creating mount target in $SUBNET ($SUBNET_AZ)..."
-      aws efs create-mount-target --file-system-id "$EFS_ID" --region "$REGION" \
-        --subnet-id "$SUBNET" --security-groups "$EFS_SG" 2>/dev/null \
-        || echo "    (mount target for $SUBNET_AZ already exists or conflicts; continuing)"
-    done
-
-    # 4) Ensure access point (look up by Name tag on this filesystem)
-    EFS_AP_ID=$(aws efs describe-access-points --file-system-id "$EFS_ID" --region "$REGION" \
-      --query "AccessPoints[?Tags[?Key=='Name' && Value=='$EFS_AP_NAME']].AccessPointId | [0]" \
-      --output text 2>/dev/null || echo "")
-    if [ -z "$EFS_AP_ID" ] || [ "$EFS_AP_ID" = "None" ]; then
-      echo "    Creating access point $EFS_AP_NAME..."
-      EFS_AP_ID=$(aws efs create-access-point --file-system-id "$EFS_ID" --region "$REGION" \
-        --posix-user "Uid=1000,Gid=1000" \
-        --root-directory 'Path=/workspaces,CreationInfo={OwnerUid=1000,OwnerGid=1000,Permissions=0755}' \
-        --tags "Key=Name,Value=$EFS_AP_NAME" \
-        --query "AccessPointId" --output text)
-    fi
-    EFS_AP_ARN="arn:aws:elasticfilesystem:$REGION:$ACCOUNT_ID:access-point/$EFS_AP_ID"
     echo "    EFS_AP_ID: $EFS_AP_ID"
     echo "    EFS_AP_ARN: $EFS_AP_ARN"
+    echo "    EFS_SG: $EFS_SG"
 
     # Build the extra IAM statement (leading comma so it appends cleanly).
+    # CreateAgentRuntime with EFS validates that the role can both mount the
+    # access point (ClientMount/ClientWrite) AND describe the access point +
+    # mount targets. The Describe* actions don't support resource-level scoping,
+    # so they need Resource:* in their own statement.
     EFS_STATEMENT=",
         {
           \"Sid\": \"EFSMount\",
@@ -762,6 +767,12 @@ if [ "$SKIP_AGENTCORE" = false ]; then
           \"Action\": [\"elasticfilesystem:ClientMount\", \"elasticfilesystem:ClientWrite\"],
           \"Resource\": \"arn:aws:elasticfilesystem:$REGION:$ACCOUNT_ID:file-system/$EFS_ID\",
           \"Condition\": { \"ArnEquals\": { \"elasticfilesystem:AccessPointArn\": \"$EFS_AP_ARN\" } }
+        },
+        {
+          \"Sid\": \"EFSDescribe\",
+          \"Effect\": \"Allow\",
+          \"Action\": [\"elasticfilesystem:DescribeAccessPoints\", \"elasticfilesystem:DescribeMountTargets\", \"elasticfilesystem:DescribeFileSystems\"],
+          \"Resource\": \"*\"
         }"
     echo "  [4b-efs] EFS ready — EFS_ID=$EFS_ID EFS_AP_ID=$EFS_AP_ID EFS_SG=$EFS_SG"
   fi
@@ -854,54 +865,72 @@ if [ "$SKIP_AGENTCORE" = false ]; then
   echo "  Image pushed: $AGENTCORE_ECR_URI:latest"
 
   # --- 4c-2: Create AgentCore Browser with web bot auth ---
+  # The Browser is an OPTIONAL enhancement (web-bot-auth tool). It must NEVER
+  # abort the deploy: the whole block runs with `set +e` restored afterward, and
+  # every failure degrades to an empty AGENTCORE_BROWSER_ID (the runtime still
+  # works without it). This is what previously killed the script under
+  # `set -euo pipefail` mid-Phase-4.
   echo "  [4c-2] Ensuring AgentCore Browser (web bot auth enabled)..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
   BROWSER_NAME="${STACK_NAME}_browser_webauth"
-  BROWSER_ID=$(aws bedrock-agentcore-control list-browsers --region "$REGION" \
-    --query "browserSummaries[?name=='${BROWSER_NAME}'].browserId" \
-    --output text 2>/dev/null || echo "")
-
-  if [ -z "$BROWSER_ID" ] || [ "$BROWSER_ID" = "None" ]; then
-    echo "  Creating new browser: $BROWSER_NAME"
-    BROWSER_OUTPUT=$(aws bedrock-agentcore-control create-browser \
-      --name "$BROWSER_NAME" \
-      --execution-role-arn "$ROLE_ARN" \
-      --network-configuration '{"networkMode":"PUBLIC"}' \
-      --browser-signing '{"enabled":true}' \
-      --description "Browser with web bot auth for $STACK_NAME" \
-      --region "$REGION" --output json 2>&1)
-    BROWSER_ID=$(echo "$BROWSER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['browserId'])" 2>/dev/null || echo "")
-    if [ -n "$BROWSER_ID" ] && [ "$BROWSER_ID" != "None" ]; then
-      echo "  Browser created: $BROWSER_ID"
+  AGENTCORE_BROWSER_ID=""
+  ensure_browser() {
+    # Runs with errexit disabled so no AWS call can abort the deploy; the prior
+    # errexit state is restored on return so the rest of Phase 4 keeps `set -e`.
+    local _errexit; case "$-" in *e*) _errexit=1 ;; *) _errexit=0 ;; esac
+    set +e
+    local bid out status i
+    bid=$(aws bedrock-agentcore-control list-browsers --region "$REGION" \
+      --query "browserSummaries[?name=='${BROWSER_NAME}'].browserId" \
+      --output text 2>/dev/null)
+    if [ -z "$bid" ] || [ "$bid" = "None" ]; then
+      echo "  Creating new browser: $BROWSER_NAME"
+      out=$(aws bedrock-agentcore-control create-browser \
+        --name "$BROWSER_NAME" \
+        --execution-role-arn "$ROLE_ARN" \
+        --network-configuration '{"networkMode":"PUBLIC"}' \
+        --browser-signing '{"enabled":true}' \
+        --description "Browser with web bot auth for $STACK_NAME" \
+        --region "$REGION" --output json 2>&1)
+      bid=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['browserId'])" 2>/dev/null)
+      if [ -n "$bid" ] && [ "$bid" != "None" ]; then
+        echo "  Browser created: $bid"
+      else
+        echo "  WARNING: Could not create AgentCore Browser (non-fatal, continuing). Output: $out"
+        bid=""
+      fi
     else
-      echo "  WARNING: Failed to create browser. Output: $BROWSER_OUTPUT"
-      BROWSER_ID=""
+      echo "  Browser already exists: $bid"
     fi
-  else
-    echo "  Browser already exists: $BROWSER_ID"
-  fi
-
-  # Wait for browser to be READY
-  if [ -n "$BROWSER_ID" ] && [ "$BROWSER_ID" != "None" ]; then
-    echo "  Waiting for browser to be READY..."
-    for i in $(seq 1 12); do
-      BR_STATUS=$(aws bedrock-agentcore-control get-browser \
-        --browser-id "$BROWSER_ID" --region "$REGION" \
-        --query 'status' --output text 2>/dev/null || echo "UNKNOWN")
-      [ "$BR_STATUS" = "READY" ] && echo "  Browser is READY." && break
-      echo "  Attempt $i/12 - status: $BR_STATUS, waiting 5s..."
-      sleep 5
-    done
-  fi
-  AGENTCORE_BROWSER_ID="${BROWSER_ID:-}"
+    if [ -n "$bid" ] && [ "$bid" != "None" ]; then
+      echo "  Waiting for browser to be READY..."
+      for i in $(seq 1 12); do
+        status=$(aws bedrock-agentcore-control get-browser \
+          --browser-id "$bid" --region "$REGION" \
+          --query 'status' --output text 2>/dev/null)
+        [ "$status" = "READY" ] && { echo "  Browser is READY."; break; }
+        echo "  Attempt $i/12 - status: ${status:-UNKNOWN}, waiting 5s..."
+        sleep 5
+      done
+    fi
+    AGENTCORE_BROWSER_ID="${bid:-}"
+    [ "$_errexit" = "1" ] && set -e
+    return 0
+  }
+  # Call in a way that a non-zero return can't trip errexit.
+  ensure_browser || true
   echo "  AGENTCORE_BROWSER_ID=$AGENTCORE_BROWSER_ID"
 
   # --- 4d: Create or Update AgentCore Runtime ---
   echo "  [4d] Creating/updating AgentCore Runtime..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
 
-  # Build environment variables JSON
-  ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-6-v1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
+  # Build environment variables JSON.
+  # Default model = Claude Opus 4.8. CLAUDE_CODE_DISABLE_THINKING=1 is REQUIRED
+  # so the CLI doesn't send thinking.type.enabled (which Opus rejects → agent
+  # exits 1). The seeded Bedrock provider also sets default_model_id to this
+  # model so the backend sends it explicitly on every invocation.
+  ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"CLAUDE_CODE_DISABLE_THINKING\":\"1\",\"ANTHROPIC_MODEL\":\"us.anthropic.claude-opus-4-8\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
   if [ "$AGENTCORE_STORAGE" = "efs" ]; then
     # Documents intent; the container derives cwd/HOME from workspace_path in the invoke payload.
     ENV_VARS="$ENV_VARS,\"AGENT_WORKSPACE_BASE_DIR\":\"/mnt/efs\""
@@ -917,8 +946,35 @@ if [ "$SKIP_AGENTCORE" = false ]; then
   # S3 mode: legacy PUBLIC network, no filesystem.
   FS_CONFIG_ARGS=()
   if [ "$AGENTCORE_STORAGE" = "efs" ]; then
-    # Convert bare "subnet-a,subnet-b" into JSON array ["subnet-a","subnet-b"]
-    SUBNETS_JSON=$(IFS=','; for s in $ECS_SUBNETS; do [ -n "$s" ] && printf '"%s",' "$s"; done)
+    # The AgentCore runtime runs in the CDK stack's PRIVATE (NAT-routed) subnets,
+    # surfaced via the AgentcoreSubnets output. This guarantees the two hard
+    # requirements: NAT egress to Bedrock (the runtime ENI has no public IP) and
+    # in-AZ EFS reachability (the CDK EFS mount targets live in those same
+    # private subnets). No CLI subnet/route discovery needed — CDK built it.
+    RUNTIME_SUBNETS="$AGENTCORE_SUBNETS"
+
+    # Filter to AgentCore-supported AZs when the VPC spans more (safety for
+    # imported VPCs). New CDK VPCs are already pinned to supported AZs.
+    if [ -n "$AGENTCORE_SUPPORTED_AZIDS" ] && [ -n "$RUNTIME_SUBNETS" ]; then
+      FILTERED=""
+      for s in $(echo "$RUNTIME_SUBNETS" | tr ',' ' '); do
+        [ -n "$s" ] || continue
+        az=$(aws ec2 describe-subnets --subnet-ids "$s" --region "$REGION" \
+          --query 'Subnets[0].AvailabilityZoneId' --output text 2>/dev/null)
+        case ",$AGENTCORE_SUPPORTED_AZIDS," in *",$az,"*) FILTERED="$FILTERED,$s" ;; esac
+      done
+      [ -n "$FILTERED" ] && RUNTIME_SUBNETS="${FILTERED#,}"
+    fi
+
+    if [ -z "$RUNTIME_SUBNETS" ] || [ "$RUNTIME_SUBNETS" = "None" ]; then
+      echo "  ERROR: AgentcoreSubnets stack output is empty — the CDK VPC has no private/NAT subnets." >&2
+      echo "         Re-run WITHOUT --skip-cdk so CDK creates the private-NAT subnets." >&2
+      exit 1
+    fi
+    echo "  AgentCore runtime subnets (CDK private/NAT subnets): $RUNTIME_SUBNETS"
+
+    # Convert "subnet-a,subnet-b" into JSON array ["subnet-a","subnet-b"]
+    SUBNETS_JSON=$(IFS=','; for s in $RUNTIME_SUBNETS; do [ -n "$s" ] && printf '"%s",' "$s"; done)
     SUBNETS_JSON="[${SUBNETS_JSON%,}]"
     RUNTIME_SG_JSON="[\"$EFS_SG\""
     if [ -n "$ECS_SG" ] && [ "$ECS_SG" != "None" ]; then
@@ -1103,11 +1159,9 @@ echo ""
 echo "============================================="
 echo "  Full Deployment Complete! (ECS)"
 echo "============================================="
-if [ -n "$DOMAIN_NAME" ]; then
-  echo "  App URL:    https://$DOMAIN_NAME"
-else
-  echo "  App URL:    http://$ALB_DNS"
-fi
+echo "  App URL:    $APP_URL"
+[ -n "$CF_DOMAIN" ] && echo "  CloudFront: https://$CF_DOMAIN"
+echo "  Login:      admin@example.com / Admin1234!"
 echo "  ALB:        $ALB_DNS"
 echo "  ECS:        $ECS_CLUSTER_NAME / $ECS_SERVICE_NAME"
 if [ "$SKIP_AGENTCORE" = false ]; then

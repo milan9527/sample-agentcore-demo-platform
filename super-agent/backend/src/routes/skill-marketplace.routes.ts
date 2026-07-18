@@ -208,6 +208,18 @@ export async function skillMarketplaceRoutes(fastify: FastifyInstance): Promise<
       } catch (err) {
         request.log.error({ err, sessionId, skillName: result.name }, 'Failed to copy skill to session workspace');
       }
+    } else {
+      // No session context (installed from the global Tools marketplace page):
+      // mark the skill org-level so it is auto-included in every scope's
+      // workspace, and invalidate all scope workspaces so existing sessions
+      // pick it up on their next message. Without this the skill would sit in
+      // the catalog bound to nothing and no agent would ever see it.
+      try {
+        await skillService.markSkillOrgLevel(request.user!.orgId, result.skillId);
+        request.log.info({ skillId: result.skillId }, 'Skill marked org-level (auto-included in all scopes)');
+      } catch (err) {
+        request.log.warn({ err, skillId: result.skillId }, 'Failed to mark skill org-level');
+      }
     }
 
     // Trigger async security scan (fire-and-forget, never blocks install)

@@ -1252,10 +1252,15 @@ function ModelConfigSection({ scope, onSave, onError }: {
   const handleProviderChange = async (providerId: string) => {
     const prevP = selectedProviderId
     const prevM = selectedModelId
+    // Default the model to the selected provider's own default_model_id so we
+    // never persist a providerId-only selection (which would later resolve to
+    // whatever default that provider has, surfacing as the wrong model in chat).
+    const chosen = providers.find(p => p.id === providerId)
+    const defModel = chosen?.default_model_id || undefined
     setSelectedProviderId(providerId)
-    setSelectedModelId('') // reset model when provider changes
+    setSelectedModelId(defModel ?? '')
     try {
-      await persist({ providerId: providerId || undefined, modelId: undefined })
+      await persist({ providerId: providerId || undefined, modelId: defModel })
     } catch {
       setSelectedProviderId(prevP)
       setSelectedModelId(prevM)

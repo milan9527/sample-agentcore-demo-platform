@@ -65,8 +65,13 @@ FROM node:20-alpine AS production
 
 WORKDIR /app
 
-# Install OpenSSL for Prisma and curl for health checks
-RUN apk add --no-cache openssl curl
+# Install OpenSSL for Prisma, curl for health checks, and LibreOffice (+ CJK
+# fonts) so document conversion (pptx/docx/xlsx → PDF in chat.routes.ts) works —
+# matches the EC2 host which installs libreoffice-core + fonts-noto-cjk.
+RUN apk add --no-cache openssl curl \
+    libreoffice \
+    font-noto-cjk font-wqy-zenhei ttf-dejavu \
+    && rm -rf /var/cache/apk/*
 
 # Create non-root user for security
 RUN addgroup --system --gid 1001 nodejs && \
@@ -82,8 +87,10 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Required by ClaudeAgentService to spawn Claude Code subprocesses
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create workspace directory for agent workspaces
-RUN mkdir -p /app/workspaces && chown backend:nodejs /app/workspaces
+# Create workspace directory for agent workspaces, plus a writable HOME for the
+# non-root user (LibreOffice needs $HOME to create its user profile on first run).
+RUN mkdir -p /app/workspaces /home/backend && \
+    chown backend:nodejs /app/workspaces /home/backend
 
 # Copy Prisma schema and generated client
 COPY --from=builder /app/prisma ./prisma
@@ -116,6 +123,8 @@ EXPOSE 3000
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
+# HOME for the non-root user so LibreOffice can write its profile
+ENV HOME=/home/backend
 
 # Health check - uses the /health endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

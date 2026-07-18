@@ -1753,9 +1753,13 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
               title={t('chat.selectModel')}
             >
               <Cpu className="w-5 h-5 shrink-0" />
-              {selectedModel && (
+              {/* Show the explicitly-selected model, else the effective default
+                  (scope/org default) so the active model is always visible. */}
+              {selectedModel ? (
                 <span className="text-xs truncate font-mono">{selectedModel}</span>
-              )}
+              ) : scopeDefaultModel ? (
+                <span className="text-xs truncate font-mono text-gray-500">{scopeDefaultModel}</span>
+              ) : null}
             </button>
             {showModelPicker && (
               <div className="absolute bottom-full mb-2 left-0 w-72 max-h-96 overflow-y-auto bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 py-1">
@@ -1876,15 +1880,32 @@ function ChatInterfaceContent() {
   } = useContext(ChatContext)
 
   // Fetch scope's default model when scope changes
+  // Effective default model shown in the chat picker: the scope's own
+  // settings.modelId if set, otherwise the org-default provider's
+  // default_model_id (what the backend actually uses when nothing is picked).
   const [scopeDefaultModel, setScopeDefaultModel] = useState<string | null>(null)
   useEffect(() => {
-    if (!selectedBusinessScopeId) { setScopeDefaultModel(null); return }
-    restClient.get<any>(`/api/business-scopes/${selectedBusinessScopeId}`)
-      .then(res => {
-        const modelId = res?.settings?.modelId as string | undefined
-        setScopeDefaultModel(modelId || null)
-      })
-      .catch(() => setScopeDefaultModel(null))
+    let cancelled = false
+    const resolveDefault = async () => {
+      let modelId: string | undefined
+      if (selectedBusinessScopeId) {
+        try {
+          const res = await restClient.get<any>(`/api/business-scopes/${selectedBusinessScopeId}`)
+          modelId = res?.settings?.modelId as string | undefined
+        } catch { /* fall through to org default */ }
+      }
+      if (!modelId) {
+        // Fall back to the org-default provider's default model.
+        try {
+          const providers = await modelProviderService.list()
+          const orgDefault = providers.find(p => p.isOrgDefault) ?? providers[0]
+          modelId = orgDefault?.default_model_id ?? undefined
+        } catch { /* leave undefined */ }
+      }
+      if (!cancelled) setScopeDefaultModel(modelId || null)
+    }
+    void resolveDefault()
+    return () => { cancelled = true }
   }, [selectedBusinessScopeId])
 
   // Auto-send initial prompt from showcase "Run" button
