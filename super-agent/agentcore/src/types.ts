@@ -22,6 +22,12 @@ export interface AgentPayload {
   base_url?: string;
   /** LiteLLM gateway API key (provider='litellm' only). */
   api_key?: string;
+  /**
+   * EFS mode: absolute path to the session workspace on the shared EFS mount
+   * (e.g. /mnt/efs/{org}/{userId}/{scope}/sessions/{session}). When set, the
+   * container uses it as cwd + HOME and does NOT restore from / sync to S3.
+   */
+  workspace_path?: string;
   mcp_servers?: Record<string, unknown>;
   allowed_tools?: string[];
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;

@@ -560,7 +560,7 @@ export async function executionRoutes(fastify: FastifyInstance): Promise<void> {
 
       const execution = await prisma.workflow_executions.findFirst({
         where: { id: executionId, organization_id: request.user!.orgId },
-        select: { workspace_session_id: true, workspace_scope_id: true, organization_id: true },
+        select: { workspace_session_id: true, workspace_scope_id: true, organization_id: true, user_id: true },
       });
 
       if (!execution) {
@@ -575,10 +575,11 @@ export async function executionRoutes(fastify: FastifyInstance): Promise<void> {
       const scopeId = execution.workspace_scope_id;
       const sessionId = execution.workspace_session_id;
 
-      // Local-first, S3 fallback (same pattern as chat workspace)
-      let files = await workspaceManager.listWorkspaceFiles(orgId, scopeId, sessionId);
+      // Local-first, S3 fallback (same pattern as chat workspace).
+      // In EFS mode local IS the shared mount — skip the S3 fallback.
+      let files = await workspaceManager.listWorkspaceFiles(orgId, scopeId, sessionId, execution.user_id);
 
-      if (!files && config.agentRuntime === 'agentcore') {
+      if (!files && config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs') {
         files = await workspaceManager.listWorkspaceFilesFromS3(orgId, scopeId, sessionId);
       }
 
@@ -604,7 +605,7 @@ export async function executionRoutes(fastify: FastifyInstance): Promise<void> {
 
       const execution = await prisma.workflow_executions.findFirst({
         where: { id: executionId, organization_id: request.user!.orgId },
-        select: { workspace_session_id: true, workspace_scope_id: true, organization_id: true },
+        select: { workspace_session_id: true, workspace_scope_id: true, organization_id: true, user_id: true },
       });
 
       if (!execution) {
@@ -619,10 +620,10 @@ export async function executionRoutes(fastify: FastifyInstance): Promise<void> {
       const scopeId = execution.workspace_scope_id;
       const sessionId = execution.workspace_session_id;
 
-      // Local-first, S3 fallback
-      let content = await workspaceManager.readWorkspaceFile(orgId, scopeId, sessionId, filePath);
+      // Local-first, S3 fallback. In EFS mode local IS the shared mount.
+      let content = await workspaceManager.readWorkspaceFile(orgId, scopeId, sessionId, filePath, execution.user_id);
 
-      if (content === null && config.agentRuntime === 'agentcore') {
+      if (content === null && config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs') {
         content = await workspaceManager.readWorkspaceFileFromS3(orgId, scopeId, sessionId, filePath);
       }
 

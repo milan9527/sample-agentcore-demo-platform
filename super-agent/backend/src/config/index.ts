@@ -92,6 +92,9 @@ const envSchema = z.object({
   AGENTCORE_BACKEND_API_URL: z.string().optional(),
   AGENTCORE_BACKEND_API_KEY: z.string().optional(),
   AGENTCORE_WORKSPACE_S3_BUCKET: z.string().optional().default('super-agent-workspaces'),
+  // Workspace storage backend: 's3' (default; local + S3 sync) or 'efs' (shared
+  // EFS mounted directly into both the backend host and the AgentCore runtime).
+  AGENTCORE_STORAGE: z.enum(['s3', 'efs']).optional().default('s3'),
 
   // LiteLLM Proxy (for model listing and routing)
   LITELLM_BASE_URL: z.string().optional(),
@@ -259,6 +262,7 @@ export const config = {
     backendApiUrl: env.AGENTCORE_BACKEND_API_URL,
     backendApiKey: env.AGENTCORE_BACKEND_API_KEY,
     workspaceS3Bucket: env.AGENTCORE_WORKSPACE_S3_BUCKET,
+    storage: env.AGENTCORE_STORAGE,
     region: env.AWS_REGION,
     registry: {
       enabled: env.AGENTCORE_REGISTRY_ENABLED === 'true' || env.AGENTCORE_REGISTRY_ENABLED === '1',

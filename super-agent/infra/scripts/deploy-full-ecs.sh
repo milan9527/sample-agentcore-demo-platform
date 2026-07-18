@@ -30,6 +30,19 @@ export AWS_PAGER=""
 #   --skip-agentcore        Skip AgentCore setup
 #   --skip-frontend         Skip frontend build/sync
 #   --skip-backend          Skip backend build/deploy
+#   --agentcore-storage <efs|s3>  Workspace storage backend for AgentCore
+#                                 (default: efs). In "efs" mode the AgentCore
+#                                 runtime + ECS backend mount a shared EFS access
+#                                 point at /mnt/efs and skip S3 workspace sync.
+#                                 In "s3" mode the legacy S3 workspace sync path
+#                                 is used and the runtime runs with PUBLIC network.
+#                                 The skills S3 bucket is always used regardless.
+#
+# EFS mode (default) idempotently ensures these resources in the stack VPC:
+#   - EFS filesystem  (Name tag: super-agent-workspaces-efs)
+#   - Access point    (Name tag: super-agent-workspaces-ap, /workspaces 1000:1000 0755)
+#   - NFS security group (Name tag: super-agent-efs-nfs, inbound TCP 2049)
+#   - One mount target per ECS subnet AZ
 #
 # Examples:
 #   # Full deploy with custom domain:
@@ -54,6 +67,7 @@ SKIP_CDK=false
 SKIP_AGENTCORE=false
 SKIP_FRONTEND=false
 SKIP_BACKEND=false
+AGENTCORE_STORAGE="efs"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,9 +81,14 @@ while [[ $# -gt 0 ]]; do
     --skip-agentcore)   SKIP_AGENTCORE=true; shift ;;
     --skip-frontend)    SKIP_FRONTEND=true; shift ;;
     --skip-backend)     SKIP_BACKEND=true; shift ;;
+    --agentcore-storage) AGENTCORE_STORAGE="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+if [ "$AGENTCORE_STORAGE" != "efs" ] && [ "$AGENTCORE_STORAGE" != "s3" ]; then
+  echo "Invalid --agentcore-storage '$AGENTCORE_STORAGE' (expected 'efs' or 's3')"; exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -83,6 +102,7 @@ echo "  Super Agent Full Deploy (ECS)"
 echo "  Account:  $ACCOUNT_ID"
 echo "  Region:   $REGION"
 echo "  Stack:    $STACK_NAME"
+echo "  Storage:  $AGENTCORE_STORAGE (AgentCore workspaces)"
 [ -n "$DOMAIN_NAME" ] && echo "  Domain:   $DOMAIN_NAME"
 echo "============================================="
 
@@ -630,6 +650,122 @@ if [ "$SKIP_AGENTCORE" = false ]; then
       --description "Execution role for Super Agent AgentCore containers ($STACK_NAME)"
   fi
 
+  # --- 4b-efs: Ensure EFS infrastructure (EFS mode only) ---
+  # EFS is ADDITIVE to S3: the skills bucket (and, in s3 mode, the workspace
+  # bucket) remain in use. In efs mode we mount a shared access point at
+  # /mnt/efs on both the AgentCore runtime and the ECS backend task.
+  EFS_ID=""
+  EFS_AP_ID=""
+  EFS_AP_ARN=""
+  EFS_SG=""
+  EFS_STATEMENT=""
+  if [ "$AGENTCORE_STORAGE" = "efs" ]; then
+    echo "  [4b-efs] Ensuring EFS infrastructure..."
+    EFS_FS_NAME="super-agent-workspaces-efs"
+    EFS_AP_NAME="super-agent-workspaces-ap"
+    EFS_SG_NAME="super-agent-efs-nfs"
+
+    # Resolve the VPC id from the first ECS subnet
+    FIRST_SUBNET="${ECS_SUBNETS%%,*}"
+    if [ -z "$FIRST_SUBNET" ]; then
+      echo "  ERROR: EcsSubnets stack output is empty; cannot provision EFS." >&2
+      exit 1
+    fi
+    VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$FIRST_SUBNET" --region "$REGION" \
+      --query "Subnets[0].VpcId" --output text)
+    echo "    VPC: $VPC_ID"
+
+    # 1) Look up (or create) the EFS filesystem by Name tag
+    EFS_ID=$(aws efs describe-file-systems --region "$REGION" \
+      --query "FileSystems[?Name=='$EFS_FS_NAME'].FileSystemId | [0]" --output text 2>/dev/null || echo "")
+    if [ -z "$EFS_ID" ] || [ "$EFS_ID" = "None" ]; then
+      echo "    Creating EFS filesystem $EFS_FS_NAME..."
+      EFS_ID=$(aws efs create-file-system --region "$REGION" \
+        --encrypted --performance-mode generalPurpose --throughput-mode elastic \
+        --tags "Key=Name,Value=$EFS_FS_NAME" \
+        --query "FileSystemId" --output text)
+      echo "    Waiting for EFS $EFS_ID to become available..."
+      for i in $(seq 1 30); do
+        FS_STATE=$(aws efs describe-file-systems --file-system-id "$EFS_ID" --region "$REGION" \
+          --query "FileSystems[0].LifeCycleState" --output text 2>/dev/null || echo "unknown")
+        [ "$FS_STATE" = "available" ] && break
+        echo "    Attempt $i/30 - EFS state: $FS_STATE, waiting 5s..."
+        sleep 5
+      done
+    fi
+    echo "    EFS_ID: $EFS_ID"
+
+    # 2) Ensure NFS security group (inbound 2049 from ECS SG + itself)
+    EFS_SG=$(aws ec2 describe-security-groups --region "$REGION" \
+      --filters "Name=group-name,Values=$EFS_SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+      --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "")
+    if [ -z "$EFS_SG" ] || [ "$EFS_SG" = "None" ]; then
+      echo "    Creating security group $EFS_SG_NAME..."
+      EFS_SG=$(aws ec2 create-security-group --region "$REGION" \
+        --group-name "$EFS_SG_NAME" --vpc-id "$VPC_ID" \
+        --description "NFS 2049 for super-agent EFS workspaces" \
+        --query "GroupId" --output text)
+    fi
+    echo "    EFS_SG: $EFS_SG"
+    # Ingress from the ECS service SG (idempotent; tolerate Duplicate)
+    if [ -n "$ECS_SG" ] && [ "$ECS_SG" != "None" ]; then
+      aws ec2 authorize-security-group-ingress --region "$REGION" \
+        --group-id "$EFS_SG" --protocol tcp --port 2049 --source-group "$ECS_SG" \
+        2>/dev/null || echo "    (ingress from ECS_SG already present)"
+    fi
+    # Ingress from itself (covers runtime ENIs that use the EFS SG)
+    aws ec2 authorize-security-group-ingress --region "$REGION" \
+      --group-id "$EFS_SG" --protocol tcp --port 2049 --source-group "$EFS_SG" \
+      2>/dev/null || echo "    (ingress from self already present)"
+
+    # 3) Ensure one mount target per ECS subnet AZ
+    IFS=',' read -ra EFS_SUBNET_ARR <<< "$ECS_SUBNETS"
+    for SUBNET in "${EFS_SUBNET_ARR[@]}"; do
+      [ -z "$SUBNET" ] && continue
+      SUBNET_AZ=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --region "$REGION" \
+        --query "Subnets[0].AvailabilityZone" --output text 2>/dev/null || echo "")
+      # Is there already a mount target in this AZ?
+      EXISTING_MT_AZ=$(aws efs describe-mount-targets --file-system-id "$EFS_ID" --region "$REGION" \
+        --query "MountTargets[?AvailabilityZoneName=='$SUBNET_AZ'].MountTargetId | [0]" \
+        --output text 2>/dev/null || echo "")
+      if [ -n "$EXISTING_MT_AZ" ] && [ "$EXISTING_MT_AZ" != "None" ]; then
+        echo "    Mount target already exists in $SUBNET_AZ ($EXISTING_MT_AZ)"
+        continue
+      fi
+      echo "    Creating mount target in $SUBNET ($SUBNET_AZ)..."
+      aws efs create-mount-target --file-system-id "$EFS_ID" --region "$REGION" \
+        --subnet-id "$SUBNET" --security-groups "$EFS_SG" 2>/dev/null \
+        || echo "    (mount target for $SUBNET_AZ already exists or conflicts; continuing)"
+    done
+
+    # 4) Ensure access point (look up by Name tag on this filesystem)
+    EFS_AP_ID=$(aws efs describe-access-points --file-system-id "$EFS_ID" --region "$REGION" \
+      --query "AccessPoints[?Tags[?Key=='Name' && Value=='$EFS_AP_NAME']].AccessPointId | [0]" \
+      --output text 2>/dev/null || echo "")
+    if [ -z "$EFS_AP_ID" ] || [ "$EFS_AP_ID" = "None" ]; then
+      echo "    Creating access point $EFS_AP_NAME..."
+      EFS_AP_ID=$(aws efs create-access-point --file-system-id "$EFS_ID" --region "$REGION" \
+        --posix-user "Uid=1000,Gid=1000" \
+        --root-directory 'Path=/workspaces,CreationInfo={OwnerUid=1000,OwnerGid=1000,Permissions=0755}' \
+        --tags "Key=Name,Value=$EFS_AP_NAME" \
+        --query "AccessPointId" --output text)
+    fi
+    EFS_AP_ARN="arn:aws:elasticfilesystem:$REGION:$ACCOUNT_ID:access-point/$EFS_AP_ID"
+    echo "    EFS_AP_ID: $EFS_AP_ID"
+    echo "    EFS_AP_ARN: $EFS_AP_ARN"
+
+    # Build the extra IAM statement (leading comma so it appends cleanly).
+    EFS_STATEMENT=",
+        {
+          \"Sid\": \"EFSMount\",
+          \"Effect\": \"Allow\",
+          \"Action\": [\"elasticfilesystem:ClientMount\", \"elasticfilesystem:ClientWrite\"],
+          \"Resource\": \"arn:aws:elasticfilesystem:$REGION:$ACCOUNT_ID:file-system/$EFS_ID\",
+          \"Condition\": { \"ArnEquals\": { \"elasticfilesystem:AccessPointArn\": \"$EFS_AP_ARN\" } }
+        }"
+    echo "  [4b-efs] EFS ready — EFS_ID=$EFS_ID EFS_AP_ID=$EFS_AP_ID EFS_SG=$EFS_SG"
+  fi
+
   # Always update permissions to latest
   echo "  Updating permissions policy ($POLICY_NAME)..."
   WORKSPACE_BUCKET_NAME="${WORKSPACE_BUCKET:-super-agent-workspace-$ACCOUNT_ID}"
@@ -700,7 +836,7 @@ if [ "$SKIP_AGENTCORE" = false ]; then
             \"bedrock-agentcore:ListCodeInterpreterSessions\"
           ],
           \"Resource\": \"arn:aws:bedrock-agentcore:*:*:code-interpreter/*\"
-        }
+        }$EFS_STATEMENT
       ]
     }"
 
@@ -766,10 +902,34 @@ if [ "$SKIP_AGENTCORE" = false ]; then
 
   # Build environment variables JSON
   ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-6-v1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
+  if [ "$AGENTCORE_STORAGE" = "efs" ]; then
+    # Documents intent; the container derives cwd/HOME from workspace_path in the invoke payload.
+    ENV_VARS="$ENV_VARS,\"AGENT_WORKSPACE_BASE_DIR\":\"/mnt/efs\""
+  fi
   if [ -n "$BEDROCK_AK" ] && [ -n "$BEDROCK_SK" ]; then
     ENV_VARS="$ENV_VARS,\"AWS_ACCESS_KEY_ID\":\"$BEDROCK_AK\",\"AWS_SECRET_ACCESS_KEY\":\"$BEDROCK_SK\""
   fi
   ENV_VARS="$ENV_VARS}"
+
+  # Build network + filesystem configuration based on storage mode.
+  # EFS mode: VPC network on the same subnets that have EFS mount targets, using
+  # the EFS SG (permits 2049) plus the ECS SG, and mount the access point at /mnt/efs.
+  # S3 mode: legacy PUBLIC network, no filesystem.
+  FS_CONFIG_ARGS=()
+  if [ "$AGENTCORE_STORAGE" = "efs" ]; then
+    # Convert bare "subnet-a,subnet-b" into JSON array ["subnet-a","subnet-b"]
+    SUBNETS_JSON=$(IFS=','; for s in $ECS_SUBNETS; do [ -n "$s" ] && printf '"%s",' "$s"; done)
+    SUBNETS_JSON="[${SUBNETS_JSON%,}]"
+    RUNTIME_SG_JSON="[\"$EFS_SG\""
+    if [ -n "$ECS_SG" ] && [ "$ECS_SG" != "None" ]; then
+      RUNTIME_SG_JSON="$RUNTIME_SG_JSON,\"$ECS_SG\""
+    fi
+    RUNTIME_SG_JSON="$RUNTIME_SG_JSON]"
+    NETWORK_CONFIG="{\"networkMode\":\"VPC\",\"networkModeConfig\":{\"subnets\":$SUBNETS_JSON,\"securityGroups\":$RUNTIME_SG_JSON}}"
+    FS_CONFIG_ARGS=(--filesystem-configurations "[{\"efsAccessPoint\":{\"accessPointArn\":\"$EFS_AP_ARN\",\"mountPath\":\"/mnt/efs\"}}]")
+  else
+    NETWORK_CONFIG='{"networkMode":"PUBLIC"}'
+  fi
 
   # Try to find existing runtime (stack-scoped name)
   RUNTIME_NAME="${STACK_NAME}Runtime"
@@ -783,7 +943,8 @@ if [ "$SKIP_AGENTCORE" = false ]; then
       --agent-runtime-id "$RUNTIME_ID" \
       --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"$AGENTCORE_ECR_URI:latest\"}}" \
       --role-arn "$ROLE_ARN" \
-      --network-configuration '{"networkMode":"PUBLIC"}' \
+      --network-configuration "$NETWORK_CONFIG" \
+      "${FS_CONFIG_ARGS[@]}" \
       --environment-variables "$ENV_VARS" \
       --region "$REGION"
   else
@@ -792,7 +953,8 @@ if [ "$SKIP_AGENTCORE" = false ]; then
       --agent-runtime-name "${RUNTIME_NAME}" \
       --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"$AGENTCORE_ECR_URI:latest\"}}" \
       --role-arn "$ROLE_ARN" \
-      --network-configuration '{"networkMode":"PUBLIC"}' \
+      --network-configuration "$NETWORK_CONFIG" \
+      "${FS_CONFIG_ARGS[@]}" \
       --environment-variables "$ENV_VARS" \
       --description "Super Agent AgentCore Runtime" \
       --region "$REGION" --output json)
@@ -820,6 +982,38 @@ if [ "$SKIP_AGENTCORE" = false ]; then
   # --- 4e: Update ECS task with AgentCore env vars ---
   echo "  [4e] Enabling AgentCore mode in ECS task..."
 
+  # In EFS mode the ECS Fargate backend also mounts the EFS access point at
+  # /mnt/efs (to read/write workspaces), so its task role needs EFS perms too.
+  # NOTE: the ECS task role ($ECS_TASK_ROLE_ARN) is a DIFFERENT role than the
+  # AgentCore execution role ($ROLE_NAME).
+  if [ "$AGENTCORE_STORAGE" = "efs" ]; then
+    ECS_TASK_ROLE_NAME=""
+    if [ -n "$ECS_TASK_ROLE_ARN" ] && [ "$ECS_TASK_ROLE_ARN" != "None" ]; then
+      ECS_TASK_ROLE_NAME="${ECS_TASK_ROLE_ARN##*/}"
+    fi
+    if [ -n "$ECS_TASK_ROLE_NAME" ]; then
+      echo "    Attaching EFS access policy to ECS task role $ECS_TASK_ROLE_NAME..."
+      aws iam put-role-policy \
+        --role-name "$ECS_TASK_ROLE_NAME" \
+        --policy-name "efs-workspaces-${STACK_NAME}" \
+        --policy-document "{
+          \"Version\": \"2012-10-17\",
+          \"Statement\": [
+            {
+              \"Sid\": \"EFSMount\",
+              \"Effect\": \"Allow\",
+              \"Action\": [\"elasticfilesystem:ClientMount\", \"elasticfilesystem:ClientWrite\"],
+              \"Resource\": \"arn:aws:elasticfilesystem:$REGION:$ACCOUNT_ID:file-system/$EFS_ID\",
+              \"Condition\": { \"ArnEquals\": { \"elasticfilesystem:AccessPointArn\": \"$EFS_AP_ARN\" } }
+            }
+          ]
+        }" 2>/dev/null || echo "    WARNING: could not attach EFS policy to $ECS_TASK_ROLE_NAME"
+    else
+      echo "    WARNING: EcsTaskRoleArn not found in stack outputs; the ECS task role"
+      echo "             may need elasticfilesystem:ClientMount/ClientWrite for EFS."
+    fi
+  fi
+
   # Re-register task definition with AgentCore environment variables added
   CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
     --task-definition "$ECS_TASK_FAMILY" --region "$REGION" \
@@ -837,6 +1031,32 @@ env['AGENTCORE_WORKSPACE_S3_BUCKET'] = '$WORKSPACE_BUCKET_NAME'
 browser_id = '$AGENTCORE_BROWSER_ID'
 if browser_id:
     env['AGENTCORE_BROWSER_IDENTIFIER'] = browser_id
+
+storage_mode = '$AGENTCORE_STORAGE'
+env['AGENTCORE_STORAGE'] = storage_mode
+if storage_mode == 'efs':
+    env['AGENT_WORKSPACE_BASE_DIR'] = '/mnt/efs'
+    # Attach a shared EFS volume + mount the access point at /mnt/efs on the backend.
+    volumes = td.get('volumes', []) or []
+    if not any(v.get('name') == 'efs-workspaces' for v in volumes):
+        volumes.append({
+            'name': 'efs-workspaces',
+            'efsVolumeConfiguration': {
+                'fileSystemId': '$EFS_ID',
+                'transitEncryption': 'ENABLED',
+                'authorizationConfig': {'accessPointId': '$EFS_AP_ID', 'iam': 'ENABLED'}
+            }
+        })
+    td['volumes'] = volumes
+    mount_points = container.get('mountPoints', []) or []
+    if not any(m.get('sourceVolume') == 'efs-workspaces' for m in mount_points):
+        mount_points.append({
+            'sourceVolume': 'efs-workspaces',
+            'containerPath': '/mnt/efs',
+            'readOnly': False
+        })
+    container['mountPoints'] = mount_points
+
 container['environment'] = [{'name': k, 'value': v} for k, v in env.items()]
 
 # Build register-task-definition input (remove read-only fields)
@@ -890,6 +1110,13 @@ else
 fi
 echo "  ALB:        $ALB_DNS"
 echo "  ECS:        $ECS_CLUSTER_NAME / $ECS_SERVICE_NAME"
-[ "$SKIP_AGENTCORE" = false ] && echo "  AgentCore:  $RUNTIME_ARN"
+if [ "$SKIP_AGENTCORE" = false ]; then
+  echo "  AgentCore:  $RUNTIME_ARN"
+  echo "  Storage:    $AGENTCORE_STORAGE"
+  if [ "$AGENTCORE_STORAGE" = "efs" ]; then
+    echo "  EFS:        ${EFS_ID:-?} / AP ${EFS_AP_ID:-?} (mounted at /mnt/efs)"
+    echo "              (use --agentcore-storage s3 to fall back to S3 workspace sync)"
+  fi
+fi
 echo "  Logs:       aws logs tail /super-agent/${STACK_NAME,,}/ecs-backend --region $REGION --follow"
 echo "============================================="

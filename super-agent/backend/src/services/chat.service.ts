@@ -959,7 +959,7 @@ export class ChatService {
       pluginPaths = refreshResult.pluginPaths;
     }
 
-    const workspacePath = this.workspaceManager.getSessionWorkspacePath(organizationId, scopeId, sessionId);
+    const workspacePath = this.workspaceManager.getSessionWorkspacePath(organizationId, scopeId, sessionId, userId);
 
     // Build agent config — use selected agent's prompt or scope-level
     const selectedAgent = selectedAgentId

@@ -50,6 +50,26 @@ export interface SkillForRuntime {
 const SKILLS_BUCKET = config.s3.skillsBucket;
 const s3Client = new S3Client({ region: config.aws.region });
 
+/**
+ * Physical directory for a shared (org-level) skill's files.
+ * - EFS mode: /mnt/efs/skills/{orgId}/{hashId} — shared across the org's
+ *   scopes/users, readable by the AgentCore container (uid/gid 1000) with no S3.
+ * - S3 mode: the legacy local mirror data/skills/{hashId}.
+ * Callers set the returned path as `metadata.localPath`, which downloadSkill
+ * prefers over S3 when materializing skills into a workspace.
+ */
+export function getSharedSkillDir(orgId: string, hashId: string): string {
+  if (config.agentcore.storage === 'efs') {
+    return join(config.claude.workspaceBaseDir, 'skills', orgId, hashId);
+  }
+  return join(process.cwd(), 'data', 'skills', hashId);
+}
+
+/** True when skill files should live on EFS rather than S3. */
+export function skillsUseEfs(): boolean {
+  return config.agentcore.storage === 'efs';
+}
+
 function generateHashId(organizationId: string, name: string): string {
   const hash = createHash('sha256');
   hash.update(`${organizationId}:${name}:${Date.now()}`);
@@ -76,12 +96,18 @@ export class SkillService {
 
   async createSkill(organizationId: string, input: CreateSkillInput): Promise<SkillEntity> {
     const hashId = generateHashId(organizationId, input.name);
+    // In EFS mode, skill files live on the shared EFS dir; record it as localPath
+    // so downloadSkill materializes from EFS (S3 columns kept for back-compat).
+    const metadata = { ...(input.metadata || {}) } as Record<string, unknown>;
+    if (skillsUseEfs() && !metadata.localPath) {
+      metadata.localPath = getSharedSkillDir(organizationId, hashId);
+    }
     return skillRepository.create(organizationId, {
       name: input.name, display_name: input.display_name,
       description: input.description || null, hash_id: hashId,
       s3_bucket: SKILLS_BUCKET, s3_prefix: `skills/${hashId}/`,
       version: input.version || '1.0.0', status: input.status || 'active',
-      skill_type: 'general', tags: input.tags || [], metadata: input.metadata || {},
+      skill_type: 'general', tags: input.tags || [], metadata,
       business_scope_id: null, parent_skill_id: null, owner_scope_id: null, created_by: null,
     } as Omit<SkillEntity, 'id' | 'organization_id' | 'created_at' | 'updated_at'>);
   }
@@ -103,9 +129,20 @@ export class SkillService {
   async deleteSkill(organizationId: string, skillId: string): Promise<boolean> {
     const skill = await skillRepository.findById(skillId, organizationId);
     if (!skill) return false;
-    try {
-      await s3Client.send(new DeleteObjectCommand({ Bucket: skill.s3_bucket, Key: `${skill.s3_prefix}skill.zip` }));
-    } catch (err) { console.warn(`Failed to delete S3 object for skill ${skillId}:`, err); }
+    const localPath = (skill.metadata as Record<string, unknown> | null)?.localPath as string | undefined;
+    if (skillsUseEfs() || localPath) {
+      // EFS/local mode: remove the shared skill directory.
+      const dir = localPath || getSharedSkillDir(organizationId, skill.hash_id);
+      try {
+        const { rm } = await import('fs/promises');
+        await rm(dir, { recursive: true, force: true });
+      } catch (err) { console.warn(`Failed to remove skill dir ${dir}:`, err); }
+    }
+    if (!skillsUseEfs()) {
+      try {
+        await s3Client.send(new DeleteObjectCommand({ Bucket: skill.s3_bucket, Key: `${skill.s3_prefix}skill.zip` }));
+      } catch (err) { console.warn(`Failed to delete S3 object for skill ${skillId}:`, err); }
+    }
     return skillRepository.delete(skillId, organizationId);
   }
 
@@ -180,6 +217,10 @@ export class SkillService {
     input: CreateSkillInput & { skillType?: string },
   ): Promise<SkillEntity> {
     const hashId = generateHashId(organizationId, input.name);
+    const metadata = { ...(input.metadata || {}) } as Record<string, unknown>;
+    if (skillsUseEfs() && !metadata.localPath) {
+      metadata.localPath = getSharedSkillDir(organizationId, hashId);
+    }
     const skill = await skillRepository.create(organizationId, {
       name: input.name,
       display_name: input.display_name,
@@ -191,7 +232,7 @@ export class SkillService {
       status: 'active',
       skill_type: input.skillType || 'general',
       tags: input.tags || [],
-      metadata: input.metadata || {},
+      metadata,
     });
 
     // Set business_scope_id (Prisma create doesn't include it in the spread above)
@@ -290,8 +331,8 @@ export class SkillService {
     const localPath = metadata?.localPath as string | undefined;
 
     if (!localPath) {
-      // No local path - create one in data/skills/{hash_id}/
-      const skillDir = join(process.cwd(), 'data', 'skills', skill.hash_id);
+      // No local path - create one (EFS shared dir in EFS mode, else data/skills)
+      const skillDir = getSharedSkillDir(organizationId, skill.hash_id);
       await mkdir(skillDir, { recursive: true });
       const skillMdPath = join(skillDir, 'SKILL.md');
       await writeFile(skillMdPath, content, 'utf-8');
@@ -401,7 +442,7 @@ export class SkillService {
     const originalMetadata = originalSkill.metadata as Record<string, unknown> | null;
     const originalLocalPath = originalMetadata?.localPath as string | undefined;
     if (originalLocalPath) {
-      const forkDir = join(process.cwd(), 'data', 'skills', forkHashId);
+      const forkDir = getSharedSkillDir(organizationId, forkHashId);
       await mkdir(forkDir, { recursive: true });
       try {
         const { cp } = await import('fs/promises');

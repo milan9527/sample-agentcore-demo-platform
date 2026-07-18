@@ -778,7 +778,13 @@ ${project.repo_url ? `Repository: ${project.repo_url}` : ''}`;
 
     // Use business_scope_id if available, otherwise use projectId as the scope path segment
     const scopeSegment = project.business_scope_id ?? projectId;
-    const localPath = workspaceManager.getSessionWorkspacePath(orgId, scopeSegment, project.workspace_session_id);
+    const localPath = workspaceManager.getSessionWorkspacePath(orgId, scopeSegment, project.workspace_session_id, project.created_by);
+
+    // EFS mode: files already live on the shared mount — nothing to download.
+    if (appConfig.agentcore.storage === 'efs') {
+      return { synced: 0, path: localPath };
+    }
+
     const s3Bucket = appConfig.agentcore.workspaceS3Bucket;
     const s3Prefix = `${orgId}/${scopeSegment}/${project.workspace_session_id}/`;
 
@@ -839,9 +845,43 @@ ${project.repo_url ? `Repository: ${project.repo_url}` : ''}`;
     if (!project?.workspace_session_id) return;
 
     const { config: appConfig } = await import('../config/index.js');
-    const { S3Client, GetObjectCommand, DeleteObjectCommand } = await import('@aws-sdk/client-s3');
-
     const scopeSegment = project.business_scope_id ?? projectId;
+
+    const storeDiff = async (bodyStr: string) => {
+      const diffData = JSON.parse(bodyStr) as {
+        diff_stat: Record<string, unknown>;
+        diff_patch: string;
+        created_at: string;
+      };
+      await prisma.project_issues.update({
+        where: { id: issueId },
+        data: {
+          diff_stat: diffData.diff_stat as Prisma.InputJsonValue,
+          diff_patch: diffData.diff_patch,
+          diff_created_at: new Date(diffData.created_at),
+        },
+      });
+      console.log(`[ProjectService] Stored diff for issue ${issueId}: ${(diffData.diff_stat as Record<string, unknown>).files_changed} files changed`);
+    };
+
+    // EFS mode: the container writes __diff__.json into the shared session dir.
+    if (appConfig.agentcore.storage === 'efs') {
+      const { workspaceManager } = await import('./workspace-manager.js');
+      const { readFile, rm } = await import('fs/promises');
+      const { join } = await import('path');
+      const wsPath = workspaceManager.getSessionWorkspacePath(orgId, scopeSegment, project.workspace_session_id, project.created_by);
+      const diffPath = join(wsPath, '__diff__.json');
+      try {
+        const bodyStr = await readFile(diffPath, 'utf-8');
+        await storeDiff(bodyStr);
+        await rm(diffPath, { force: true }).catch(() => {});
+      } catch {
+        // No diff file — agent produced no changes.
+      }
+      return;
+    }
+
+    const { S3Client, GetObjectCommand, DeleteObjectCommand } = await import('@aws-sdk/client-s3');
     const s3Client = new S3Client({ region: appConfig.agentcore.region || 'us-east-1' });
     const s3Bucket = appConfig.agentcore.workspaceS3Bucket;
     const s3Prefix = `${orgId}/${scopeSegment}/${project.workspace_session_id}/`;
@@ -856,23 +896,7 @@ ${project.repo_url ? `Repository: ${project.repo_url}` : ''}`;
       if (!response.Body) return;
 
       const bodyStr = await response.Body.transformToString('utf-8');
-      const diffData = JSON.parse(bodyStr) as {
-        diff_stat: Record<string, unknown>;
-        diff_patch: string;
-        created_at: string;
-      };
-
-      // Store on the issue
-      await prisma.project_issues.update({
-        where: { id: issueId },
-        data: {
-          diff_stat: diffData.diff_stat as Prisma.InputJsonValue,
-          diff_patch: diffData.diff_patch,
-          diff_created_at: new Date(diffData.created_at),
-        },
-      });
-
-      console.log(`[ProjectService] Stored diff for issue ${issueId}: ${(diffData.diff_stat as Record<string, unknown>).files_changed} files changed`);
+      await storeDiff(bodyStr);
 
       // Clean up the diff file from S3
       await s3Client.send(new DeleteObjectCommand({

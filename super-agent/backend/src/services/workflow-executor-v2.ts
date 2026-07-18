@@ -522,16 +522,21 @@ export class WorkflowExecutorV2 {
           const exec = await prisma.workflow_executions.findUnique({ where: { id: executionId } });
           if (exec?.workspace_session_id && exec?.workspace_scope_id) {
             const wsPath = workspaceManager.getSessionWorkspacePath(
-              organizationId, exec.workspace_scope_id, exec.workspace_session_id,
+              organizationId, exec.workspace_scope_id, exec.workspace_session_id, exec.user_id,
             );
-            // In agentcore mode, sync files from agentcore S3 path to local first
-            // so that both the snapshot and the workspace file browser have the latest files.
+            // In agentcore S3 mode, sync files from the workspace bucket to local
+            // first so the snapshot has the latest files. In EFS mode files are
+            // already on the shared mount (ensureS3SyncedToLocal is a no-op).
             if (config.agentRuntime === 'agentcore') {
               await workspaceManager.ensureS3SyncedToLocal(
                 organizationId, exec.workspace_scope_id, exec.workspace_session_id,
               );
             }
-            await snapshotWorkspaceToS3(wsPath, executionId);
+            // EFS mode: the workspace persists on the shared mount across
+            // pause/resume, so no S3 snapshot is needed.
+            if (config.agentcore.storage !== 'efs') {
+              await snapshotWorkspaceToS3(wsPath, executionId);
+            }
           }
         } catch (err) {
           console.warn('[workflow-v2] Workspace snapshot failed (non-fatal):', err instanceof Error ? err.message : err);
@@ -650,9 +655,10 @@ export class WorkflowExecutorV2 {
 
     // Restore workspace snapshot from S3 (files produced by previous segments)
     try {
-      if (execution.workspace_session_id && execution.workspace_scope_id) {
+      // EFS mode: workspace persists on the shared mount — no snapshot to restore.
+      if (execution.workspace_session_id && execution.workspace_scope_id && config.agentcore.storage !== 'efs') {
         const wsPath = workspaceManager.getSessionWorkspacePath(
-          execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id,
+          execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id, execution.user_id,
         );
         const restored = await restoreWorkspaceFromSnapshot(wsPath, executionId);
         if (restored > 0) {
@@ -678,14 +684,16 @@ export class WorkflowExecutorV2 {
         try {
           if (execution.workspace_session_id && execution.workspace_scope_id) {
             const wsPath = workspaceManager.getSessionWorkspacePath(
-              execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id,
+              execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id, execution.user_id,
             );
             if (config.agentRuntime === 'agentcore') {
               await workspaceManager.ensureS3SyncedToLocal(
                 execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id,
               );
             }
-            await snapshotWorkspaceToS3(wsPath, executionId);
+            if (config.agentcore.storage !== 'efs') {
+              await snapshotWorkspaceToS3(wsPath, executionId);
+            }
           }
         } catch (err) {
           console.warn('[workflow-v2] Workspace snapshot failed (non-fatal):', err instanceof Error ? err.message : err);

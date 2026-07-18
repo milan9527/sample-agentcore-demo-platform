@@ -377,6 +377,88 @@ aws bedrock-agentcore-control update-agent-runtime \
 > - 不要使用 `us.anthropic.*`（仅 US 区域）或裸模型名（如 `claude-sonnet-4-6`）
 > - 可用 `aws bedrock list-inference-profiles --region <region>` 查看当前区域支持的 profile
 
+## AgentCore 存储模式（本地文件 / S3 / EFS）
+
+Agent 工作区（项目文件、会话、`.claude` 配置、skill、产出物）的存储由 `AGENT_RUNTIME`
+和 `AGENTCORE_STORAGE` 两个环境变量共同决定：
+
+| 场景 | AGENT_RUNTIME | AGENTCORE_STORAGE | AGENT_WORKSPACE_BASE_DIR | 说明 |
+|------|---------------|-------------------|--------------------------|------|
+| **本地开发** | `claude` | `s3`（或不设）| `/tmp/workspaces` | Agent 跑在后端本机子进程，工作区就是本地目录，**不走 S3、不走 EFS** |
+| **AgentCore + S3** | `agentcore` | `s3` | `/tmp/workspaces` | 后端本地构建工作区 → 上传 S3 → 容器下载到 `/workspace` → 回传 S3 |
+| **AgentCore + EFS**（推荐）| `agentcore` | `efs` | `/mnt/efs` | 后端与容器共享挂载同一 EFS，直接读写、**无 S3 往返**；按 `/mnt/efs/{org}/{userId}/{scope}/sessions/{session}` 每用户隔离 |
+
+> `deploy-full-ecs.sh` / `deploy-full.sh` **默认使用 EFS**；用 `--agentcore-storage s3`
+> 回退到 S3 模式。`AGENTCORE_STORAGE` 只影响 `agentcore` 运行时；`claude` 运行时始终用本地文件。
+
+### 切换到本地文件（本地开发）
+
+```bash
+# backend/.env
+AGENT_RUNTIME=claude
+AGENT_WORKSPACE_BASE_DIR=/tmp/workspaces
+# AGENTCORE_STORAGE 可删除或设为 s3（claude 模式下忽略此项）
+```
+
+### 切换 AgentCore 的 S3 ↔ EFS
+
+**改后端 `.env`（本地或 EC2 `/opt/super-agent/.env`）：**
+
+```bash
+# → EFS 模式
+sed -i 's/^AGENTCORE_STORAGE=.*/AGENTCORE_STORAGE=efs/' .env
+sed -i 's#^AGENT_WORKSPACE_BASE_DIR=.*#AGENT_WORKSPACE_BASE_DIR=/mnt/efs#' .env
+# 确保本机已挂载 EFS 到 /mnt/efs（见下方“挂载 EFS”），然后重启后端
+
+# → S3 模式
+sed -i 's/^AGENTCORE_STORAGE=.*/AGENTCORE_STORAGE=s3/' .env
+sed -i 's#^AGENT_WORKSPACE_BASE_DIR=.*#AGENT_WORKSPACE_BASE_DIR=/tmp/workspaces#' .env
+```
+
+**同时 runtime 也要匹配**——EFS 模式要求 runtime 为 VPC 网络并挂载 EFS access point：
+
+```bash
+# EFS 模式：VPC + 挂载 access point 到 /mnt/efs（需 aws-cli ≥ 2.36）
+aws bedrock-agentcore-control update-agent-runtime \
+  --agent-runtime-id <runtime-id> \
+  --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:latest"}}' \
+  --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-role-<StackName>" \
+  --network-configuration '{"networkMode":"VPC","networkModeConfig":{"subnets":["<私有子网,需有NAT出口+EFS挂载目标>"],"securityGroups":["<允许2049的SG>"]}}' \
+  --filesystem-configurations '[{"efsAccessPoint":{"accessPointArn":"<access-point-arn>","mountPath":"/mnt/efs"}}]' \
+  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","AGENT_WORKSPACE_BASE_DIR":"/mnt/efs"}' \
+  --region <REGION>
+
+# S3 模式：PUBLIC + 无 filesystem-configurations
+aws bedrock-agentcore-control update-agent-runtime \
+  --agent-runtime-id <runtime-id> \
+  --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:latest"}}' \
+  --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/super-agent-agentcore-role-<StackName>" \
+  --network-configuration '{"networkMode":"PUBLIC"}' \
+  --environment-variables '{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-4-8","AWS_REGION":"<REGION>","WORKSPACE_S3_REGION":"<REGION>"}' \
+  --region <REGION>
+```
+
+### EFS 模式的前置资源（deploy 脚本会自动按名字幂等创建）
+
+- **EFS 文件系统**（Name 标签 `super-agent-workspaces-efs`）
+- **access point**（Name 标签 `super-agent-workspaces-ap`，根目录 `/workspaces`，POSIX uid/gid **1000:1000**，与容器 `node` 用户一致）
+- **挂载目标**：必须在 runtime 所用子网的**每个 AZ** 各有一个；且这些子网要有出口（NAT）访问 Bedrock/ECR
+- **安全组**（`super-agent-efs-nfs`）：放行 TCP **2049**
+- **执行角色 IAM**：`elasticfilesystem:ClientMount`、`ClientWrite`（带 access point 条件）、`DescribeAccessPoints`、`DescribeMountTargets`
+- **ECS 后端任务**：任务定义需加 EFS volume + mountPoint 到 `/mnt/efs`，任务角色也需上述 EFS 权限
+
+### 在后端主机手动挂载 EFS
+
+```bash
+sudo mkdir -p /mnt/efs
+# 用 access point 挂载（TLS）；amazon-efs-utils 提供 mount -t efs
+sudo mount -t efs -o tls,accesspoint=<access-point-id> <fs-id>:/ /mnt/efs
+# 若 DNS 无法解析 <fs-id>.efs.<region>.amazonaws.com，可临时加 /etc/hosts 指向本 AZ 挂载目标 IP
+```
+
+> **回退能力**：应用代码同时保留 S3 与 EFS 两条路径，`AGENTCORE_STORAGE` 切换即可；
+> 无需改代码。切回 S3 时记得把 runtime 也改回 PUBLIC（或部署时 `--agentcore-storage s3`）。
+
 ## 销毁环境
 
 ```bash

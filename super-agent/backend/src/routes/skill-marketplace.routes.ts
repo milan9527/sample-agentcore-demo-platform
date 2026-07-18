@@ -110,6 +110,7 @@ export async function skillMarketplaceRoutes(fastify: FastifyInstance): Promise<
             sessionId,
             result.name,
             result.localPath,
+            session.user_id,
           );
 
           // Auto-sync: bind the installed skill to the session's scope so
@@ -131,9 +132,11 @@ export async function skillMarketplaceRoutes(fastify: FastifyInstance): Promise<
             );
           }
 
-          // In agentcore mode, also write skill files directly to the container
+          // In agentcore S3 mode, also write skill files directly to the container
+          // + workspace bucket. In EFS mode installSkillToWorkspace already wrote
+          // them to the shared mount the container sees.
           const { config: appConfig } = await import('../config/index.js');
-          if (appConfig.agentRuntime === 'agentcore') {
+          if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
             try {
               const { agentCoreCommandService } = await import('../services/agentcore-command.service.js');
               const { readdir, readFile, stat } = await import('fs/promises');

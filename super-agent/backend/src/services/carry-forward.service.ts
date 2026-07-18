@@ -20,6 +20,7 @@ import {
 } from '@aws-sdk/client-s3';
 import { config } from '../config/index.js';
 import { prisma } from '../config/database.js';
+import { getSharedSkillDir } from './skill.service.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -179,6 +180,18 @@ class LocalFileSource implements FileSource {
 const s3 = new S3Client({ region: config.agentcore.region ?? config.aws.region });
 const WORKSPACE_BUCKET = config.agentcore.workspaceS3Bucket;
 const SKILLS_BUCKET = config.s3.skillsBucket;
+const SKILLS_USE_EFS = config.agentcore.storage === 'efs';
+
+/** Write skill file buffers into a shared skill directory (EFS mode). */
+async function writeSkillFilesToDir(dir: string, files: Array<{ relPath: string; buffer: Buffer }>): Promise<void> {
+  const { mkdir, writeFile } = await import('fs/promises');
+  const { join, dirname } = await import('path');
+  for (const { relPath, buffer } of files) {
+    const dest = join(dir, relPath);
+    await mkdir(dirname(dest), { recursive: true });
+    await writeFile(dest, buffer);
+  }
+}
 
 class CarryForwardService {
   /**
@@ -404,15 +417,22 @@ class CarryForwardService {
           const prevHash = meta.contentHash as string | undefined;
           if (prevHash === contentHash) continue; // content identical — nothing to do
 
-          // Re-upload all files to the existing s3_prefix (overwrite)
-          for (const { relPath, buffer } of fileBuffers) {
-            await s3.send(
-              new PutObjectCommand({
-                Bucket: SKILLS_BUCKET,
-                Key: `${existing.s3_prefix}${relPath}`,
-                Body: buffer,
-              })
-            );
+          // EFS mode: write into the shared skill dir; else re-upload to S3.
+          const existingLocalPath = meta.localPath as string | undefined;
+          if (SKILLS_USE_EFS) {
+            const dir = existingLocalPath || getSharedSkillDir(orgId, existing.hash_id);
+            await writeSkillFilesToDir(dir, fileBuffers);
+            meta.localPath = dir;
+          } else {
+            for (const { relPath, buffer } of fileBuffers) {
+              await s3.send(
+                new PutObjectCommand({
+                  Bucket: SKILLS_BUCKET,
+                  Key: `${existing.s3_prefix}${relPath}`,
+                  Body: buffer,
+                })
+              );
+            }
           }
 
           const newVersion = this.bumpPatchVersion(existing.version);
@@ -435,18 +455,26 @@ class CarryForwardService {
           carried.push(skillName);
           console.log(`[carry-forward] Updated skill: ${skillName} → v${newVersion}`);
         } else {
-          // Create path: brand new
+          // Create path: brand new (promote private session skill → shared org skill)
           const hashId = this.generateHashId(orgId, skillName);
           const s3Prefix = `skills/${hashId}/`;
 
-          for (const { relPath, buffer } of fileBuffers) {
-            await s3.send(
-              new PutObjectCommand({
-                Bucket: SKILLS_BUCKET,
-                Key: `${s3Prefix}${relPath}`,
-                Body: buffer,
-              })
-            );
+          // EFS mode: write files to the shared skill dir; else upload to S3.
+          const metadata: Record<string, unknown> = { source: 'carry-forward', contentHash };
+          if (SKILLS_USE_EFS) {
+            const dir = getSharedSkillDir(orgId, hashId);
+            await writeSkillFilesToDir(dir, fileBuffers);
+            metadata.localPath = dir;
+          } else {
+            for (const { relPath, buffer } of fileBuffers) {
+              await s3.send(
+                new PutObjectCommand({
+                  Bucket: SKILLS_BUCKET,
+                  Key: `${s3Prefix}${relPath}`,
+                  Body: buffer,
+                })
+              );
+            }
           }
 
           const description = this.extractSkillDescription(skillMdContent);
@@ -465,7 +493,7 @@ class CarryForwardService {
               status: 'active',
               skill_type: 'general',
               tags: ['session-generated'],
-              metadata: { source: 'carry-forward', contentHash },
+              metadata: metadata as Parameters<typeof prisma.skills.create>[0]['data']['metadata'],
             },
           });
 

@@ -105,14 +105,18 @@ export class AgentCoreAgentRuntime implements AgentRuntime {
   ): AsyncGenerator<ConversationEvent> {
     await this.ensureSDK();
 
-    // --- Upload workspace to S3 (if needed) and load chat history in parallel ---
+    // --- Load chat history (+ upload workspace to S3 in S3 mode) in parallel ---
     const chatSessionId = options.sessionId;
     const scopeId = options.scopeId ?? 'default';
     const s3Prefix = `${options.organizationId}/${scopeId}/${chatSessionId ?? 'ephemeral'}/`;
+    // EFS mode: the backend and container share the same mounted filesystem, so
+    // there is no S3 upload — the container reads the workspace directly at the
+    // absolute path we pass in the payload.
+    const efsMode = config.agentcore.storage === 'efs';
 
     const [history] = await Promise.all([
       this.loadChatHistory(options.organizationId, options.sessionId),
-      chatSessionId && options.workspacePath
+      (!efsMode && chatSessionId && options.workspacePath)
         ? this.uploadWorkspaceIfNeeded(chatSessionId, options.workspacePath, s3Prefix)
         : Promise.resolve(),
     ]);
@@ -151,8 +155,11 @@ export class AgentCoreAgentRuntime implements AgentRuntime {
       base_url: agentConfig.resolvedModel?.baseUrl,
       api_key: agentConfig.resolvedModel?.apiKey,
       mcp_servers: serializableMcpServers,
-      workspace_s3_bucket: this.workspaceBucket,
-      workspace_s3_prefix: s3Prefix,
+      // EFS mode: pass the absolute shared-mount path; the container reads/writes
+      // it directly. S3 mode: pass bucket/prefix for the container to restore/sync.
+      workspace_path: efsMode ? options.workspacePath : undefined,
+      workspace_s3_bucket: efsMode ? undefined : this.workspaceBucket,
+      workspace_s3_prefix: efsMode ? undefined : s3Prefix,
       // Backend connectivity for RAG and other API calls from within the container
       backend_api_url: config.agentcore.backendApiUrl || process.env.PUBLIC_API_URL || undefined,
       // Generate a short-lived token so the container can authenticate API calls (e.g. RAG search)
@@ -164,7 +171,11 @@ export class AgentCoreAgentRuntime implements AgentRuntime {
       }),
     });
 
-    console.log(`[agentcore-runtime] S3 workspace: s3://${this.workspaceBucket}/${s3Prefix}`);
+    if (efsMode) {
+      console.log(`[agentcore-runtime] EFS workspace: ${options.workspacePath ?? 'none'}`);
+    } else {
+      console.log(`[agentcore-runtime] S3 workspace: s3://${this.workspaceBucket}/${s3Prefix}`);
+    }
     console.log(
       `[agentcore-runtime] History count: ${history.length}, workspacePath: ${options.workspacePath ?? 'none'}`
     );
@@ -274,6 +285,46 @@ export class AgentCoreAgentRuntime implements AgentRuntime {
           message: `Failed to parse response: ${body.slice(0, 200)}`,
         };
       }
+    }
+
+    // --- EFS mode: no S3 sync-back; files are already on the shared mount. ---
+    // Run carry-forward directly against the local (EFS) workspace path.
+    if (efsMode) {
+      if (options.workspacePath && chatSessionId && scopeId && scopeId !== 'default') {
+        const carryOrgId = options.organizationId;
+        const carryScopeId = scopeId;
+        const carrySessionId = chatSessionId;
+        const localWorkspacePath = options.workspacePath;
+        (async () => {
+          try {
+            const { carryForwardService } = await import('./carry-forward.service.js');
+            const result = await carryForwardService.syncFromSession(
+              carryOrgId,
+              carryScopeId,
+              carrySessionId,
+              { localWorkspacePath },
+            );
+            if (
+              result.skills.length > 0 ||
+              result.agents.length > 0 ||
+              result.claudeMdUpdated ||
+              result.settingsUpdated ||
+              result.hooksUpdated ||
+              result.systemPromptUpdated
+            ) {
+              console.log(
+                `[agentcore-runtime] Carry-forward (EFS) complete: skills=${result.skills.join(',')}, agents=${result.agents.join(',')}, systemPrompt=${result.systemPromptUpdated}`
+              );
+            }
+          } catch (err) {
+            console.warn(
+              '[agentcore-runtime] Carry-forward (EFS) failed:',
+              err instanceof Error ? err.message : err
+            );
+          }
+        })();
+      }
+      return;
     }
 
     // --- S3 sync-back + carry-forward: chained fire-and-forget ---

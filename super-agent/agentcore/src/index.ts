@@ -57,9 +57,14 @@ async function handleInvocations(
 
   const bucket = payload.workspace_s3_bucket;
   const prefix = payload.workspace_s3_prefix;
+  const workspacePath = payload.workspace_path;
 
-  // --- Restore full workspace from S3 → /workspace/ ---
-  if (bucket && prefix) {
+  if (workspacePath) {
+    // --- EFS mode: workspace is already mounted at this path. No S3 restore. ---
+    console.log(`[index] EFS mode: using mounted workspace at ${workspacePath}`);
+    createGitBaseline(workspacePath);
+  } else if (bucket && prefix) {
+    // --- S3 mode: restore full workspace from S3 → /workspace/ ---
     try {
       const count = await restoreWorkspaceFromS3(s3, bucket, prefix);
       console.log(`[index] Restored ${count} files from s3://${bucket}/${prefix}`);

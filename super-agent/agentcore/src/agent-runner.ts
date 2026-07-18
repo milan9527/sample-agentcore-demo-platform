@@ -103,6 +103,18 @@ function createStopHook(bucket: string, prefix: string) {
   };
 }
 
+/** EFS mode Stop hook: write the diff into the shared workspace dir (no S3). */
+function createEfsStopHook(dir: string) {
+  return async () => {
+    try {
+      extractAndWriteDiff(dir);
+    } catch (err) {
+      console.warn('[hook:Stop] Diff write failed:', err);
+    }
+    return {};
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Git baseline & diff extraction
 // ---------------------------------------------------------------------------
@@ -113,7 +125,7 @@ const WORKSPACE_DIR = '/workspace';
  * Create a git baseline snapshot of the current workspace state.
  * Called BEFORE the agent runs so we can diff against it later.
  */
-export function createGitBaseline(): boolean {
+export function createGitBaseline(dir: string = WORKSPACE_DIR): boolean {
   try {
     // Check if git is available
     execSync('which git', { stdio: 'ignore' });
@@ -124,26 +136,26 @@ export function createGitBaseline(): boolean {
 
   try {
     // Configure git (required for commit)
-    execSync('git config user.email "agent@superagent.local"', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
-    execSync('git config user.name "Agent"', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+    execSync('git config user.email "agent@superagent.local"', { cwd: dir, stdio: 'ignore' });
+    execSync('git config user.name "Agent"', { cwd: dir, stdio: 'ignore' });
 
     // Init repo if not already (idempotent)
-    execSync('git init', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+    execSync('git init', { cwd: dir, stdio: 'ignore' });
 
     // Stage everything and commit as baseline
-    execSync('git add -A', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+    execSync('git add -A', { cwd: dir, stdio: 'ignore' });
 
     // Check if there's anything to commit
     try {
-      execSync('git diff --cached --quiet', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+      execSync('git diff --cached --quiet', { cwd: dir, stdio: 'ignore' });
       // No changes staged — either empty workspace or already committed
       // Try committing anyway (might be initial commit)
       try {
-        execSync('git commit -m "baseline" --allow-empty', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+        execSync('git commit -m "baseline" --allow-empty', { cwd: dir, stdio: 'ignore' });
       } catch { /* already committed, fine */ }
     } catch {
       // There are staged changes, commit them
-      execSync('git commit -m "baseline"', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+      execSync('git commit -m "baseline"', { cwd: dir, stdio: 'ignore' });
     }
 
     console.log('[git-diff] Baseline snapshot created');
@@ -155,24 +167,25 @@ export function createGitBaseline(): boolean {
 }
 
 /**
- * Extract diff between baseline and current state, upload as __diff__.json to S3.
+ * Compute the diff between the baseline commit and the current workspace state.
+ * Returns the structured diff object, or null if there is no git repo / no changes.
  */
-function extractAndUploadDiff(bucket: string, prefix: string): void {
+function computeDiff(dir: string): { diff_stat: unknown; diff_patch: string; created_at: string } | null {
   // Check if git repo exists
-  if (!fs.existsSync(`${WORKSPACE_DIR}/.git`)) {
+  if (!fs.existsSync(`${dir}/.git`)) {
     console.log('[git-diff] No git repo found, skipping diff extraction');
-    return;
+    return null;
   }
 
   try {
     // Stage all current changes
-    execSync('git add -A', { cwd: WORKSPACE_DIR, stdio: 'ignore' });
+    execSync('git add -A', { cwd: dir, stdio: 'ignore' });
 
     // Get diff stat (structured)
     let diffStatOutput = '';
     try {
       diffStatOutput = execSync('git diff --cached --numstat HEAD', {
-        cwd: WORKSPACE_DIR,
+        cwd: dir,
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024,
       }).trim();
@@ -180,7 +193,7 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
 
     if (!diffStatOutput) {
       console.log('[git-diff] No changes detected');
-      return;
+      return null;
     }
 
     // Parse numstat: "insertions\tdeletions\tfilepath"
@@ -198,7 +211,7 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
     let nameStatusOutput = '';
     try {
       nameStatusOutput = execSync('git diff --cached --name-status HEAD', {
-        cwd: WORKSPACE_DIR,
+        cwd: dir,
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024,
       }).trim();
@@ -235,7 +248,7 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
     let diffPatch = '';
     try {
       diffPatch = execSync('git diff --cached HEAD', {
-        cwd: WORKSPACE_DIR,
+        cwd: dir,
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024,
       });
@@ -246,27 +259,45 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
       diffPatch = diffPatch.substring(0, 1024 * 1024) + '\n\n... (diff truncated, exceeded 1MB)';
     }
 
-    const diffData = {
+    return {
       diff_stat: diffStat,
       diff_patch: diffPatch,
       created_at: new Date().toISOString(),
     };
-
-    // Upload to S3 as __diff__.json
-    const key = `${prefix}__diff__.json`;
-    s3.send(new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: JSON.stringify(diffData),
-      ContentType: 'application/json',
-    })).then(() => {
-      console.log(`[git-diff] Uploaded diff (${files.length} files, +${totalInsertions}/-${totalDeletions}) → s3://${bucket}/${key}`);
-    }).catch(err => {
-      console.warn('[git-diff] Failed to upload diff to S3:', err);
-    });
-
   } catch (err) {
     console.warn('[git-diff] Diff extraction failed:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+/** S3 mode: compute diff and upload as __diff__.json to S3. */
+function extractAndUploadDiff(bucket: string, prefix: string): void {
+  const diffData = computeDiff(WORKSPACE_DIR);
+  if (!diffData) return;
+  const key = `${prefix}__diff__.json`;
+  s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: JSON.stringify(diffData),
+    ContentType: 'application/json',
+  })).then(() => {
+    const st = diffData.diff_stat as { files_changed: number; insertions: number; deletions: number };
+    console.log(`[git-diff] Uploaded diff (${st.files_changed} files, +${st.insertions}/-${st.deletions}) → s3://${bucket}/${key}`);
+  }).catch(err => {
+    console.warn('[git-diff] Failed to upload diff to S3:', err);
+  });
+}
+
+/** EFS mode: compute diff and write __diff__.json into the workspace dir. */
+function extractAndWriteDiff(dir: string): void {
+  const diffData = computeDiff(dir);
+  if (!diffData) return;
+  try {
+    fs.writeFileSync(`${dir}/__diff__.json`, JSON.stringify(diffData));
+    const st = diffData.diff_stat as { files_changed: number };
+    console.log(`[git-diff] Wrote diff (${st.files_changed} files) → ${dir}/__diff__.json`);
+  } catch (err) {
+    console.warn('[git-diff] Failed to write diff file:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -275,10 +306,13 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
 // ---------------------------------------------------------------------------
 
 export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEvent> {
+  // EFS mode: the workspace is a shared mount at an absolute path. S3 mode: /workspace.
+  const cwd = payload.workspace_path ?? '/workspace';
+  const efsMode = !!payload.workspace_path;
   const baseOptions: Record<string, unknown> = {
     systemPrompt: payload.system_prompt ?? undefined,
     allowedTools: payload.allowed_tools ?? DEFAULT_TOOLS,
-    cwd: '/workspace',
+    cwd,
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     settingSources: ['project'],
@@ -317,6 +351,8 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_PROFILE;
+    // EFS mode: keep ~/.claude (session resume data) inside the persistent mount.
+    if (efsMode) env.HOME = cwd;
     baseOptions.env = env;
     baseOptions.settingSources = ['project'];
     console.log(`[agent-runner] Provider=litellm base_url=${payload.base_url ?? '(none)'} model=${gatewayModel ?? '(none)'}`);
@@ -325,6 +361,8 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
       ...process.env,
       CLAUDE_CODE_USE_BEDROCK: '1',
       ...(payload.model ? { ANTHROPIC_MODEL: payload.model } : {}),
+      // EFS mode: keep ~/.claude inside the persistent mount for session resume.
+      ...(efsMode ? { HOME: cwd } : {}),
     };
     delete (baseOptions.env as Record<string, string | undefined>).ANTHROPIC_BASE_URL;
     delete (baseOptions.env as Record<string, string | undefined>).ANTHROPIC_AUTH_TOKEN;
@@ -335,10 +373,17 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
     baseOptions.mcpServers = payload.mcp_servers;
   }
 
-  // Register S3 sync hooks (replaces file-watcher)
   const bucket = payload.workspace_s3_bucket;
   const prefix = payload.workspace_s3_prefix;
-  if (bucket && prefix) {
+  if (efsMode) {
+    // EFS mode: files land on the shared mount directly — no per-file S3 sync.
+    // Only compute + write the diff at Stop for the backend to pick up.
+    baseOptions.hooks = {
+      Stop: [{ hooks: [createEfsStopHook(cwd)] }],
+    };
+    console.log(`[agent-runner] EFS mode: diff-only Stop hook registered for ${cwd}`);
+  } else if (bucket && prefix) {
+    // S3 mode: sync each Write/Edit to S3 + full sync at Stop.
     baseOptions.hooks = {
       PostToolUse: [
         {

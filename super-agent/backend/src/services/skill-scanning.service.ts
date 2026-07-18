@@ -14,7 +14,7 @@
  * Scans run asynchronously (fire-and-forget) so they never block installation.
  */
 
-import { mkdtemp, writeFile, readFile, cp, rm } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, cp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -206,8 +206,14 @@ export async function scanSkill(
   const metadata = (skill.metadata as Record<string, unknown>) || {};
   const localPath = metadata.localPath as string | undefined;
 
-  // Create temp workspace and copy skill files into it
-  const tempWorkspace = await mkdtemp(join(tmpdir(), 'skill-scan-'));
+  // Session id (also the EFS workspace path segment + S3 prefix).
+  const sessionId = `skill-scan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Workspace: on EFS the container + backend share this dir; else a local temp.
+  const { workspaceManager } = await import('./workspace-manager.js');
+  const efsPath = workspaceManager.getSystemTaskWorkspacePath(sessionId);
+  const tempWorkspace = efsPath ?? await mkdtemp(join(tmpdir(), 'skill-scan-'));
+  if (efsPath) await mkdir(efsPath, { recursive: true });
   const skillDir = join(tempWorkspace, 'skill');
 
   try {
@@ -243,8 +249,6 @@ export async function scanSkill(
       skillIds: [],
       mcpServerIds: [],
     };
-
-    const sessionId = `skill-scan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const message = [
       `Scan the skill files in the "skill" subdirectory of your working directory.`,
@@ -305,8 +309,9 @@ export async function scanSkill(
       }
     }
 
-    // Strategy 1b: Try S3 for agentcore mode
-    if (!scanOutput && config.agentRuntime === 'agentcore') {
+    // Strategy 1b: Try S3 for agentcore S3 mode. In EFS mode the file is on the
+    // shared mount and was already read by Strategy 1 above.
+    if (!scanOutput && config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs') {
       try {
         const s3Prefix = `system/system/${sessionId}/`;
         const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');

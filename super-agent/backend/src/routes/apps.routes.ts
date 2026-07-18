@@ -356,8 +356,8 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
       // }
 
       // 2. Resolve the folder path within the workspace
-      const workspacePath = workspaceManager.getSessionWorkspacePath(orgId, scopeId, session_id);
-      let resolvedPath = workspaceManager.resolveWorkspaceFilePath(orgId, scopeId, session_id, folder_path);
+      const workspacePath = workspaceManager.getSessionWorkspacePath(orgId, scopeId, session_id, session.user_id);
+      let resolvedPath = workspaceManager.resolveWorkspaceFilePath(orgId, scopeId, session_id, folder_path, session.user_id);
       if (!resolvedPath) {
         return reply.status(400).send({
           error: 'Invalid folder path (path traversal detected)',

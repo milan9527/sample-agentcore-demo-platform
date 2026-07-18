@@ -6,7 +6,7 @@
  */
 
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { skillService } from '../services/skill.service.js';
+import { skillService, getSharedSkillDir } from '../services/skill.service.js';
 import { apiSpecParserService } from '../services/api-spec-parser.service.js';
 import { authenticate } from '../middleware/auth.js';
 import { writeFile, mkdir } from 'fs/promises';
@@ -106,8 +106,8 @@ export async function integrationRoutes(fastify: FastifyInstance): Promise<void>
         },
       );
 
-      // Write SKILL.md to local path
-      const skillDir = join(process.cwd(), 'data', 'skills', skill.hash_id);
+      // Write SKILL.md to the shared skill dir (EFS in EFS mode, else data/skills)
+      const skillDir = getSharedSkillDir(request.user!.orgId, skill.hash_id);
       await mkdir(skillDir, { recursive: true });
       await writeFile(join(skillDir, 'SKILL.md'), parsed.skillMd, 'utf-8');
 

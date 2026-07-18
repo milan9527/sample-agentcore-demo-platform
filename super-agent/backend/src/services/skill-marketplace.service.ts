@@ -19,7 +19,7 @@ import { promisify } from 'util';
 import { mkdir, writeFile, cp, readFile, readdir, rm } from 'fs/promises';
 import { join, resolve } from 'path';
 import { createHash } from 'crypto';
-import { skillService, type CreateSkillInput } from './skill.service.js';
+import { skillService, getSharedSkillDir, type CreateSkillInput } from './skill.service.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -386,8 +386,8 @@ export class SkillMarketplaceService {
 
     const hashId = createHash('sha256').update(`${organizationId}:marketplace:${installRef}:${Date.now()}`).digest('hex').substring(0, 16);
 
-    // Permanent skill directory
-    const skillDir = resolve(process.cwd(), 'data', 'skills', hashId);
+    // Permanent skill directory (EFS shared dir in EFS mode, else data/skills)
+    const skillDir = getSharedSkillDir(organizationId, hashId);
     await mkdir(skillDir, { recursive: true });
 
     let skillContent: string | null = null;
@@ -837,8 +837,8 @@ export class SkillMarketplaceService {
             .update(`${organizationId}:zip-upload:${skillName}:${Date.now()}`)
             .digest('hex').substring(0, 16);
 
-          // Copy skill files to permanent location
-          const permDir = resolve(process.cwd(), 'data', 'skills', hashId);
+          // Copy skill files to permanent location (EFS shared dir in EFS mode)
+          const permDir = getSharedSkillDir(organizationId, hashId);
           await mkdir(permDir, { recursive: true });
           await cp(skillDir, permDir, { recursive: true });
 

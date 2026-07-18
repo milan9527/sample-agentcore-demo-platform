@@ -6,14 +6,14 @@
  */
 
 import { readFile, mkdir, cp, access } from 'fs/promises';
-import { join, resolve } from 'path';
+import { join } from 'path';
 import { createHash } from 'crypto';
 import {
   enterpriseSkillRepository,
   type EnterpriseSkillWithDetails,
   type SortOption,
 } from '../repositories/enterprise-skill.repository.js';
-import { skillService } from './skill.service.js';
+import { skillService, getSharedSkillDir } from './skill.service.js';
 import { skillMarketplaceService } from './skill-marketplace.service.js';
 import { workspaceManager } from './workspace-manager.js';
 import { chatService } from './chat.service.js';
@@ -233,6 +233,7 @@ export class EnterpriseSkillService {
           sessionId,
           entry.skill.name,
           localPath,
+          session.user_id,
         );
         installed = true;
       } catch {
@@ -243,7 +244,7 @@ export class EnterpriseSkillService {
     if (!installed) {
       // Download from S3 into workspace
       const skillsDir = join(
-        workspaceManager.getSessionWorkspacePath(organizationId, session.business_scope_id, sessionId),
+        workspaceManager.getSessionWorkspacePath(organizationId, session.business_scope_id, sessionId, session.user_id),
         '.claude',
         'skills',
       );
@@ -278,9 +279,9 @@ export class EnterpriseSkillService {
     // In agentcore mode, sync the installed skill to S3 and the container
     // so the workspace file tree can see it immediately.
     const { config: appConfig } = await import('../config/index.js');
-    if (appConfig.agentRuntime === 'agentcore') {
+    if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
       const skillSourceDir = join(
-        workspaceManager.getSessionWorkspacePath(organizationId, session.business_scope_id, sessionId),
+        workspaceManager.getSessionWorkspacePath(organizationId, session.business_scope_id, sessionId, session.user_id),
         '.claude', 'skills', entry.skill.name,
       );
 
@@ -374,6 +375,7 @@ export class EnterpriseSkillService {
       organizationId,
       session.business_scope_id,
       options.sessionId,
+      session.user_id,
     );
     const skillSourceDir = join(workspacePath, '.claude', 'skills', options.skillName);
 
@@ -397,8 +399,8 @@ export class EnterpriseSkillService {
       .digest('hex')
       .substring(0, 16);
 
-    // Copy skill files to permanent storage
-    const permanentDir = resolve(process.cwd(), 'data', 'skills', hashId);
+    // Copy skill files to permanent storage (EFS shared dir in EFS mode)
+    const permanentDir = getSharedSkillDir(organizationId, hashId);
     await mkdir(permanentDir, { recursive: true });
     await cp(skillSourceDir, permanentDir, { recursive: true });
 

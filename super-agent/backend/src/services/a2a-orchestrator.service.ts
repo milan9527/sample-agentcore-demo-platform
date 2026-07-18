@@ -434,7 +434,7 @@ Provide a comprehensive, well-structured response that synthesizes all findings.
       if (!session?.business_scope_id) return;
 
       const wsMgr = new WorkspaceManager();
-      const wsPath = wsMgr.getSessionWorkspacePath(organizationId, session.business_scope_id, roomId);
+      const wsPath = wsMgr.getSessionWorkspacePath(organizationId, session.business_scope_id, roomId, session.user_id);
 
       const { mkdir, writeFile } = await import('fs/promises');
       const { join } = await import('path');

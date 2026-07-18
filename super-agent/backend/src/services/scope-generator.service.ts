@@ -12,7 +12,7 @@
 
 import { agentRuntime } from './agent-runtime-factory.js';
 import type { AgentConfig, ConversationEvent } from './agent-runtime.js';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -367,8 +367,15 @@ export class ScopeGeneratorService {
         mcpServerIds: [],
       };
 
-      // Always create a fresh temp workspace (consistent across all strategies)
-      const tempWorkspace = await mkdtemp(join(tmpdir(), 'scope-gen-'));
+      // Stable session ID (also used for the EFS workspace path + S3 prefix).
+      const sessionId = `scope-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      // Workspace: on EFS the container and backend share this dir directly;
+      // otherwise a local temp dir. Must exist before the agent writes into it.
+      const { workspaceManager } = await import('./workspace-manager.js');
+      const efsPath = workspaceManager.getSystemTaskWorkspacePath(sessionId);
+      const tempWorkspace = efsPath ?? await mkdtemp(join(tmpdir(), 'scope-gen-'));
+      if (efsPath) await mkdir(efsPath, { recursive: true });
       const configFilePath = join(tempWorkspace, 'scope-config.json');
 
       let message: string;
@@ -395,11 +402,9 @@ export class ScopeGeneratorService {
         message = `Analyze this business and generate a scope configuration with specialized AI agents. Write the final JSON result to "scope-config.json" in the current directory.\n\n${businessDescription}`;
       }
 
-      // Use a stable session ID so repair turns share the same conversation context
-      const sessionId = `scope-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-      // Compute S3 prefix for AgentCore mode (must match what AgentCoreAgentRuntime builds)
-      const s3Prefix = config.agentRuntime === 'agentcore'
+      // Compute S3 prefix for AgentCore S3 mode (must match what AgentCoreAgentRuntime builds).
+      // In EFS mode there is no S3 fallback — the shared mount is authoritative.
+      const s3Prefix = (config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs')
         ? `system/system/${sessionId}/`
         : undefined;
 
@@ -651,7 +656,13 @@ QUALITY CHECK — before outputting, verify:
       mcpServerIds: [],
     };
 
-    const tempWorkspace = await mkdtemp(join(tmpdir(), 'twin-gen-'));
+    // Unique session id per generation (also the EFS workspace path segment).
+    const uniqueSessionId = `twin-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // On EFS the container + backend share this dir; otherwise a local temp dir.
+    const { workspaceManager: twinWsMgr } = await import('./workspace-manager.js');
+    const twinEfsPath = twinWsMgr.getSystemTaskWorkspacePath(uniqueSessionId);
+    const tempWorkspace = twinEfsPath ?? await mkdtemp(join(tmpdir(), 'twin-gen-'));
+    if (twinEfsPath) await mkdir(twinEfsPath, { recursive: true });
     const configFilePath = join(tempWorkspace, 'scope-config.json');
 
     // Place documents in workspace
@@ -687,9 +698,6 @@ QUALITY CHECK — before outputting, verify:
     try {
       // Accumulate all text content for fallback JSON extraction
       const allTextBlocks: string[] = [];
-
-      // Use a unique session ID per generation to avoid AgentCore session reuse
-      const uniqueSessionId = `twin-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
       for await (const event of agentRuntime.runConversation(
         { agentId: 'twin-generator', sessionId: uniqueSessionId, message, organizationId: 'system', userId: 'system', workspacePath: tempWorkspace, scopeId: 'system' },

@@ -134,9 +134,65 @@ export class WorkspaceManager {
   // Path helpers
   // =========================================================================
 
-  /** Per-session workspace: {baseDir}/{orgId}/{scopeId}/sessions/{sessionId}/ */
-  getSessionWorkspacePath(orgId: string, scopeId: string, sessionId: string): string {
+  /**
+   * Per-session workspace path.
+   * - S3 mode (default): {baseDir}/{orgId}/{scopeId}/sessions/{sessionId}/
+   * - EFS mode: {baseDir}/{orgId}/{userId}/{scopeId}/sessions/{sessionId}/
+   *   The extra {userId} segment gives per-user directory isolation on the
+   *   shared EFS filesystem. `userId` is optional so S3-mode callers are
+   *   unchanged; in EFS mode a missing userId falls back (with a warning) to
+   *   the userId-less path so the mismatch is diagnosable rather than silent.
+   */
+  getSessionWorkspacePath(orgId: string, scopeId: string, sessionId: string, userId?: string): string {
+    if (config.agentcore.storage === 'efs') {
+      if (userId) {
+        return join(this.baseDir, orgId, userId, scopeId, 'sessions', sessionId);
+      }
+      console.warn(
+        `[workspace-manager] EFS mode but no userId for session ${sessionId}; using userId-less path`,
+      );
+    }
     return join(this.baseDir, orgId, scopeId, 'sessions', sessionId);
+  }
+
+  /**
+   * Normalize a caller-supplied file path to be RELATIVE to the session
+   * workspace root. The agent (and thus clickable file links in chat) often
+   * reports absolute paths — e.g. `/mnt/efs/{org}/{user}/{scope}/sessions/{id}/app/x.txt`
+   * in EFS mode or `/workspace/app/x.txt` in the container. Browsers also strip
+   * the leading `/`, yielding `mnt/efs/.../app/x.txt`. Strip any of these so the
+   * result is workspace-relative (e.g. `app/x.txt`).
+   */
+  private normalizeWorkspaceRelativePath(workspacePath: string, filePath: string): string {
+    let p = filePath;
+    // Absolute or leading-slash-stripped copy of the workspace root itself.
+    const wsAbs = workspacePath.replace(/^\/+/, '');       // e.g. mnt/efs/.../sessions/{id}
+    for (const prefix of [workspacePath, wsAbs]) {
+      if (prefix && (p === prefix || p.startsWith(prefix + '/'))) {
+        p = p.slice(prefix.length);
+        break;
+      }
+    }
+    // Container-side absolute path (cwd was /workspace in S3 mode).
+    if (p.startsWith('/workspace/')) p = p.slice('/workspace/'.length);
+    else if (p === '/workspace') p = '';
+    // Trim any remaining leading slashes so join() keeps it inside the workspace.
+    return p.replace(/^\/+/, '');
+  }
+
+  /**
+   * Workspace path for one-off system tasks (scope generation, digital-twin,
+   * skill scanning). In EFS mode this MUST live on the shared mount so the
+   * AgentCore container and the backend see the same directory; otherwise a
+   * local temp dir is fine. Callers create the dir if needed.
+   * Returns null in non-EFS mode (caller should mkdtemp instead).
+   */
+  getSystemTaskWorkspacePath(sessionId: string): string | null {
+    if (config.agentcore.storage === 'efs') {
+      // Matches the S3 prefix scheme used for system tasks: system/system/{session}
+      return join(this.baseDir, 'system', 'system', 'sessions', sessionId);
+    }
+    return null;
   }
 
   /** Legacy per-agent workspace path (kept for backward compat). */
@@ -256,7 +312,7 @@ export class WorkspaceManager {
     selectedAgentId: string | null,
     userId?: string,
   ): Promise<{ workspacePath: string; pluginPaths: string[] }> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scope.id, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scope.id, sessionId, userId);
 
     // Create directory structure (must complete before parallel writes)
     const skillsDir = join(workspacePath, '.claude', 'skills');
@@ -376,7 +432,7 @@ export class WorkspaceManager {
     selectedAgentId: string | null,
     userId?: string,
   ): Promise<{ refreshed: boolean; pluginPaths: string[] }> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scope.id, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scope.id, sessionId, userId);
     const manifest = await this.readManifest(workspacePath);
 
     if (!manifest) {
@@ -1170,6 +1226,8 @@ export class WorkspaceManager {
     scopeId: string,
     sessionId: string,
   ): Promise<number> {
+    // EFS mode: files already live on the shared mount — nothing to sync.
+    if (config.agentcore.storage === 'efs') return 0;
     const s3Bucket = config.agentcore.workspaceS3Bucket;
     const prefix = `${orgId}/${scopeId}/${sessionId}/`;
     const localDir = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
@@ -1244,8 +1302,9 @@ export class WorkspaceManager {
     orgId: string,
     scopeId: string,
     sessionId: string,
+    userId?: string,
   ): Promise<WorkspaceFileNode[] | null> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
     try {
       await access(workspacePath);
     } catch {
@@ -1351,8 +1410,9 @@ export class WorkspaceManager {
     sessionId: string,
     skillName: string,
     sourcePath: string,
+    userId?: string,
   ): Promise<void> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
     const skillsDir = join(workspacePath, '.claude', 'skills');
     await mkdir(skillsDir, { recursive: true });
     const targetDir = join(skillsDir, skillName);
@@ -1367,8 +1427,9 @@ export class WorkspaceManager {
     orgId: string,
     scopeId: string,
     sessionId: string,
+    userId?: string,
   ): Promise<Array<{ name: string; hasSkillMd: boolean; description: string | null }>> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
     const skillsDir = join(workspacePath, '.claude', 'skills');
     try {
       await access(skillsDir);
@@ -1407,8 +1468,9 @@ export class WorkspaceManager {
     scopeId: string,
     sessionId: string,
     skillName: string,
+    userId?: string,
   ): Promise<boolean> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
     const skillDir = join(workspacePath, '.claude', 'skills', skillName);
     // Prevent path traversal
     if (!skillDir.startsWith(join(workspacePath, '.claude', 'skills'))) return false;
@@ -1416,8 +1478,9 @@ export class WorkspaceManager {
       await access(skillDir);
       await rm(skillDir, { recursive: true, force: true });
 
-      // In agentcore mode, also delete from S3
-      if (config.agentRuntime === 'agentcore') {
+      // In agentcore S3 mode, also delete from S3. In EFS mode the delete above
+      // already removed it from the shared mount the container sees.
+      if (config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs') {
         await this.deleteS3Prefix(
           `${orgId}/${scopeId}/${sessionId}/.claude/skills/${skillName}/`,
         ).catch(err => console.warn('[workspace-manager] S3 delete failed:', err));
@@ -1467,8 +1530,10 @@ export class WorkspaceManager {
     scopeId: string,
     sessionId: string,
     filePath: string,
+    userId?: string,
   ): Promise<string | null> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
+    filePath = this.normalizeWorkspaceRelativePath(workspacePath, filePath);
     // Prevent path traversal
     const resolved = join(workspacePath, filePath);
     if (!resolved.startsWith(workspacePath)) return null;
@@ -1547,8 +1612,10 @@ export class WorkspaceManager {
     scopeId: string,
     sessionId: string,
     filePath: string,
+    userId?: string,
   ): string | null {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
+    filePath = this.normalizeWorkspaceRelativePath(workspacePath, filePath);
     const resolved = join(workspacePath, filePath);
     if (!resolved.startsWith(workspacePath)) return null;
     return resolved;
@@ -1561,16 +1628,19 @@ export class WorkspaceManager {
     sessionId: string,
     filePath: string,
     content: string,
+    userId?: string,
   ): Promise<boolean> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
+    filePath = this.normalizeWorkspaceRelativePath(workspacePath, filePath);
     const resolved = join(workspacePath, filePath);
     if (!resolved.startsWith(workspacePath)) return false;
     try {
       await mkdir(dirname(resolved), { recursive: true });
       await writeFile(resolved, content, 'utf-8');
 
-      // In agentcore mode, also upload to S3 so the container picks it up
-      if (config.agentRuntime === 'agentcore') {
+      // In agentcore S3 mode, also upload to S3 so the container picks it up.
+      // In EFS mode the write above already landed on the shared mount.
+      if (config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs') {
         const { PutObjectCommand } = await import('@aws-sdk/client-s3');
         const key = `${orgId}/${scopeId}/${sessionId}/${filePath}`;
         await this.s3Client.send(new PutObjectCommand({
@@ -1597,16 +1667,19 @@ export class WorkspaceManager {
     sessionId: string,
     filePath: string,
     content: Buffer,
+    userId?: string,
   ): Promise<boolean> {
-    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+    const workspacePath = this.getSessionWorkspacePath(orgId, scopeId, sessionId, userId);
+    filePath = this.normalizeWorkspaceRelativePath(workspacePath, filePath);
     const resolved = join(workspacePath, filePath);
     if (!resolved.startsWith(workspacePath)) return false;
     try {
       await mkdir(dirname(resolved), { recursive: true });
       await writeFile(resolved, content);
 
-      // In agentcore mode, also upload to S3 so the container picks it up
-      if (config.agentRuntime === 'agentcore') {
+      // In agentcore S3 mode, also upload to S3 + notify the container. In EFS
+      // mode the write above already landed on the shared mount.
+      if (config.agentRuntime === 'agentcore' && config.agentcore.storage !== 'efs') {
         const { PutObjectCommand } = await import('@aws-sdk/client-s3');
         const key = `${orgId}/${scopeId}/${sessionId}/${filePath}`;
         await this.s3Client.send(new PutObjectCommand({
@@ -1702,27 +1775,48 @@ export class WorkspaceManager {
    * Returns the number of directories removed.
    */
   async pruneStaleWorkspaces(maxAgeMs: number = 10 * 365 * 24 * 60 * 60 * 1000): Promise<number> {
-    let removed = 0;
     const now = Date.now();
+    // Prune sessions under a given `{...}/scope` dir.
+    const pruneScopeDir = async (scopeDir: string): Promise<number> => {
+      let n = 0;
+      const sessionsDir = join(scopeDir, 'sessions');
+      const sessions = await readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
+      for (const sess of sessions) {
+        if (!sess.isDirectory()) continue;
+        const wsPath = join(sessionsDir, sess.name);
+        const manifest = await this.readManifest(wsPath);
+        const lastSync = manifest?.lastSyncedAt ? new Date(manifest.lastSyncedAt).getTime() : 0;
+        if (now - lastSync > maxAgeMs) {
+          await rm(wsPath, { recursive: true, force: true }).catch(() => {});
+          n++;
+        }
+      }
+      return n;
+    };
+
+    let removed = 0;
+    // Layout is {org}/{scope}/sessions (S3 mode) or {org}/{userId}/{scope}/sessions
+    // (EFS mode) — one extra level. Walk accordingly.
+    const efs = config.agentcore.storage === 'efs';
     try {
       const orgs = await readdir(this.baseDir, { withFileTypes: true });
       for (const org of orgs) {
         if (!org.isDirectory()) continue;
         const orgDir = join(this.baseDir, org.name);
-        const scopes = await readdir(orgDir, { withFileTypes: true }).catch(() => []);
-        for (const scope of scopes) {
-          if (!scope.isDirectory()) continue;
-          const sessionsDir = join(orgDir, scope.name, 'sessions');
-          const sessions = await readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
-          for (const sess of sessions) {
-            if (!sess.isDirectory()) continue;
-            const wsPath = join(sessionsDir, sess.name);
-            const manifest = await this.readManifest(wsPath);
-            const lastSync = manifest?.lastSyncedAt ? new Date(manifest.lastSyncedAt).getTime() : 0;
-            if (now - lastSync > maxAgeMs) {
-              await rm(wsPath, { recursive: true, force: true }).catch(() => {});
-              removed++;
+        const mids = await readdir(orgDir, { withFileTypes: true }).catch(() => []);
+        for (const mid of mids) {
+          if (!mid.isDirectory()) continue;
+          if (efs) {
+            // mid = userId; scopes are one level deeper.
+            const userDir = join(orgDir, mid.name);
+            const scopes = await readdir(userDir, { withFileTypes: true }).catch(() => []);
+            for (const scope of scopes) {
+              if (!scope.isDirectory()) continue;
+              removed += await pruneScopeDir(join(userDir, scope.name));
             }
+          } else {
+            // mid = scope.
+            removed += await pruneScopeDir(join(orgDir, mid.name));
           }
         }
       }

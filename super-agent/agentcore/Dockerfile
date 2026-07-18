@@ -44,6 +44,8 @@ USER node
 # Set HOME to /workspace so Claude Code writes ~/.claude/ inside the workspace
 # This ensures all file operations (rules, backups, session-env, etc.) stay
 # within /workspace and get synced to S3.
+# NOTE: In EFS mode the runtime overrides HOME per-invocation (via SDK
+# options.env.HOME = the shared mount session dir) so ~/.claude persists on EFS.
 ENV HOME=/workspace
 
 WORKDIR /workspace

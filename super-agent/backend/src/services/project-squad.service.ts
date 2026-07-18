@@ -535,7 +535,7 @@ Return ONLY valid JSON (no markdown):
    */
   async syncAgentToWorkspace(
     orgId: string,
-    project: { id: string; business_scope_id: string | null; workspace_session_id: string | null },
+    project: { id: string; business_scope_id: string | null; workspace_session_id: string | null; created_by: string },
     agentId: string,
   ): Promise<void> {
     if (!project.workspace_session_id || !project.business_scope_id) return;
@@ -545,7 +545,7 @@ Return ONLY valid JSON (no markdown):
     const { workspaceManager } = await import('./workspace-manager.js');
 
     const wsPath = workspaceManager.getSessionWorkspacePath(
-      orgId, project.business_scope_id, project.workspace_session_id,
+      orgId, project.business_scope_id, project.workspace_session_id, project.created_by,
     );
 
     // Load full agent data with skills
@@ -623,7 +623,7 @@ Return ONLY valid JSON (no markdown):
    */
   private async removeAgentFromWorkspace(
     orgId: string,
-    project: { id: string; business_scope_id: string | null; workspace_session_id: string | null },
+    project: { id: string; business_scope_id: string | null; workspace_session_id: string | null; created_by: string },
     agentId: string,
   ): Promise<void> {
     if (!project.workspace_session_id || !project.business_scope_id) return;
@@ -633,7 +633,7 @@ Return ONLY valid JSON (no markdown):
     const { workspaceManager } = await import('./workspace-manager.js');
 
     const wsPath = workspaceManager.getSessionWorkspacePath(
-      orgId, project.business_scope_id, project.workspace_session_id,
+      orgId, project.business_scope_id, project.workspace_session_id, project.created_by,
     );
 
     // Load agent with skills to know what to remove

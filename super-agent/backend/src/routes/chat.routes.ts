@@ -873,7 +873,9 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         const { config: appConfig } = await import('../config/index.js');
         let files;
-        if (appConfig.agentRuntime === 'agentcore') {
+        // S3-backed agentcore: local-first then container/S3. EFS mode and local
+        // 'claude' mode both read the shared/local filesystem directly.
+        if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
           // Local-first strategy: return local workspace instantly if available,
           // then let subsequent polls pick up the authoritative AgentCore/S3 data.
           const localFiles = await workspaceManager.listWorkspaceFiles(
@@ -909,11 +911,12 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
             request.user!.orgId,
             scopeIdForPath,
             session.id,
+            session.user_id,
           );
         }
 
         const wsPath = files ? workspaceManager.getSessionWorkspacePath(
-          request.user!.orgId, scopeIdForPath, session.id,
+          request.user!.orgId, scopeIdForPath, session.id, session.user_id,
         ) : null;
 
         // Cache the result
@@ -963,6 +966,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         request.user!.orgId,
         session.business_scope_id,
         session.id,
+        session.user_id,
       );
 
       return reply.status(200).send({ data: skills });
@@ -1011,6 +1015,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.business_scope_id,
         session.id,
         request.params.skillName,
+        session.user_id,
       );
 
       if (!deleted) {
@@ -1085,12 +1090,14 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.business_scope_id,
         session.id,
         request.query.path,
+        session.user_id,
       );
 
       if (content === null) {
-        // In agentcore mode, try reading directly from container via Command API
+        // In agentcore S3 mode, try reading from the container / S3. In EFS mode
+        // the shared mount is authoritative — a null means the file truly is absent.
         const { config: appConfig } = await import('../config/index.js');
-        if (appConfig.agentRuntime === 'agentcore') {
+        if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
           try {
             const cmdContent = await agentCoreCommandService.readFile(session.id, request.query.path);
             if (cmdContent !== null) {
@@ -1156,6 +1163,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.business_scope_id,
         session.id,
         request.query.path,
+        session.user_id,
       );
 
       if (!resolvedPath) {
@@ -1189,9 +1197,10 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         fileStat = await fsStat(resolvedPath);
       } catch {
-        // Local file not found — in agentcore mode, fall back to Command API then S3
+        // Local file not found — in agentcore S3 mode, fall back to Command API then S3.
+        // EFS mode reads the shared mount directly (no fallback).
         const { config: appConfig } = await import('../config/index.js');
-        if (appConfig.agentRuntime === 'agentcore') {
+        if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
           const isBinaryContent = !contentType.startsWith('text/') && contentType !== 'application/json' && contentType !== 'application/javascript';
 
           // Try reading from the agentcore container via Command API (text only — Command API returns strings)
@@ -1303,6 +1312,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.business_scope_id,
         session.id,
         filePath,
+        session.user_id,
       );
 
       if (resolvedPath) {
@@ -1313,10 +1323,10 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         }
       }
 
-      // Fallback: S3 raw read (agentcore mode)
+      // Fallback: S3 raw read (agentcore S3 mode only; EFS reads the mount above)
       if (!sourceBuffer) {
         const { config: appConfig } = await import('../config/index.js');
-        if (appConfig.agentRuntime === 'agentcore') {
+        if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
           sourceBuffer = await workspaceManager.readWorkspaceFileFromS3Raw(
             request.user!.orgId,
             session.business_scope_id,
@@ -1419,15 +1429,17 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.id,
         request.body.path,
         request.body.content,
+        session.user_id,
       );
 
       if (!ok) {
         return reply.status(400).send({ error: 'Failed to write file' });
       }
 
-      // In agentcore mode, also write directly to the container
+      // In agentcore S3 mode, also write directly to the container. In EFS mode
+      // the write above already landed on the shared mount.
       const { config: appConfig } = await import('../config/index.js');
-      if (appConfig.agentRuntime === 'agentcore') {
+      if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
         try {
           await agentCoreCommandService.writeFile(session.id, request.body.path, request.body.content);
         } catch (err) {
@@ -1481,6 +1493,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.id,
         request.body.fileName,
         decoded,
+        session.user_id,
       );
 
       if (!ok) {
@@ -1542,6 +1555,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.id,
         fileName,
         buffer,
+        session.user_id,
       );
 
       if (!ok) {
@@ -1661,13 +1675,14 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         request.user!.orgId,
         session.business_scope_id,
         session.id,
+        session.user_id,
       );
 
-      // In agentcore mode, ensure local workspace is synced from S3 before
-      // starting the dev server. The container writes files to S3 and the
-      // sync-back to local is fire-and-forget, so files may not be present yet.
+      // In agentcore S3 mode, ensure local workspace is synced from S3 before
+      // starting the dev server. In EFS mode files are already on the shared
+      // mount (ensureS3SyncedToLocal is a no-op).
       const { config: appConfig } = await import('../config/index.js');
-      if (appConfig.agentRuntime === 'agentcore') {
+      if (appConfig.agentRuntime === 'agentcore' && appConfig.agentcore.storage !== 'efs') {
         try {
           await workspaceManager.ensureS3SyncedToLocal(
             request.user!.orgId,
@@ -1833,6 +1848,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         request.user!.orgId,
         session.business_scope_id,
         session.id,
+        session.user_id,
       );
 
       const { readdir, stat: fsStat2 } = await import('fs/promises');
@@ -2026,7 +2042,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
 
       const content = await workspaceManager.readWorkspaceFile(
         request.user!.orgId, session.business_scope_id, session.id,
-        '.claude/settings.json',
+        '.claude/settings.json', session.user_id,
       );
       if (!content) return reply.status(200).send({ servers: [] });
 
@@ -2081,7 +2097,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
       // Read existing settings
       const content = await workspaceManager.readWorkspaceFile(
         request.user!.orgId, session.business_scope_id, session.id,
-        '.claude/settings.json',
+        '.claude/settings.json', session.user_id,
       );
       let settings: Record<string, unknown> = {};
       if (content) {
@@ -2097,6 +2113,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         request.user!.orgId, session.business_scope_id, session.id,
         '.claude/settings.json',
         JSON.stringify(settings, null, 2),
+        session.user_id,
       );
 
       return reply.status(200).send({ success: true, name: request.body.name });
@@ -2135,7 +2152,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
 
       const content = await workspaceManager.readWorkspaceFile(
         request.user!.orgId, session.business_scope_id, session.id,
-        '.claude/settings.json',
+        '.claude/settings.json', session.user_id,
       );
       if (!content) return reply.status(204).send();
 
@@ -2150,6 +2167,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         request.user!.orgId, session.business_scope_id, session.id,
         '.claude/settings.json',
         JSON.stringify(settings, null, 2),
+        session.user_id,
       );
 
       return reply.status(204).send();
