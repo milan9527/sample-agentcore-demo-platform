@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Plus, Star, Trash2, Server, Cloud, X, RefreshCw } from 'lucide-react'
+import { Plus, Star, Trash2, Server, Cloud, X, RefreshCw, Pencil } from 'lucide-react'
 import { modelProviderService, type CreateModelProviderInput } from '@/services/modelProviderService'
 import type { ModelProvider } from '@/types'
 import { useTranslation } from '@/i18n'
@@ -25,6 +25,7 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [form, setForm] = useState<CreateModelProviderInput>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
   const [formModels, setFormModels] = useState<ModelOption[]>([])
@@ -70,22 +71,59 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
     void load()
   }, [])
 
-  const handleCreate = async () => {
+  const openCreate = () => {
+    setEditingId(null)
+    setForm(EMPTY_FORM)
+    setShowForm(true)
+  }
+
+  const openEdit = (p: ModelProvider) => {
+    setEditingId(p.id)
+    setForm({
+      name: p.name,
+      type: p.type,
+      base_url: p.baseUrl ?? '',
+      api_key: '', // write-only; blank keeps the existing key
+      default_model_id: p.defaultModelId ?? '',
+      is_org_default: p.isOrgDefault,
+    })
+    setShowForm(true)
+  }
+
+  const closeForm = () => {
+    setShowForm(false)
+    setEditingId(null)
+    setForm(EMPTY_FORM)
+  }
+
+  const handleSave = async () => {
     setSaving(true)
     try {
-      await modelProviderService.create({
-        name: form.name.trim(),
-        type: form.type,
-        base_url: form.type === 'litellm' ? form.base_url?.trim() || null : null,
-        api_key: form.type === 'litellm' ? form.api_key?.trim() || null : null,
-        default_model_id: form.default_model_id?.trim() || null,
-        is_org_default: form.is_org_default,
-      })
-      setShowForm(false)
-      setForm(EMPTY_FORM)
+      if (editingId) {
+        // Edit: type is immutable; api_key is only sent when the admin typed a new one.
+        await modelProviderService.update(editingId, {
+          name: form.name.trim(),
+          base_url: form.type === 'litellm' ? form.base_url?.trim() || null : null,
+          ...(form.type === 'litellm' && form.api_key?.trim()
+            ? { api_key: form.api_key.trim() }
+            : {}),
+          default_model_id: form.default_model_id?.trim() || null,
+          is_org_default: form.is_org_default,
+        })
+      } else {
+        await modelProviderService.create({
+          name: form.name.trim(),
+          type: form.type,
+          base_url: form.type === 'litellm' ? form.base_url?.trim() || null : null,
+          api_key: form.type === 'litellm' ? form.api_key?.trim() || null : null,
+          default_model_id: form.default_model_id?.trim() || null,
+          is_org_default: form.is_org_default,
+        })
+      }
+      closeForm()
       await load()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create provider')
+      setError(e instanceof Error ? e.message : 'Failed to save provider')
     } finally {
       setSaving(false)
     }
@@ -119,8 +157,13 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
     }
   }
 
+  // litellm providers require both a base_url and an explicit model id — chat
+  // uses that specific model rather than listing the gateway's whole catalog.
   const canSubmit =
-    form.name.trim().length > 0 && (form.type === 'bedrock' || (form.base_url?.trim().length ?? 0) > 0)
+    form.name.trim().length > 0 &&
+    (form.type === 'bedrock'
+      ? true
+      : (form.base_url?.trim().length ?? 0) > 0 && (form.default_model_id?.trim().length ?? 0) > 0)
 
   return (
     <div className="max-w-3xl">
@@ -128,7 +171,7 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
         <h2 className="text-lg font-semibold text-white">{t('models.title')}</h2>
         {isAdmin && !showForm && (
           <button
-            onClick={() => setShowForm(true)}
+            onClick={openCreate}
             className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white"
           >
             <Plus className="w-4 h-4" />
@@ -147,8 +190,10 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
       {showForm && (
         <div className="mb-6 p-4 rounded-xl border border-gray-700 bg-gray-800/50 space-y-3">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium text-gray-200">{t('models.add')}</h3>
-            <button onClick={() => setShowForm(false)} className="text-gray-400 hover:text-white">
+            <h3 className="text-sm font-medium text-gray-200">
+              {editingId ? t('models.editProvider') : t('models.add')}
+            </h3>
+            <button onClick={closeForm} className="text-gray-400 hover:text-white">
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -167,7 +212,8 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
               <select
                 value={form.type}
                 onChange={(e) => setForm({ ...form, type: e.target.value as 'bedrock' | 'litellm' })}
-                className="mt-1 w-full px-3 py-2 rounded-lg bg-gray-900 border border-gray-700 text-white text-sm"
+                disabled={!!editingId}
+                className="mt-1 w-full px-3 py-2 rounded-lg bg-gray-900 border border-gray-700 text-white text-sm disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <option value="litellm">LiteLLM Gateway</option>
                 <option value="bedrock">Amazon Bedrock</option>
@@ -192,15 +238,18 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
                   value={form.api_key ?? ''}
                   onChange={(e) => setForm({ ...form, api_key: e.target.value })}
                   className="mt-1 w-full px-3 py-2 rounded-lg bg-gray-900 border border-gray-700 text-white text-sm"
-                  placeholder="sk-..."
+                  placeholder={editingId ? '••••••••' : 'sk-...'}
                   autoComplete="new-password"
                 />
+                {editingId && (
+                  <span className="mt-1 block text-[11px] text-gray-500">{t('models.apiKeyKeepHint')}</span>
+                )}
               </label>
             </>
           )}
           <div className="block text-xs text-gray-400">
             <div className="flex items-center justify-between">
-              <span>{t('models.defaultModelId')}</span>
+              <span>{form.type === 'litellm' ? t('models.modelIdRequired') : t('models.defaultModelId')}</span>
               {form.type === 'bedrock' && (
                 <button
                   type="button"
@@ -246,14 +295,14 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
           </label>
           <div className="flex justify-end gap-2 pt-1">
             <button
-              onClick={() => setShowForm(false)}
+              onClick={closeForm}
               className="px-3 py-1.5 text-sm rounded-lg border border-gray-700 text-gray-300 hover:bg-gray-800"
             >
               {t('common.cancel')}
             </button>
             <button
               disabled={!canSubmit || saving}
-              onClick={handleCreate}
+              onClick={handleSave}
               className="px-3 py-1.5 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50"
             >
               {saving ? t('common.saving') : t('common.save')}
@@ -293,6 +342,14 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
               </div>
               {isAdmin && (
                 <div className="flex items-center gap-1 shrink-0">
+                  {/* Edit provider (name, base_url, api_key, default model, org default) */}
+                  <button
+                    onClick={() => openEdit(p)}
+                    title={t('models.edit')}
+                    className="p-2 text-gray-400 hover:text-blue-400"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
                   {/* Enable/disable toggle (any provider; the org keeps >=1 enabled) */}
                   <button
                     role="switch"

@@ -1373,7 +1373,11 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
       .catch(() => setAllFiles([]))
   }, [sessionId])
 
-  // Load enabled providers and each provider's models into one grouped list.
+  // Load enabled providers into one grouped list. Chat offers ONLY the single
+  // model the admin configured on each provider (its defaultModelId) — for both
+  // bedrock and litellm. We never fetch the provider's full catalog here:
+  // listing every Bedrock region model or every gateway model would flood the
+  // picker; the admin already picked the intended model at setup time.
   useEffect(() => {
     if (!showModelPicker || modelGroups.length > 0) return
     let cancelled = false
@@ -1381,11 +1385,12 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
     ;(async () => {
       try {
         const providers = (await modelProviderService.list()).filter(p => p.enabled)
-        const groups = await Promise.all(providers.map(async (provider) => {
-          let models: Array<{ id: string; litellm_model: string; provider: string }> = []
-          try { models = await modelProviderService.listModels(provider.id) } catch { /* leave empty */ }
+        const groups = providers.map((provider) => {
+          const models = provider.defaultModelId
+            ? [{ id: provider.defaultModelId, litellm_model: provider.defaultModelId, provider: provider.type }]
+            : []
           return { provider, models }
-        }))
+        })
         if (!cancelled) setModelGroups(groups)
       } catch {
         if (!cancelled) setModelGroups([])

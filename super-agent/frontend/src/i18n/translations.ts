@@ -1522,6 +1522,18 @@ export const translations: TranslationData = {
     en: 'Add Provider',
     cn: '添加来源'
   },
+  'models.edit': {
+    en: 'Edit',
+    cn: '编辑'
+  },
+  'models.editProvider': {
+    en: 'Edit Provider',
+    cn: '编辑来源'
+  },
+  'models.apiKeyKeepHint': {
+    en: 'Leave blank to keep the current key',
+    cn: '留空则保留当前密钥'
+  },
   'models.name': {
     en: 'Name',
     cn: '名称'
@@ -1541,6 +1553,10 @@ export const translations: TranslationData = {
   'models.defaultModelId': {
     en: 'Default Model ID (optional)',
     cn: '默认模型 ID（可选）'
+  },
+  'models.modelIdRequired': {
+    en: 'Model ID (required)',
+    cn: '模型 ID（必填）'
   },
   'models.setDefault': {
     en: 'Set as org default',
