@@ -50,35 +50,16 @@ aws sts get-caller-identity
 ## ECS 一键部署（推荐）
 
 ECS 模式使用 Fargate 运行后端容器，无需管理 EC2 实例、SSH Key 或 Nginx。
-
-### 带自定义域名（CloudFront CDN）
-
-需要 Route53 托管的域名。查找 hosted zone ID：
-
-```bash
-aws route53 list-hosted-zones --query "HostedZones[].{Name:Name,Id:Id}" --output table
-```
-
-执行部署：
+默认新建专属 VPC + 全套资源，并把应用挂在自动生成的 `*.cloudfront.net` 域名上
+（CloudFront 把 `/api/*`、`/ws/*` 反代到 ALB），部署结束会打印访问 URL。
 
 ```bash
 cd /path/to/super-agent
 
-./infra/scripts/deploy-full-ecs.sh \
-  --stack SuperAgentProd \
-  --region ap-northeast-1 \
-  --domain app.example.com \
-  --hosted-zone-id Z01234567890ABC
+./infra/scripts/deploy-full-ecs.sh --stack SuperAgentProd --region us-east-1
 ```
 
-### 无域名部署（CloudFront 默认域名）
-
-省略 `--domain`/`--hosted-zone-id`，应用会挂在自动生成的 `*.cloudfront.net` 域名上
-（不创建 Route53/ACM，CloudFront 把 `/api/*`、`/ws/*` 反代到 ALB）。部署结束会打印访问 URL。
-
-```bash
-./infra/scripts/deploy-full-ecs.sh --stack SuperAgentDev --region us-east-1
-```
+如需自定义域名，另加 `--domain app.example.com --hosted-zone-id <Route53 Zone ID>`（见下方可选参数）。
 
 ### 可选参数
 
