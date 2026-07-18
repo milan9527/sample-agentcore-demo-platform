@@ -1373,7 +1373,9 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
       .catch(() => setAllFiles([]))
   }, [sessionId])
 
-  // Load enabled providers and each provider's models into one grouped list.
+  // Build the chat model list from the ENABLED providers configured in Admin →
+  // Models. Each provider contributes exactly its configured default model — we
+  // do NOT enumerate the full Bedrock catalog here (that belongs in Admin only).
   useEffect(() => {
     if (!showModelPicker || modelGroups.length > 0) return
     let cancelled = false
@@ -1381,11 +1383,16 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
     ;(async () => {
       try {
         const providers = (await modelProviderService.list()).filter(p => p.enabled)
-        const groups = await Promise.all(providers.map(async (provider) => {
-          let models: Array<{ id: string; litellm_model: string; provider: string }> = []
-          try { models = await modelProviderService.listModels(provider.id) } catch { /* leave empty */ }
-          return { provider, models }
-        }))
+        const groups = providers
+          .map((provider) => {
+            const modelId = provider.defaultModelId?.trim()
+            const models = modelId
+              ? [{ id: modelId, litellm_model: modelId, provider: provider.type }]
+              : []
+            return { provider, models }
+          })
+          // Only surface providers that actually have a configured model.
+          .filter(g => g.models.length > 0)
         if (!cancelled) setModelGroups(groups)
       } catch {
         if (!cancelled) setModelGroups([])
