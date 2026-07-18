@@ -30,13 +30,23 @@ export function ModelsTab({ isAdmin }: ModelsTabProps) {
   const [formModels, setFormModels] = useState<ModelOption[]>([])
   const [formModelsLoading, setFormModelsLoading] = useState(false)
 
+  // Preferred default model for a new Bedrock provider (org-wide default).
+  const PREFERRED_BEDROCK_DEFAULT = 'us.anthropic.claude-opus-4-8'
+
   // Load the model list for the form's current provider type (live for bedrock;
   // for litellm requires base_url + api_key to be filled).
   const loadFormModels = async (refresh = false) => {
     setFormModelsLoading(true)
     try {
       if (form.type === 'bedrock') {
-        setFormModels(await modelProviderService.listBedrockModels({ refresh }))
+        const models = await modelProviderService.listBedrockModels({ refresh })
+        setFormModels(models)
+        // Pre-select Claude Opus 4.8 as the Bedrock default when nothing is chosen yet.
+        setForm((f) => {
+          if (f.type !== 'bedrock' || f.default_model_id) return f
+          const opus = models.find((m) => m.litellm_model === PREFERRED_BEDROCK_DEFAULT)
+          return opus ? { ...f, default_model_id: opus.litellm_model } : f
+        })
       } else {
         setFormModels([]) // litellm: models are listed after the provider is saved
       }
