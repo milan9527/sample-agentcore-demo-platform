@@ -130,10 +130,17 @@ function parseScope(scope: unknown): string[] {
 function parseModelConfig(config: unknown): ModelConfig {
   if (typeof config === 'object' && config !== null) {
     const c = config as Record<string, unknown>;
+    const sel = c.modelSelection as Record<string, unknown> | undefined;
     return {
       provider: isValidProvider(c.provider) ? c.provider : 'Bedrock',
       modelId: typeof c.modelId === 'string' ? c.modelId : 'claude-3-sonnet',
       agentType: isValidAgentType(c.agentType) ? c.agentType : 'Worker',
+      modelSelection: sel && typeof sel === 'object'
+        ? {
+            providerId: typeof sel.providerId === 'string' ? sel.providerId : undefined,
+            modelId: typeof sel.modelId === 'string' ? sel.modelId : undefined,
+          }
+        : undefined,
     };
   }
   return { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' };

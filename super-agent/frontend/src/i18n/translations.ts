@@ -259,6 +259,14 @@ export const translations: TranslationData = {
     en: 'AI Configuration',
     cn: 'AI配置'
   },
+  'agentConfig.model': {
+    en: 'Model',
+    cn: '模型'
+  },
+  'agentConfig.modelHint': {
+    en: 'Choose a provider + model for this agent. Leave blank to use the scope or org default.',
+    cn: '为该智能体选择模型来源与模型。留空则使用业务域或组织默认。'
+  },
   'agentConfig.capabilities': {
     en: 'Capabilities',
     cn: '能力配置'
@@ -863,8 +871,8 @@ export const translations: TranslationData = {
     cn: '框架设置'
   },
   'admin.settings': {
-    en: 'Members & Permissions',
-    cn: '成员与权限'
+    en: 'Admin Settings',
+    cn: '管理设置'
   },
   'admin.logout': {
     en: 'Log Out',
@@ -1491,6 +1499,118 @@ export const translations: TranslationData = {
   'settings.tab.appearance': {
     en: 'Appearance',
     cn: '外观'
+  },
+  'settings.tab.features': {
+    en: 'Features',
+    cn: '功能'
+  },
+  'settings.tab.models': {
+    en: 'Models',
+    cn: '模型'
+  },
+
+  // Models Tab (LLM providers)
+  'models.title': {
+    en: 'Model Providers',
+    cn: '模型来源'
+  },
+  'models.subtitle': {
+    en: 'Configure which LLMs power your agents — Amazon Bedrock or a LiteLLM-compatible gateway. Agents and scopes reference these providers.',
+    cn: '配置驱动智能体的大模型来源——Amazon Bedrock 或兼容 LiteLLM 的网关。智能体和业务域会引用这些来源。'
+  },
+  'models.add': {
+    en: 'Add Provider',
+    cn: '添加来源'
+  },
+  'models.name': {
+    en: 'Name',
+    cn: '名称'
+  },
+  'models.type': {
+    en: 'Type',
+    cn: '类型'
+  },
+  'models.baseUrl': {
+    en: 'Base URL',
+    cn: '接口地址 (Base URL)'
+  },
+  'models.apiKey': {
+    en: 'API Key',
+    cn: 'API 密钥'
+  },
+  'models.defaultModelId': {
+    en: 'Default Model ID (optional)',
+    cn: '默认模型 ID（可选）'
+  },
+  'models.setDefault': {
+    en: 'Set as org default',
+    cn: '设为组织默认'
+  },
+  'models.default': {
+    en: 'Default',
+    cn: '默认'
+  },
+  'models.confirmDelete': {
+    en: 'Delete this model provider?',
+    cn: '确定删除该模型来源？'
+  },
+  'models.enabledToggle': {
+    en: 'Enable / disable for scopes, agents and chat',
+    cn: '启用/停用（作用于业务域、智能体和对话）'
+  },
+  'models.refreshModels': {
+    en: 'Refresh',
+    cn: '刷新'
+  },
+  'models.defaultModelNone': {
+    en: '(runtime default)',
+    cn: '（运行时默认）'
+  },
+  'common.saving': {
+    en: 'Saving...',
+    cn: '保存中...'
+  },
+
+  // Features Tab (sidebar navigation toggles)
+  'features.title': {
+    en: 'Navigation Features',
+    cn: '功能开关'
+  },
+  'features.subtitle': {
+    en: 'Choose which optional features appear in the left sidebar. Core features are always available.',
+    cn: '选择左侧功能栏显示哪些可选功能。核心功能始终可用。'
+  },
+  'features.coreTitle': {
+    en: 'Always available',
+    cn: '默认保留'
+  },
+  'features.optionalTitle': {
+    en: 'Optional',
+    cn: '可选功能'
+  },
+  'features.starredDesc': {
+    en: 'Enterprise agent showcase gallery',
+    cn: '企业 Agent 大赏展示'
+  },
+  'features.approvalsDesc': {
+    en: 'Review and approve pending tasks',
+    cn: '审批待处理的任务'
+  },
+  'features.projectsDesc': {
+    en: 'Project boards and task tracking',
+    cn: '项目看板与任务跟踪'
+  },
+  'features.knowledgeDesc': {
+    en: 'Knowledge base document drive',
+    cn: '知识库文档管理'
+  },
+  'features.appsDesc': {
+    en: 'Internal app marketplace',
+    cn: '企业应用市场'
+  },
+  'features.supportDesc': {
+    en: 'Customer support workspace',
+    cn: '客服工作台'
   },
 
   // Organization Tab
@@ -3778,6 +3898,10 @@ export const translations: TranslationData = {
     en: 'Default (runtime setting)',
     cn: '默认（运行时设置）'
   },
+  'scopeProfile.providerDefault': {
+    en: 'Org default provider',
+    cn: '组织默认来源'
+  },
   'scopeProfile.modelHint': {
     en: 'Default model for this scope. Changes take effect on the next conversation.',
     cn: '此业务智能体的默认模型。更改将在下次对话时生效。'
@@ -4182,6 +4306,11 @@ export const translations: TranslationData = {
   'chat.selectScope': { en: 'Select scope', cn: '选择范围' },
   'chat.noScopesAvailable': { en: 'No scopes available', cn: '无可用范围' },
   'chat.uploadToWorkspace': { en: 'Upload files to workspace', cn: '上传文件到工作区' },
+  'chat.selectModel': { en: 'Select model', cn: '选择模型' },
+  'chat.scopeDefault': { en: 'Default model', cn: '默认模型' },
+  'chat.noModels': { en: 'No models available', cn: '无可用模型' },
+  'chat.provider': { en: 'Provider', cn: '模型来源' },
+  'chat.orgDefaultProvider': { en: 'Default provider', cn: '默认来源' },
   'chat.stopGeneration': { en: 'Stop generation', cn: '停止生成' },
   'chat.groupChat': { en: 'Group Chat', cn: '群聊' },
   'chat.groupChatHint': { en: 'Create a group chat room with multiple agents', cn: '创建多智能体群聊房间' },

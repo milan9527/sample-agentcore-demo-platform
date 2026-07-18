@@ -86,6 +86,13 @@ export const chatStreamRequestSchema = z.object({
   session_id: uuidSchema.optional(),
   message: z.string().min(1, 'Message is required'),
   model: z.string().max(200).optional(),
+  /** Provider + model selection (from the chat UI model picker). */
+  model_selection: z
+    .object({
+      providerId: z.string().uuid().optional(),
+      modelId: z.string().max(255).optional(),
+    })
+    .optional(),
   context: z.record(z.string(), z.unknown()).optional(),
   /** File names recently uploaded by the user (injected as context for the agent). */
   attached_files: z.array(z.string()).optional(),

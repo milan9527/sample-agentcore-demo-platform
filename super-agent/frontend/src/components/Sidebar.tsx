@@ -15,21 +15,18 @@ import {
 import type { NavigationPage } from '@/types'
 import { useTranslation } from '@/i18n'
 import { usePendingApprovals } from '@/hooks/usePendingApprovals'
+import { useFeatureToggles, type OptionalFeature } from '@/services/FeatureTogglesContext'
 
 interface NavItemConfig {
   id: NavigationPage
   icon: React.ReactNode
   tooltipKey: string
   path: string
+  /** If set, this item is optional and only shown when the feature is enabled. */
+  feature?: OptionalFeature
 }
 
 const navItems: NavItemConfig[] = [
-  {
-    id: 'starred',
-    icon: <Star className="w-5 h-5" />,
-    tooltipKey: 'nav.starred',
-    path: '/showcase',
-  },
   {
     id: 'dashboard',
     icon: <LayoutDashboard className="w-5 h-5" />,
@@ -49,22 +46,10 @@ const navItems: NavItemConfig[] = [
     path: '/workflow',
   },
   {
-    id: 'approvals',
-    icon: <ClipboardCheck className="w-5 h-5" />,
-    tooltipKey: 'nav.approvals',
-    path: '/approvals',
-  },
-  {
     id: 'agents',
     icon: <Users className="w-5 h-5" />,
     tooltipKey: 'nav.agents',
     path: '/agents',
-  },
-  {
-    id: 'projects',
-    icon: <FolderKanban className="w-5 h-5" />,
-    tooltipKey: 'nav.projects',
-    path: '/projects',
   },
   {
     id: 'tools',
@@ -73,22 +58,46 @@ const navItems: NavItemConfig[] = [
     path: '/tools',
   },
   {
+    id: 'starred',
+    icon: <Star className="w-5 h-5" />,
+    tooltipKey: 'nav.starred',
+    path: '/showcase',
+    feature: 'starred',
+  },
+  {
+    id: 'approvals',
+    icon: <ClipboardCheck className="w-5 h-5" />,
+    tooltipKey: 'nav.approvals',
+    path: '/approvals',
+    feature: 'approvals',
+  },
+  {
+    id: 'projects',
+    icon: <FolderKanban className="w-5 h-5" />,
+    tooltipKey: 'nav.projects',
+    path: '/projects',
+    feature: 'projects',
+  },
+  {
     id: 'knowledge',
     icon: <Database className="w-5 h-5" />,
     tooltipKey: 'nav.knowledge',
     path: '/knowledge',
+    feature: 'knowledge',
   },
   {
     id: 'apps',
     icon: <Rocket className="w-5 h-5" />,
     tooltipKey: 'nav.apps',
     path: '/apps',
+    feature: 'apps',
   },
   {
     id: 'support',
     icon: <Headphones className="w-5 h-5" />,
     tooltipKey: 'nav.support',
     path: '/support',
+    feature: 'support',
   },
 ]
 
@@ -102,6 +111,10 @@ export function Sidebar({ onAvatarClick, isAdminMenuOpen }: SidebarProps) {
   const location = useLocation()
   const { t } = useTranslation()
   const { pendingCount } = usePendingApprovals()
+  const { isEnabled } = useFeatureToggles()
+
+  // Core items always show; optional items only when their feature is enabled.
+  const visibleNavItems = navItems.filter((item) => !item.feature || isEnabled(item.feature))
 
   const getActivePage = (): NavigationPage => {
     const path = location.pathname
@@ -134,7 +147,7 @@ export function Sidebar({ onAvatarClick, isAdminMenuOpen }: SidebarProps) {
 
       {/* Navigation Items */}
       <nav className="flex flex-col gap-1 flex-1">
-        {navItems.map((item) => {
+        {visibleNavItems.map((item) => {
           const isActive = activePage === item.id
           return (
             <button

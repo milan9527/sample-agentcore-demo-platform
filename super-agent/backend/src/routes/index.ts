@@ -74,6 +74,8 @@ import { connectorRoutes } from './connectors.routes.js';
 import { supportRoutes, supportSettingsRoutes, supportKnowledgeRoutes } from './support.routes.js';
 import { widgetRoutes } from './widget.routes.js';
 import { litellmRoutes } from './litellm.routes.js';
+import { userPreferencesRoutes } from './userPreferences.routes.js';
+import { modelProviderRoutes } from './model-providers.routes.js';
 import { a2aRoutes } from './a2a.routes.js';
 import { auditRoutes } from './audit.routes.js';
 import { knowledgeBaseRoutes } from './knowledge-base.routes.js';
@@ -280,6 +282,12 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
   // LiteLLM Model Proxy
   await fastify.register(litellmRoutes, { prefix: '/api/litellm' });
+
+  // User-level UI preferences (account-scoped)
+  await fastify.register(userPreferencesRoutes, { prefix: '/api/user' });
+
+  // Model Providers (reusable per-org LLM provider configs)
+  await fastify.register(modelProviderRoutes, { prefix: '/api/model-providers' });
 
   // ============================================================================
   // LLM Proxy Routes (OpenAI-compatible, API Key Authentication)

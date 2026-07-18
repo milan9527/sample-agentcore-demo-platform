@@ -16,6 +16,12 @@ export interface AgentPayload {
   system_prompt?: string;
   /** Model identifier to use for this invocation (overrides ANTHROPIC_MODEL env var). */
   model?: string;
+  /** LLM provider for this invocation: 'bedrock' (default) or 'litellm'. */
+  provider?: 'bedrock' | 'litellm';
+  /** LiteLLM gateway base URL (provider='litellm' only). */
+  base_url?: string;
+  /** LiteLLM gateway API key (provider='litellm' only). */
+  api_key?: string;
   mcp_servers?: Record<string, unknown>;
   allowed_tools?: string[];
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;

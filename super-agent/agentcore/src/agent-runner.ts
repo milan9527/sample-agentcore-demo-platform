@@ -291,6 +291,46 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
     console.log(`[agent-runner] Model override via options: ${payload.model}`);
   }
 
+  // Per-invocation provider routing via SDK options.env (defaults to process.env).
+  // litellm → point the SDK at an Anthropic-compatible gateway; bedrock → the
+  // container's default Bedrock config. Never log the api_key.
+  const provider = payload.provider ?? 'bedrock';
+  if (provider === 'litellm') {
+    // Drive the CLI with the `opus` alias and remap that alias to the gateway's
+    // actual model id — the CLI rewrites its built-in aliases to canonical
+    // Anthropic ids that a custom gateway may reject.
+    const gatewayModel = payload.model;
+    const env = { ...process.env } as Record<string, string | undefined>;
+    if (payload.base_url) env.ANTHROPIC_BASE_URL = payload.base_url;
+    if (payload.api_key) { env.ANTHROPIC_AUTH_TOKEN = payload.api_key; env.ANTHROPIC_API_KEY = payload.api_key; }
+    if (gatewayModel) {
+      env.ANTHROPIC_MODEL = 'opus';
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = gatewayModel;
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = gatewayModel;
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = gatewayModel;
+      env.ANTHROPIC_SMALL_FAST_MODEL = gatewayModel;
+      baseOptions.model = 'opus';
+    }
+    // Use gateway auth only — no Bedrock, no stored OAuth session.
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    delete env.AWS_PROFILE;
+    baseOptions.env = env;
+    baseOptions.settingSources = ['project'];
+    console.log(`[agent-runner] Provider=litellm base_url=${payload.base_url ?? '(none)'} model=${gatewayModel ?? '(none)'}`);
+  } else {
+    baseOptions.env = {
+      ...process.env,
+      CLAUDE_CODE_USE_BEDROCK: '1',
+      ...(payload.model ? { ANTHROPIC_MODEL: payload.model } : {}),
+    };
+    delete (baseOptions.env as Record<string, string | undefined>).ANTHROPIC_BASE_URL;
+    delete (baseOptions.env as Record<string, string | undefined>).ANTHROPIC_AUTH_TOKEN;
+    console.log(`[agent-runner] Provider=bedrock model=${payload.model ?? '(default)'}`);
+  }
+
   if (payload.mcp_servers && Object.keys(payload.mcp_servers).length > 0) {
     baseOptions.mcpServers = payload.mcp_servers;
   }

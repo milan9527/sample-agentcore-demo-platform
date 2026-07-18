@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useContext, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Send, ChevronDown, AlertCircle, X, Bot, Layers, MessageSquare, File as FileIcon, Save, Eye, Pencil, Square, Paperclip, Upload, Trash2, Globe, Rocket, RefreshCw, ExternalLink, Brain, Download, Users, PanelRightClose, PanelRightOpen } from 'lucide-react'
+import { Send, ChevronDown, AlertCircle, X, Bot, Layers, MessageSquare, File as FileIcon, Save, Eye, Pencil, Square, Paperclip, Upload, Trash2, Globe, Rocket, RefreshCw, ExternalLink, Brain, Download, Users, PanelRightClose, PanelRightOpen, Cpu } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import hljs from 'highlight.js'
@@ -17,7 +17,8 @@ import { AgentService } from '@/services/agentService'
 import { BusinessScopeService, type BusinessScope } from '@/services/businessScopeService'
 import { RestChatRoomService } from '@/services/api/restChatRoomService'
 import { RestChatService } from '@/services/api/restChatService'
-import type { QuickQuestion, Agent } from '@/types'
+import type { QuickQuestion, Agent, ModelProvider } from '@/types'
+import { modelProviderService } from '@/services/modelProviderService'
 import { getAvatarDisplayUrl, getAvatarFallback, shouldShowAvatarImage } from '@/utils/avatarUtils'
 import { restClient } from '@/services/api/restClient'
 import { AgentMentionPopup, type AgentMentionPopupHandle, type MentionAgent } from '@/components/chat/AgentMentionPopup'
@@ -1317,6 +1318,8 @@ interface MessageInputProps {
   isSending?: boolean
   selectedModel: string | null
   onModelChange: (model: string | null) => void
+  selectedProviderId: string | null
+  onProviderChange: (providerId: string | null) => void
   scopeDefaultModel?: string | null
 }
 
@@ -1331,7 +1334,7 @@ function flattenFiles(nodes: FileNode[], prefix = ''): string[] {
   return result
 }
 
-function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, disabled = false, isSending = false, selectedModel, onModelChange, scopeDefaultModel }: MessageInputProps) {
+function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, disabled = false, isSending = false, selectedModel, onModelChange, selectedProviderId, onProviderChange, scopeDefaultModel }: MessageInputProps) {
   const { t } = useTranslation()
   const [input, setInput] = useState('')
   const [showUpload, setShowUpload] = useState(false)
@@ -1341,9 +1344,9 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
   const [pastedImages, setPastedImages] = useState<File[]>([])
   const [pastedPreviews, setPastedPreviews] = useState<string[]>([])
 
-  // Model selector state
+  // Unified model selector state: one dropdown, models grouped by provider.
   const [showModelPicker, setShowModelPicker] = useState(false)
-  const [availableModels, setAvailableModels] = useState<Array<{ id: string; litellm_model: string; provider: string }>>([])
+  const [modelGroups, setModelGroups] = useState<Array<{ provider: ModelProvider; models: Array<{ id: string; litellm_model: string; provider: string }> }>>([])
   const [modelsLoading, setModelsLoading] = useState(false)
   const modelPickerRef = useRef<HTMLDivElement>(null)
 
@@ -1370,15 +1373,28 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
       .catch(() => setAllFiles([]))
   }, [sessionId])
 
-  // Fetch available models from LiteLLM
+  // Load enabled providers and each provider's models into one grouped list.
   useEffect(() => {
-    if (!showModelPicker || availableModels.length > 0) return
+    if (!showModelPicker || modelGroups.length > 0) return
+    let cancelled = false
     setModelsLoading(true)
-    restClient.get<{ data: Array<{ id: string; litellm_model: string; provider: string }> }>('/api/litellm/models')
-      .then(res => setAvailableModels(res.data || []))
-      .catch(() => setAvailableModels([]))
-      .finally(() => setModelsLoading(false))
-  }, [showModelPicker, availableModels.length])
+    ;(async () => {
+      try {
+        const providers = (await modelProviderService.list()).filter(p => p.enabled)
+        const groups = await Promise.all(providers.map(async (provider) => {
+          let models: Array<{ id: string; litellm_model: string; provider: string }> = []
+          try { models = await modelProviderService.listModels(provider.id) } catch { /* leave empty */ }
+          return { provider, models }
+        }))
+        if (!cancelled) setModelGroups(groups)
+      } catch {
+        if (!cancelled) setModelGroups([])
+      } finally {
+        if (!cancelled) setModelsLoading(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [showModelPicker, modelGroups.length])
 
   // Close model picker on click outside
   useEffect(() => {
@@ -1727,8 +1743,62 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, di
             <Paperclip className="w-5 h-5" />
           </button>
 
-          {/* Model selector — hidden for now (session-level model switching not yet supported) */}
-          {/* TODO: Re-enable when AgentCore supports per-invocation model override */}
+          {/* Model selector — per-invocation model override (works in AgentCore + local runtimes) */}
+          <div className="relative" ref={modelPickerRef}>
+            <button
+              type="button"
+              onClick={() => setShowModelPicker(v => !v)}
+              disabled={isSending}
+              className="flex items-center gap-1 p-2 text-gray-400 hover:text-white rounded-lg hover:bg-gray-800 transition-colors disabled:opacity-50 max-w-[160px]"
+              title={t('chat.selectModel')}
+            >
+              <Cpu className="w-5 h-5 shrink-0" />
+              {selectedModel && (
+                <span className="text-xs truncate font-mono">{selectedModel}</span>
+              )}
+            </button>
+            {showModelPicker && (
+              <div className="absolute bottom-full mb-2 left-0 w-72 max-h-96 overflow-y-auto bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 py-1">
+                {/* Default (use scope/org default) */}
+                <button
+                  onClick={() => { onProviderChange?.(null); onModelChange?.(null); setShowModelPicker(false) }}
+                  className={`w-full text-left px-3 py-2 text-xs hover:bg-gray-700 ${!selectedProviderId && !selectedModel ? 'text-blue-400' : 'text-gray-300'}`}
+                >
+                  {scopeDefaultModel ? `${t('chat.scopeDefault')} (${scopeDefaultModel})` : t('chat.scopeDefault')}
+                </button>
+
+                {modelsLoading ? (
+                  <div className="px-3 py-2 text-xs text-gray-500">Loading…</div>
+                ) : modelGroups.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-gray-500">{t('chat.noModels')}</div>
+                ) : (
+                  modelGroups.map(({ provider, models }) => (
+                    <div key={provider.id}>
+                      <div className="mt-1 border-t border-gray-700 px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+                        {provider.name}{provider.isOrgDefault ? ' ★' : ''}
+                      </div>
+                      {models.length === 0 ? (
+                        <div className="px-3 py-1.5 text-[11px] text-gray-600 italic">{t('chat.noModels')}</div>
+                      ) : (
+                        models.map(m => {
+                          const active = selectedProviderId === provider.id && selectedModel === m.litellm_model
+                          return (
+                            <button
+                              key={`${provider.id}:${m.litellm_model}`}
+                              onClick={() => { onProviderChange?.(provider.id); onModelChange?.(m.litellm_model); setShowModelPicker(false) }}
+                              className={`w-full text-left px-3 py-2 text-xs font-mono hover:bg-gray-700 ${active ? 'text-blue-400' : 'text-gray-300'}`}
+                            >
+                              {m.litellm_model}
+                            </button>
+                          )
+                        })
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
 
           <textarea
             ref={inputRef}
@@ -1801,6 +1871,8 @@ function ChatInterfaceContent() {
     clearConversation,
     selectedModel,
     setSelectedModel,
+    selectedProviderId,
+    setSelectedProviderId,
   } = useContext(ChatContext)
 
   // Fetch scope's default model when scope changes
@@ -2216,7 +2288,7 @@ function ChatInterfaceContent() {
                 refreshKey={wsRefreshKey}
                 onSendMessage={handleSendMessage}
               />
-              <MessageInput onSend={handleSendMessage} onStop={stopGeneration} onUpload={handleUploadFile} sessionId={backendSessionId} businessScopeId={selectedBusinessScopeId} disabled={isSending} isSending={isSending} selectedModel={selectedModel} onModelChange={setSelectedModel} scopeDefaultModel={scopeDefaultModel} />
+              <MessageInput onSend={handleSendMessage} onStop={stopGeneration} onUpload={handleUploadFile} sessionId={backendSessionId} businessScopeId={selectedBusinessScopeId} disabled={isSending} isSending={isSending} selectedModel={selectedModel} onModelChange={setSelectedModel} selectedProviderId={selectedProviderId} onProviderChange={setSelectedProviderId} scopeDefaultModel={scopeDefaultModel} />
             </>
           )
         ) : (

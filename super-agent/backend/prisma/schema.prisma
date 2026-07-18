@@ -81,6 +81,7 @@ model organizations {
   knowledge_files            knowledge_files[]
   app_backend_instances      app_backend_instances[]
   agent_permissions          agent_permissions[]
+  model_providers            model_providers[]
 
   @@index([slug])
   @@index([plan_type])
@@ -122,6 +123,7 @@ model profiles {
   avatar_url             String?
   password_hash          String?
   active_organization_id String?  @db.Uuid
+  preferences            Json     @default("{}") @db.JsonB // user-level UI prefs (e.g. { featureToggles: {...} })
   created_at             DateTime @default(now()) @db.Timestamptz
   updated_at             DateTime @default(now()) @updatedAt @db.Timestamptz
 
@@ -1697,6 +1699,32 @@ model credential_vault {
   @@index([auth_type])
   @@index([status])
   @@index([token_expires_at])
+}
+
+// ============================================================================
+// Model Providers — reusable per-org LLM provider configs (Bedrock or LiteLLM
+// gateway). Agents/scopes reference a provider + model id; the LiteLLM api_key
+// is stored encrypted in credential_vault (referenced via credential_id).
+// ============================================================================
+model model_providers {
+  id               String   @id @default(uuid()) @db.Uuid
+  organization_id  String   @db.Uuid
+  name             String   @db.VarChar(255) // display name, e.g. "Corp LiteLLM"
+  type             String   @db.VarChar(32) // 'bedrock' | 'litellm'
+  base_url         String?  @db.VarChar(1024) // litellm only
+  credential_id    String?  @db.Uuid // FK → credential_vault (litellm api_key); null for bedrock
+  default_model_id String?  @db.VarChar(255)
+  is_org_default   Boolean  @default(false)
+  status           String   @default("active") @db.VarChar(50)
+  created_by       String?  @db.Uuid
+  created_at       DateTime @default(now()) @db.Timestamptz
+  updated_at       DateTime @default(now()) @updatedAt @db.Timestamptz
+
+  organization organizations @relation(fields: [organization_id], references: [id], onDelete: Cascade)
+
+  @@unique([organization_id, name], name: "unique_provider_name_per_org")
+  @@index([organization_id])
+  @@index([status])
 }
 
 // ============================================================================

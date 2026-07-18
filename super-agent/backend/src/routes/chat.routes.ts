@@ -187,6 +187,13 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
             session_id: { type: 'string', format: 'uuid' },
             message: { type: 'string', minLength: 1 },
             model: { type: 'string' },
+            model_selection: {
+              type: 'object',
+              properties: {
+                providerId: { type: 'string', format: 'uuid' },
+                modelId: { type: 'string' },
+              },
+            },
             context: { type: 'object' },
             attached_files: { type: 'array', items: { type: 'string' } },
             attached_images: { type: 'array', items: { type: 'string' } },
@@ -239,6 +246,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         sessionId: data.session_id,
         message: data.message,
         model: data.model,
+        modelSelection: data.model_selection,
         context: data.context,
         attachedFiles: data.attached_files,
         attachedImages: data.attached_images,

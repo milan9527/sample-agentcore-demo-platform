@@ -20,6 +20,7 @@ import { SupportLive } from '@/pages/SupportLive'
 import { Approvals } from '@/pages/Approvals'
 import { AuthProvider } from '@/services/AuthContext'
 import { ThemeProvider } from '@/services/ThemeContext'
+import { FeatureTogglesProvider } from '@/services/FeatureTogglesContext'
 import { useTranslation } from '@/i18n'
 
 function AppContent() {
@@ -36,7 +37,7 @@ function AppContent() {
       <Route path="/*" element={
         <AppShell>
           <Routes>
-            <Route path="/" element={<Navigate to="/showcase" replace />} />
+            <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/chat" element={<Chat />} />
             <Route path="/chat/room/:roomId" element={<ChatRoomPage />} />
@@ -81,16 +82,18 @@ function App() {
           <TranslationProvider>
             <ToastProvider>
               <AuthProvider>
-                <Routes>
-                  <Route path="/login" element={<Login />} />
-                  <Route path="/auth/callback" element={<AuthCallback />} />
-                  <Route path="/invite/:token" element={<InviteAccept />} />
-                  <Route path="/*" element={
-                    <ProtectedRoute>
-                      <AppContent />
-                    </ProtectedRoute>
-                  } />
-                </Routes>
+                <FeatureTogglesProvider>
+                  <Routes>
+                    <Route path="/login" element={<Login />} />
+                    <Route path="/auth/callback" element={<AuthCallback />} />
+                    <Route path="/invite/:token" element={<InviteAccept />} />
+                    <Route path="/*" element={
+                      <ProtectedRoute>
+                        <AppContent />
+                      </ProtectedRoute>
+                    } />
+                  </Routes>
+                </FeatureTogglesProvider>
               </AuthProvider>
             </ToastProvider>
           </TranslationProvider>

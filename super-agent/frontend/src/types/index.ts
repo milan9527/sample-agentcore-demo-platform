@@ -31,6 +31,29 @@ export interface ModelConfig {
   provider: 'Bedrock' | 'OpenAI' | 'Azure' | 'LiteLLM'
   modelId: string
   agentType: 'Orchestrator' | 'Worker' | 'Supervisor'
+  /** Provider + model selection referencing a reusable ModelProvider. */
+  modelSelection?: ModelSelection
+}
+
+/** A reusable per-org LLM provider (Bedrock or LiteLLM gateway). API key never exposed. */
+export interface ModelProvider {
+  id: string
+  name: string
+  type: 'bedrock' | 'litellm'
+  baseUrl: string | null
+  defaultModelId: string | null
+  isOrgDefault: boolean
+  hasApiKey: boolean
+  status: string
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+/** Selection of a provider + model, stored on agent.model_config / scope.settings. */
+export interface ModelSelection {
+  providerId?: string
+  modelId?: string
 }
 
 export interface Tool {

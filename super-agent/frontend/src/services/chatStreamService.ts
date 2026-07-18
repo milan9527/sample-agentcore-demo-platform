@@ -131,6 +131,8 @@ export interface StreamChatOptions {
   message: string;
   sessionId?: string;
   model?: string;
+  /** Provider + model selection (from the chat provider/model picker). */
+  modelSelection?: { providerId?: string; modelId?: string };
   context?: Record<string, unknown>;
   /** File names recently uploaded by the user (injected as context for the agent). */
   attachedFiles?: string[];
@@ -383,6 +385,9 @@ export function streamChat(
       }
       if (options.model) {
         body.model = options.model;
+      }
+      if (options.modelSelection && (options.modelSelection.providerId || options.modelSelection.modelId)) {
+        body.model_selection = options.modelSelection;
       }
       if (options.attachedFiles && options.attachedFiles.length > 0) {
         body.attached_files = options.attachedFiles;

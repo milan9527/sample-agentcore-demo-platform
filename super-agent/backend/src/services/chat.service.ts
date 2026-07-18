@@ -28,6 +28,8 @@ import {
 } from './claude-agent.service.js';
 import type { AgentRuntime } from './agent-runtime.js';
 import { agentRuntime as defaultAgentRuntime } from './agent-runtime-factory.js';
+import { resolveModel, extractSelection } from './model-resolver.js';
+import type { ModelSelection } from '../schemas/model-provider.schema.js';
 import {
   workspaceManager as defaultWorkspaceManager,
   type WorkspaceManager,
@@ -65,8 +67,10 @@ export interface ChatStreamOptions {
   mentionAgentId?: string;
   sessionId?: string;
   message: string;
-  /** Per-request model override (from chat UI model selector). */
+  /** Per-request model override (from chat UI model selector). Legacy bare model id. */
   model?: string;
+  /** Per-request provider+model selection (from chat UI). Takes priority over scope/agent. */
+  modelSelection?: ModelSelection;
   context?: Record<string, unknown>;
   /** File names recently uploaded by the user (injected as context for the agent). */
   attachedFiles?: string[];
@@ -580,23 +584,40 @@ export class ChatService {
       agentConfig.systemPrompt = systemPromptOverride;
     }
 
-    // Apply per-request model override from chat UI (takes priority over scope default)
-    console.log(`[chat] options.model=${options.model}, agentConfig.model=${agentConfig.model}, claudeSessionId=${claudeSessionId}`);
-    if (options.model) {
-      // Only reset Claude Code session if the model actually changed.
-      // SDK locks model per session, so switching requires a fresh session
-      // that falls back to history injection for context continuity.
-      const currentModel = agentConfig.model;
-      agentConfig.model = options.model;
-      if (options.model !== currentModel && claudeSessionId) {
-        console.log(`[chat] Model changed from ${currentModel} to ${options.model}, resetting Claude session`);
+    // Apply per-request model override from chat UI (takes priority over scope default).
+    // Supports both the new provider+model selection and the legacy bare model id.
+    const requestSelection: ModelSelection | undefined =
+      options.modelSelection ?? (options.model ? { modelId: options.model } : undefined);
+    console.log(`[chat] requestSelection=${JSON.stringify(requestSelection)}, claudeSessionId=${claudeSessionId}`);
+    if (requestSelection) {
+      const prev = agentConfig.resolvedModel;
+      if (requestSelection.providerId) {
+        // Explicit provider switch → full re-resolve.
+        agentConfig.resolvedModel = await resolveModel(organizationId, { requestSelection });
+      } else if (prev) {
+        // Model-only change → keep the already-resolved provider (base_url/api_key),
+        // just swap the model id.
+        agentConfig.resolvedModel = { ...prev, modelId: requestSelection.modelId ?? prev.modelId };
+      } else {
+        agentConfig.resolvedModel = await resolveModel(organizationId, { requestSelection });
+      }
+      agentConfig.model = agentConfig.resolvedModel.modelId ?? agentConfig.model;
+
+      // SDK locks model/provider per session; reset the Claude session when
+      // either the provider OR the model changed so the switch takes effect.
+      const providerChanged = prev?.provider !== agentConfig.resolvedModel.provider;
+      const modelChanged = prev?.modelId !== agentConfig.resolvedModel.modelId;
+      if ((providerChanged || modelChanged) && claudeSessionId) {
+        console.log(
+          `[chat] Model/provider changed (${prev?.provider}/${prev?.modelId} → ${agentConfig.resolvedModel.provider}/${agentConfig.resolvedModel.modelId}), resetting Claude session`,
+        );
         claudeSessionId = undefined;
         if (sessionId) {
           chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, null).catch(() => {});
         }
       }
     }
-    console.log(`[chat] Final model=${agentConfig.model}, claudeSessionId=${claudeSessionId}`);
+    console.log(`[chat] Final provider=${agentConfig.resolvedModel?.provider}, model=${agentConfig.resolvedModel?.modelId}, claudeSessionId=${claudeSessionId}`);
 
     // Persist user message + mark session as generating + agent as busy (in parallel)
     const resolvedAgentId = agentConfig.id;
@@ -957,6 +978,12 @@ export class ChatService {
       mcpServerIds: [],
     };
 
+    // Resolve provider (bedrock/litellm) from scope default → agent config → org default.
+    agentConfig.resolvedModel = await resolveModel(organizationId, {
+      scopeSelection: extractSelection(scopeForWorkspace.settings),
+      agentSelection: extractSelection((selectedAgent as unknown as { model_config?: unknown })?.model_config),
+    });
+
     const subAgentInfoMap = new Map(agentsWithSkills.map(a => {
       // Resolve avatar S3 key to a full API URL so the frontend can load it directly
       let avatarUrl: string | null = null;
@@ -1080,6 +1107,10 @@ export class ChatService {
       skillIds: skills.map(s => s.id),
       mcpServerIds: [],
     };
+
+    agentConfig.resolvedModel = await resolveModel(organizationId, {
+      agentSelection: extractSelection(agent.model_config),
+    });
 
     return { sessionId, workspacePath, agentConfig, skills, claudeSessionId };
   }

@@ -4,11 +4,13 @@
  */
 
 import { useState } from 'react';
-import { Users, Building2, Key, AlertCircle, Palette, UsersRound, BarChart3 } from 'lucide-react';
+import { Users, Building2, Key, AlertCircle, Palette, UsersRound, BarChart3, LayoutGrid, Cpu } from 'lucide-react';
 import { MembersTab } from './settings/MembersTab';
 import { OrganizationTab } from './settings/OrganizationTab';
 import { ApiKeysTab } from './settings/ApiKeysTab';
 import { AppearanceTab } from './settings/AppearanceTab';
+import { FeaturesTab } from './settings/FeaturesTab';
+import { ModelsTab } from './settings/ModelsTab';
 import { GroupsTab } from './settings/GroupsTab';
 import { TokenUsageTab } from './settings/TokenUsageTab';
 import { UserAccessTab } from './settings/UserAccessTab';
@@ -16,7 +18,7 @@ import { useAuth } from '@/services/AuthContext';
 import { useMembers } from '@/services/useMembers';
 import { useTranslation } from '@/i18n';
 
-type Tab = 'members' | 'groups' | 'organization' | 'api-keys' | 'appearance' | 'token-usage' | 'user-access';
+type Tab = 'members' | 'groups' | 'organization' | 'api-keys' | 'models' | 'appearance' | 'features' | 'token-usage' | 'user-access';
 
 const TAB_KEYS: { id: Tab; labelKey: string; icon: React.ReactNode }[] = [
   { id: 'members', labelKey: 'settings.tab.members', icon: <Users className="w-4 h-4" /> },
@@ -25,6 +27,8 @@ const TAB_KEYS: { id: Tab; labelKey: string; icon: React.ReactNode }[] = [
   { id: 'token-usage', labelKey: 'settings.tab.tokenUsage', icon: <BarChart3 className="w-4 h-4" /> },
   { id: 'organization', labelKey: 'settings.tab.organization', icon: <Building2 className="w-4 h-4" /> },
   { id: 'api-keys', labelKey: 'settings.tab.apiKeys', icon: <Key className="w-4 h-4" /> },
+  { id: 'models', labelKey: 'settings.tab.models', icon: <Cpu className="w-4 h-4" /> },
+  { id: 'features', labelKey: 'settings.tab.features', icon: <LayoutGrid className="w-4 h-4" /> },
   { id: 'appearance', labelKey: 'settings.tab.appearance', icon: <Palette className="w-4 h-4" /> },
 ];
 
@@ -75,6 +79,8 @@ export function Settings() {
       {activeTab === 'token-usage' && <TokenUsageTab isAdmin={isAdmin} />}
       {activeTab === 'organization' && <OrganizationTab isOwner={user?.role === 'owner'} />}
       {activeTab === 'api-keys' && <ApiKeysTab isAdmin={isAdmin} />}
+      {activeTab === 'models' && <ModelsTab isAdmin={isAdmin} />}
+      {activeTab === 'features' && <FeaturesTab />}
       {activeTab === 'appearance' && <AppearanceTab />}
     </div>
   );

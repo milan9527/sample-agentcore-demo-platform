@@ -11,7 +11,8 @@ import { useMCP } from '@/services'
 import { useToast } from '@/components'
 import { restClient } from '@/services/api/restClient'
 import type { BusinessScope } from '@/services/businessScopeService'
-import type { MCPServer, MCPServerConfig, Agent } from '@/types'
+import type { MCPServer, MCPServerConfig, Agent, ModelProvider } from '@/types'
+import { modelProviderService } from '@/services/modelProviderService'
 import type { McpServerEntry } from '@/data/mcp-servers'
 import { IMChannelsPanel } from './IMChannelsPanel'
 import { ScopeMemoryPanel } from './ScopeMemoryPanel'
@@ -785,9 +786,15 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
         {/* ============================================================ */}
         {/*  Model Configuration                                          */}
         {/* ============================================================ */}
-        <ModelConfigSection scope={scope} onSave={async (modelId) => {
+        <ModelConfigSection scope={scope} onSave={async (selection) => {
           await restClient.put(`/api/business-scopes/${scope.id}`, {
-            settings: { ...(scope.settings || {}), modelId: modelId || undefined },
+            settings: {
+              ...(scope.settings || {}),
+              // New provider+model selection.
+              modelSelection: (selection.providerId || selection.modelId) ? selection : undefined,
+              // Keep legacy modelId in sync for one release / backward-compat.
+              modelId: selection.modelId || undefined,
+            },
           })
           success('Model saved')
         }} onError={showError} />
@@ -1193,38 +1200,75 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
 
 function ModelConfigSection({ scope, onSave, onError }: {
   scope: { settings?: Record<string, unknown> | null }
-  onSave: (modelId: string) => Promise<void>
+  onSave: (selection: { providerId?: string; modelId?: string }) => Promise<void>
   onError: (msg: string) => void
 }) {
-  const initialModelId = (scope.settings as Record<string, unknown>)?.modelId as string || ''
+  const settings = (scope.settings as Record<string, unknown>) || {}
+  const initialSelection = (settings.modelSelection as { providerId?: string; modelId?: string } | undefined) || {}
+  const initialProviderId = initialSelection.providerId || ''
+  const initialModelId = initialSelection.modelId || (settings.modelId as string) || ''
+
+  const [providers, setProviders] = useState<ModelProvider[]>([])
+  const [selectedProviderId, setSelectedProviderId] = useState(initialProviderId)
   const [selectedModelId, setSelectedModelId] = useState(initialModelId)
   const [isSaving, setIsSaving] = useState(false)
   const [models, setModels] = useState<Array<{ id: string; litellm_model: string; provider: string }>>([])
-  const [isLoadingModels, setIsLoadingModels] = useState(true)
+  const [isLoadingModels, setIsLoadingModels] = useState(false)
 
   // Sync if parent scope changes (e.g. switching between scopes)
   useEffect(() => {
-    setSelectedModelId((scope.settings as Record<string, unknown>)?.modelId as string || '')
+    const s = (scope.settings as Record<string, unknown>) || {}
+    const sel = (s.modelSelection as { providerId?: string; modelId?: string } | undefined) || {}
+    setSelectedProviderId(sel.providerId || '')
+    setSelectedModelId(sel.modelId || (s.modelId as string) || '')
   }, [scope.settings])
 
+  // Load providers once.
   useEffect(() => {
-    restClient.get<{ data: Array<{ id: string; litellm_model: string; provider: string }> }>('/api/litellm/models')
-      .then(res => setModels(res.data || []))
-      .catch(() => setModels([]))
-      .finally(() => setIsLoadingModels(false))
+    modelProviderService.list().then(setProviders).catch(() => setProviders([]))
   }, [])
 
-  const handleSelect = async (litellmModel: string) => {
-    const prev = selectedModelId
-    setSelectedModelId(litellmModel)
+  // Load models for the selected provider (litellm only).
+  useEffect(() => {
+    setIsLoadingModels(true)
+    modelProviderService.listModels(selectedProviderId || undefined)
+      .then(setModels)
+      .catch(() => setModels([]))
+      .finally(() => setIsLoadingModels(false))
+  }, [selectedProviderId])
+
+  const persist = async (next: { providerId?: string; modelId?: string }) => {
     setIsSaving(true)
     try {
-      await onSave(litellmModel)
+      await onSave(next)
     } catch (err) {
-      setSelectedModelId(prev)
       onError(err instanceof Error ? err.message : 'Failed to save model')
+      throw err
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  const handleProviderChange = async (providerId: string) => {
+    const prevP = selectedProviderId
+    const prevM = selectedModelId
+    setSelectedProviderId(providerId)
+    setSelectedModelId('') // reset model when provider changes
+    try {
+      await persist({ providerId: providerId || undefined, modelId: undefined })
+    } catch {
+      setSelectedProviderId(prevP)
+      setSelectedModelId(prevM)
+    }
+  }
+
+  const handleModelChange = async (modelId: string) => {
+    const prev = selectedModelId
+    setSelectedModelId(modelId)
+    try {
+      await persist({ providerId: selectedProviderId || undefined, modelId: modelId || undefined })
+    } catch {
+      setSelectedModelId(prev)
     }
   }
 
@@ -1238,16 +1282,39 @@ function ModelConfigSection({ scope, onSave, onError }: {
         {isSaving && <Loader2 className="w-3 h-3 animate-spin text-purple-400" />}
       </div>
       <div className="space-y-2">
+        {/* Provider selector */}
+        <select
+          value={selectedProviderId}
+          onChange={e => handleProviderChange(e.target.value)}
+          disabled={isSaving}
+          className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-purple-500 focus:outline-none appearance-none cursor-pointer disabled:opacity-50"
+        >
+          <option value="">{t('scopeProfile.providerDefault')}</option>
+          {providers.map(p => (
+            <option key={p.id} value={p.id}>
+              {p.name}{p.isOrgDefault ? ' ★' : ''}
+            </option>
+          ))}
+        </select>
+
+        {/* Model selector (populated for litellm providers) */}
         {isLoadingModels ? (
           <div className="flex items-center gap-2 px-3 py-2 text-xs text-gray-500">
             <Loader2 className="w-3 h-3 animate-spin" /> Loading models...
           </div>
         ) : models.length === 0 ? (
-          <p className="text-xs text-gray-500 px-1">No models available. Configure LITELLM_BASE_URL in backend .env.</p>
+          <input
+            value={selectedModelId}
+            onChange={e => setSelectedModelId(e.target.value)}
+            onBlur={e => handleModelChange(e.target.value)}
+            disabled={isSaving}
+            placeholder={t('scopeProfile.modelDefault')}
+            className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-purple-500 focus:outline-none font-mono disabled:opacity-50"
+          />
         ) : (
           <select
             value={selectedModelId}
-            onChange={e => handleSelect(e.target.value)}
+            onChange={e => handleModelChange(e.target.value)}
             disabled={isSaving}
             className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-purple-500 focus:outline-none font-mono appearance-none cursor-pointer disabled:opacity-50"
           >

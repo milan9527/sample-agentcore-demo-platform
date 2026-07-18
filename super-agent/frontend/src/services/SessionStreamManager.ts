@@ -115,6 +115,7 @@ class SessionStreamManager {
       agentId?: string
       mentionAgentId?: string
       model?: string
+      modelSelection?: { providerId?: string; modelId?: string }
       sopContext: string
       attachedFiles?: string[]
       attachedImages?: string[]
@@ -154,6 +155,7 @@ class SessionStreamManager {
         message: content.trim(),
         sessionId,
         model: options.model,
+        modelSelection: options.modelSelection,
         context: { sop_context: options.sopContext },
         attachedFiles: options.attachedFiles,
         attachedImages: options.attachedImages,

@@ -39,6 +39,9 @@ export interface ChatContextType extends ChatSessionState {
   /** Currently selected model override (null = use scope default). */
   selectedModel: string | null
   setSelectedModel: (model: string | null) => void
+  /** Currently selected model provider override (null = use scope/org default). */
+  selectedProviderId: string | null
+  setSelectedProviderId: (providerId: string | null) => void
   clearHistory: () => Promise<void>
   clearError: () => void
   refreshContext: () => Promise<void>
@@ -74,6 +77,8 @@ const defaultContext: ChatContextType = {
   setSelectedBusinessScope: () => {},
   selectedModel: null,
   setSelectedModel: () => {},
+  selectedProviderId: null,
+  setSelectedProviderId: () => {},
   clearHistory: async () => {},
   clearError: () => {},
   refreshContext: async () => {},
@@ -126,6 +131,7 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
   const [selectedAgentId, setSelectedAgentIdState] = useState<string | null>(() => initialAgentId || getStoredAgentId())
   const [selectedBusinessScopeId, setSelectedBusinessScopeIdState] = useState<string | null>(() => initialScopeId || getStoredScopeId())
   const [selectedModel, setSelectedModel] = useState<string | null>(null)
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null)
   const [context, setContext] = useState<ChatContextData | null>(null)
   const [quickQuestions, setQuickQuestions] = useState<QuickQuestion[]>([])
   const [quickQuestionsLoading, setQuickQuestionsLoading] = useState(false)
@@ -322,6 +328,9 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
           agentId: selectedAgentId || undefined,
           mentionAgentId: mentionAgentId || undefined,
           model: selectedModel || undefined,
+          modelSelection: (selectedProviderId || selectedModel)
+            ? { providerId: selectedProviderId || undefined, modelId: selectedModel || undefined }
+            : undefined,
           sopContext: activeSop,
           attachedFiles: attachedFiles,
           attachedImages: attachedImages,
@@ -485,6 +494,8 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
     setSelectedBusinessScope,
     selectedModel,
     setSelectedModel,
+    selectedProviderId,
+    setSelectedProviderId,
     clearHistory,
     clearError,
     refreshContext,

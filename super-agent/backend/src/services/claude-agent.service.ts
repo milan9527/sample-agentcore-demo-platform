@@ -15,6 +15,7 @@ import { createToken } from '../middleware/auth.js';
 import { dangerousCommandBlocker, binaryFileReadBlocker, createSkillAccessChecker } from './claude-hooks.js';
 import { WorkspaceManager, type SkillForWorkspace } from './workspace-manager.js';
 import { prisma } from '../config/database.js';
+import type { ResolvedModel } from './model-resolver.js';
 
 // ---------------------------------------------------------------------------
 // Re-export SDK types from @anthropic-ai/claude-agent-sdk for consumers.
@@ -167,6 +168,12 @@ export interface AgentConfig {
   systemPrompt: string | null;
   /** Model identifier (e.g. LiteLLM model name). Passed to container to override ANTHROPIC_MODEL. */
   model?: string;
+  /**
+   * Fully resolved model + provider for this invocation (bedrock or litellm,
+   * with base_url/api_key for litellm). When present, runtimes use this to
+   * choose provider env; `model` is kept for display/logging.
+   */
+  resolvedModel?: ResolvedModel;
   organizationId: string;
   skillIds: string[];
   mcpServerIds: string[];
@@ -372,8 +379,14 @@ export class ClaudeAgentService {
     mcpServers: Record<string, AnyMCPServerConfig>, resumeSessionId?: string, abortController?: AbortController, userId?: string,
     pluginPaths?: string[],
   ): ClaudeCodeOptions {
-    let model = config.claude.model;
-    if (config.claude.useBedrock) model = getBedrockModelId(model);
+    // Provider resolution: prefer the per-invocation resolvedModel; otherwise
+    // fall back to the global config (legacy behavior).
+    const resolved = agentConfig.resolvedModel;
+    const useLiteLLM = resolved?.provider === 'litellm';
+    const useBedrock = useLiteLLM ? false : (resolved ? resolved.provider === 'bedrock' : config.claude.useBedrock);
+
+    let model = resolved?.modelId ?? agentConfig.model ?? config.claude.model;
+    if (useBedrock) model = getBedrockModelId(model);
     const preToolUseHooks: SDKHookCallbackMatcher[] = [{ hooks: [dangerousCommandBlocker, binaryFileReadBlocker] }];
     if (skillNames.length > 0) preToolUseHooks.push({ hooks: [createSkillAccessChecker(skillNames)] });
 
@@ -405,7 +418,10 @@ export class ClaudeAgentService {
       allowDangerouslySkipPermissions: true,
       hooks: { PreToolUse: preToolUseHooks },
       mcpServers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
-      settingSources: config.claude.useBedrock ? ['project'] : ['user', 'project'],
+      // Only load host 'user' settings for plain Anthropic auth. Bedrock and
+      // litellm must not inherit the host's stored OAuth login (it would win
+      // over our explicit creds), so restrict them to project settings.
+      settingSources: (useBedrock || useLiteLLM) ? ['project'] : ['user', 'project'],
       plugins: pluginPaths && pluginPaths.length > 0
         ? pluginPaths.map(p => ({ type: 'local' as const, path: p }))
         : undefined,
@@ -432,8 +448,41 @@ export class ClaudeAgentService {
       ...(agentToken ? { AUTH_TOKEN: agentToken } : {}),
     };
 
-    // Pass Bedrock env vars to the SDK subprocess so it picks up AWS credentials
-    if (config.claude.useBedrock) {
+    if (useLiteLLM) {
+      // Route the SDK at a LiteLLM-compatible gateway (Anthropic-compatible API).
+      // The CLI validates model ids client-side and rewrites its built-in
+      // aliases (opus/sonnet/haiku) to canonical Anthropic ids, which a gateway
+      // may reject. So we drive the CLI with the `opus` alias but remap that
+      // alias to the gateway's actual model id via ANTHROPIC_DEFAULT_OPUS_MODEL.
+      const gatewayModel = resolved?.modelId;
+      options.env = {
+        ...process.env,
+        ...platformEnv,
+        ...(resolved?.baseUrl ? { ANTHROPIC_BASE_URL: resolved.baseUrl } : {}),
+        // Gateway auth: set BOTH so the CLI uses the token regardless of which
+        // header it prefers, and does not fall back to stored OAuth creds.
+        ...(resolved?.apiKey ? { ANTHROPIC_AUTH_TOKEN: resolved.apiKey, ANTHROPIC_API_KEY: resolved.apiKey } : {}),
+        ...(gatewayModel
+          ? {
+              ANTHROPIC_MODEL: 'opus',
+              ANTHROPIC_DEFAULT_OPUS_MODEL: gatewayModel,
+              ANTHROPIC_DEFAULT_SONNET_MODEL: gatewayModel,
+              ANTHROPIC_DEFAULT_HAIKU_MODEL: gatewayModel,
+              ANTHROPIC_SMALL_FAST_MODEL: gatewayModel,
+            }
+          : {}),
+      };
+      // The SDK options.model must also be the alias, not the raw gateway id.
+      options.model = 'opus';
+      // Ensure Bedrock mode is off so the CLI uses the gateway auth, and remove
+      // any stored OAuth session so it doesn't win over our token.
+      delete options.env.CLAUDE_CODE_USE_BEDROCK;
+      delete options.env.CLAUDE_CODE_OAUTH_TOKEN;
+      delete options.env.AWS_ACCESS_KEY_ID;
+      delete options.env.AWS_SECRET_ACCESS_KEY;
+      delete options.env.AWS_PROFILE;
+    } else if (useBedrock) {
+      // Pass Bedrock env vars to the SDK subprocess so it picks up AWS credentials
       options.env = {
         ...process.env,
         ...platformEnv,

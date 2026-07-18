@@ -6,7 +6,8 @@ import { useAgents } from '@/services'
 import { useBusinessScopes } from '@/services/useBusinessScopes'
 import { restClient } from '@/services/api/restClient'
 import { getAvatarDisplayUrl, shouldShowAvatarImage } from '@/utils/avatarUtils'
-import type { Agent, AgentStatus, Tool } from '@/types'
+import { ModelSelector } from '@/components/ModelSelector'
+import type { Agent, AgentStatus, Tool, ModelSelection } from '@/types'
 
 interface FormState {
   internalName: string
@@ -21,6 +22,8 @@ interface FormState {
   a2aEnabled: boolean
   a2aCapabilities: string
   a2aExposedSkillIds: string[]
+  // Model provider + model selection
+  modelSelection?: ModelSelection
 }
 
 interface ToastState {
@@ -120,6 +123,7 @@ export function AgentConfigurator() {
           a2aEnabled: loadedAgent.a2aEnabled ?? false,
           a2aCapabilities: loadedAgent.a2aCapabilities ?? '',
           a2aExposedSkillIds: loadedAgent.a2aExposedSkillIds ?? [],
+          modelSelection: loadedAgent.modelConfig?.modelSelection,
         })
       } else {
         setError('Agent not found')
@@ -261,6 +265,10 @@ export function AgentConfigurator() {
       a2aEnabled: form.a2aEnabled,
       a2aCapabilities: form.a2aCapabilities,
       a2aExposedSkillIds: form.a2aExposedSkillIds,
+      modelConfig: {
+        ...(agent.modelConfig ?? { provider: 'Bedrock', modelId: '', agentType: 'Worker' }),
+        modelSelection: form.modelSelection,
+      },
     })
 
     setIsSaving(false)
@@ -515,6 +523,15 @@ export function AgentConfigurator() {
               className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-colors resize-none"
               placeholder="Define the agent's personality, expertise, and behavior..."
             />
+          </FormField>
+
+          {/* Model provider + model */}
+          <FormField label={t('agentConfig.model')}>
+            <ModelSelector
+              value={form.modelSelection}
+              onChange={(sel: ModelSelection) => setForm(prev => ({ ...prev, modelSelection: sel }))}
+            />
+            <p className="mt-1 text-xs text-gray-500">{t('agentConfig.modelHint')}</p>
           </FormField>
 
           {/* Capabilities Section */}
