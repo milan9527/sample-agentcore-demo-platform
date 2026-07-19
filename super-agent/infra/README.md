@@ -294,13 +294,41 @@ S3 桶名、SecretsManager secret 名、ElastiCache 集群名都以 stack 名为
 
 Type 选择 **Amazon Bedrock** 时，**Model ID** 会自动列出当前区域可用的 Bedrock 模型（点 **Refresh** 刷新）供选择；无需 Base URL / API Key（使用平台自身的 AWS 凭证）。
 
-> ⚠️ **仅支持 Anthropic / Claude 模型。** Agent 运行时（AgentCore + Claude Code）只使用 Anthropic Messages 协议（请求带 `metadata` 字段）。Amazon Bedrock 上的 **非 Anthropic 模型（Nova、Titan、Llama 等）** 使用不同的请求格式，会直接报错 `extraneous key [metadata] is not permitted`。因此直连 Bedrock 来源请只选 `*.anthropic.*` / Claude 模型。若为非 Claude 模型，后端会拦截并返回明确提示，而不是把 Bedrock 的原始错误抛给用户。
+**支持 Claude 与非 Claude 模型**：直连 Bedrock 来源不仅支持 Anthropic/Claude，也支持 **Amazon Nova、DeepSeek、Meta Llama、OpenAI gpt-oss、Kimi** 等 Bedrock 托管模型。运行时会自动为非 Claude 模型切换到兼容路径（见下文"模型统一兼容"）。
 
-### 使用非 Anthropic 模型（Nova / Kimi / GLM 等）
+> 少数模型的注意事项：**推理型模型**（如 DeepSeek R1、Kimi K2 Thinking）在 Bedrock 上不支持工具调用；由于 Agent 会话总是携带工具，代理会自动去掉工具重试一次（可回答，但无工具能力）。**Llama 3.3** 会把工具调用当成普通文本返回（不推荐做 Agent）；**Llama 4** 则原生支持工具，推荐用于 Agent 场景。
 
-这些模型需要通过 **LiteLLM 网关来源** 接入（见上文）。网关会把 Anthropic 协议翻译成各模型的原生格式（并剥离 `metadata` 等不兼容字段），从而让运行时可以驱动它们。即：**直连 Bedrock = 仅 Claude；其他一切走 LiteLLM。**
+### 使用非 Bedrock 模型（OpenAI 直连 / DeepSeek 直连等）
+
+不在 Bedrock 上托管的模型，通过 **LiteLLM 网关来源** 接入（见上文），由网关翻译到各家原生 API。
 
 > 生效范围：启用的来源会出现在对话框的模型选择器中；组织默认来源用于未显式指定模型时的兜底。切换默认来源即改变全局默认模型。
+
+## 模型统一兼容（架构）
+
+Agent 运行时本质是 **Claude Code CLI**，它**只会说 Anthropic Messages 协议**（请求带 `metadata`、`cachePoint`、`thinking` 等字段）。不同模型对这套协议的接受度不同——Bedrock 上的 Claude 全接受，而 Nova / DeepSeek / Llama 会拒绝 `metadata`、`cachePoint`、`thinking`，且 `max_tokens` 上限各异。统一兼容靠服务端的**路由 + 协议翻译 + 能力裁剪**实现，客户端（CLI）无需改动。
+
+```
+Claude Code CLI ──(Anthropic Messages)──▶ [路由]
+                                            ├─ Anthropic 模型         → Bedrock 直连（原生可用）
+                                            ├─ 其他 Bedrock 托管模型  → 内置代理 /v1/messages → Bedrock Converse（能力裁剪）
+                                            └─ 非 Bedrock 模型        → 外部 LiteLLM 网关 → 各家原生 API
+```
+
+**第 1 层 · 路由决策**（`backend/src/services/agent-runtime-agentcore.ts`）
+逐请求判断：`provider == bedrock` 且模型非 Anthropic（`isAnthropicBedrockModel()`）时，改道到后端自带的 `/v1/messages` 代理（把 `provider` 视作 `litellm`，`base_url` 指向后端公网地址 `AGENTCORE_BACKEND_API_URL`，用内部服务令牌鉴权）；Claude 模型走 Bedrock 直连的快速路径。
+
+**第 2 层 · Anthropic → Converse 代理**（`backend/src/routes/llm-proxy.routes.ts` + `backend/src/services/llm-proxy/`）
+`/v1/messages` 把 Anthropic 协议转换成 **Bedrock Converse**（Bedrock 的统一 API，一套 schema 覆盖 Nova / DeepSeek / Llama 等）。转换器里的**能力裁剪门**是通用性的关键（`openai-to-bedrock.ts`）：
+- `isAnthropicModel()` 拦住 Claude 专属字段 → 非 Anthropic 模型**不注入** `cachePoint`（提示缓存）与 `thinking`（扩展思考）
+- `MODEL_MAX_OUTPUT_TOKENS` 按模型钳制 `max_tokens`（如 Nova 8192）
+- **无工具回退**：模型拒绝 `tools` 时（如 DeepSeek R1），自动去掉工具重试一次
+- 代理接受容器传来的**内部服务令牌**（`internal.*`，授予 `model:invoke`），无需单独发放 API Key
+
+**第 3 层 · 外部 LiteLLM 网关**（非 Bedrock 模型）
+容器路径相同（`ANTHROPIC_BASE_URL` 指向网关），由网关做同样的协议翻译。若网关上的推理模型报 `does not support parameters: ['tools']`，在**网关端**配置 `litellm_settings: drop_params: true` 即可。
+
+> 依赖的部署配置（`deploy-full-ecs.sh` 与 CDK 已内置）：ECS 任务注入 `AGENTCORE_BACKEND_API_URL`（容器回调地址），CloudFront 增加 `/v1/*` 行为把 LLM 代理请求转发到 ALB。
 
 ## 运维
 
