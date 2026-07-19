@@ -21,6 +21,7 @@ export interface ChatSessionEntity {
   business_scope_id: string | null;
   agent_id: string | null;
   claude_session_id: string | null;
+  claude_session_model?: string | null;
   title: string | null;
   status: SessionStatus;
   source: SessionSource;
@@ -151,14 +152,23 @@ export class ChatSessionRepository extends BaseRepository<ChatSessionEntity> {
   }
 
   /**
-   * Update the Claude SDK session ID on a chat session.
+   * Update the Claude SDK session ID on a chat session, and the model that
+   * session was created with (so a later model switch can be detected).
+   * Pass `claudeSessionId: null` to clear the session (forces a fresh start).
    */
   async updateClaudeSessionId(
     id: string,
     organizationId: string,
-    claudeSessionId: string,
+    claudeSessionId: string | null,
+    claudeSessionModel?: string | null,
   ): Promise<void> {
-    await this.update(id, organizationId, { claude_session_id: claudeSessionId } as Partial<ChatSessionEntity>);
+    const data: Partial<ChatSessionEntity> = { claude_session_id: claudeSessionId };
+    // Only touch the model column when a value is supplied (including explicit
+    // null to clear it alongside the session id).
+    if (claudeSessionModel !== undefined) {
+      data.claude_session_model = claudeSessionModel;
+    }
+    await this.update(id, organizationId, data as Partial<ChatSessionEntity>);
   }
 
   /**

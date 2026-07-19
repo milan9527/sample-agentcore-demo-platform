@@ -28,7 +28,7 @@ import {
 } from './claude-agent.service.js';
 import type { AgentRuntime } from './agent-runtime.js';
 import { agentRuntime as defaultAgentRuntime } from './agent-runtime-factory.js';
-import { resolveModel, extractSelection } from './model-resolver.js';
+import { resolveModel, extractSelection, isAnthropicBedrockModel } from './model-resolver.js';
 import type { ModelSelection } from '../schemas/model-provider.schema.js';
 import {
   workspaceManager as defaultWorkspaceManager,
@@ -301,7 +301,8 @@ export class ChatService {
         timeoutMs,
         (event: ConversationEvent) => {
           if (event.type === 'session_start' && event.sessionId) {
-            chatSessionRepository.updateClaudeSessionId(sessionId, options.organizationId, event.sessionId).catch(() => {});
+            const sessionModel = agentConfig.resolvedModel?.modelId ?? agentConfig.model ?? null;
+            chatSessionRepository.updateClaudeSessionId(sessionId, options.organizationId, event.sessionId, sessionModel).catch(() => {});
           }
           if (event.type === 'assistant' && event.content) {
             allContentBlocks.push(...event.content);
@@ -542,6 +543,8 @@ export class ChatService {
     let agentConfig: AgentConfig;
     let skills: SkillForWorkspace[];
     let claudeSessionId: string | undefined;
+    // Model the resumable Claude session was created with (null/undefined if none).
+    let claudeSessionModel: string | undefined;
     let workspacePath: string | undefined;
     let subAgentNames: string[] = [];
     let subAgentNameToId: Map<string, string> = new Map();
@@ -558,6 +561,7 @@ export class ChatService {
       agentConfig = result.agentConfig;
       skills = result.skills;
       claudeSessionId = result.claudeSessionId;
+      claudeSessionModel = result.claudeSessionModel;
       workspacePath = result.workspacePath;
       subAgentNames = result.subAgentNames;
       subAgentNameToId = result.subAgentNameToId;
@@ -576,6 +580,7 @@ export class ChatService {
       agentConfig = result.agentConfig;
       skills = result.skills;
       claudeSessionId = result.claudeSessionId;
+      claudeSessionModel = result.claudeSessionModel;
       workspacePath = result.workspacePath;
     }
 
@@ -602,22 +607,42 @@ export class ChatService {
         agentConfig.resolvedModel = await resolveModel(organizationId, { requestSelection });
       }
       agentConfig.model = agentConfig.resolvedModel.modelId ?? agentConfig.model;
+    }
 
-      // SDK locks model/provider per session; reset the Claude session when
-      // either the provider OR the model changed so the switch takes effect.
-      const providerChanged = prev?.provider !== agentConfig.resolvedModel.provider;
-      const modelChanged = prev?.modelId !== agentConfig.resolvedModel.modelId;
-      if ((providerChanged || modelChanged) && claudeSessionId) {
-        console.log(
-          `[chat] Model/provider changed (${prev?.provider}/${prev?.modelId} → ${agentConfig.resolvedModel.provider}/${agentConfig.resolvedModel.modelId}), resetting Claude session`,
-        );
-        claudeSessionId = undefined;
-        if (sessionId) {
-          chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, null).catch(() => {});
-        }
+    // Claude Code locks the model to a session at creation — resuming keeps the
+    // ORIGINAL model. So detect a switch against the model the resumable session
+    // was actually created with (claudeSessionModel), NOT the freshly-resolved
+    // scope/org default (which may coincide with the selection and mask a real
+    // switch). If they differ, drop the session id so the container starts fresh.
+    const effectiveModel = agentConfig.resolvedModel?.modelId ?? agentConfig.model;
+
+    // Guard: the direct Bedrock path drives Claude Code, which only speaks the
+    // Anthropic Messages schema. Non-Anthropic Bedrock models (Nova, Titan,
+    // Llama, …) reject it ("extraneous key [metadata]"). Fail fast with an
+    // actionable message instead of surfacing the cryptic Bedrock 400. Such
+    // models must be served via a LiteLLM gateway provider, which translates
+    // the schema.
+    if (
+      agentConfig.resolvedModel?.provider === 'bedrock' &&
+      !isAnthropicBedrockModel(effectiveModel)
+    ) {
+      throw AppError.validation(
+        `Model "${effectiveModel}" is not an Anthropic model and cannot run on the direct Amazon Bedrock provider ` +
+          `(the agent runtime only supports Anthropic/Claude models there). ` +
+          `To use non-Anthropic models (e.g. Amazon Nova), add them through a LiteLLM gateway provider in Settings → Models.`,
+      );
+    }
+
+    if (claudeSessionId && claudeSessionModel && effectiveModel && claudeSessionModel !== effectiveModel) {
+      console.log(
+        `[chat] Model changed (session was ${claudeSessionModel} → now ${effectiveModel}), resetting Claude session`,
+      );
+      claudeSessionId = undefined;
+      if (sessionId) {
+        chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, null, null).catch(() => {});
       }
     }
-    console.log(`[chat] Final provider=${agentConfig.resolvedModel?.provider}, model=${agentConfig.resolvedModel?.modelId}, claudeSessionId=${claudeSessionId}`);
+    console.log(`[chat] Final provider=${agentConfig.resolvedModel?.provider}, model=${effectiveModel}, sessionModel=${claudeSessionModel ?? '(none)'}, claudeSessionId=${claudeSessionId}`);
 
     // Persist user message + mark session as generating + agent as busy (in parallel)
     const resolvedAgentId = agentConfig.id;
@@ -763,9 +788,10 @@ export class ChatService {
         (event: ConversationEvent) => {
           if (event.type === 'session_start' && event.sessionId) {
             conversationSessionId = event.sessionId;
-            // Store the Claude SDK session ID for future resume
+            // Store the Claude SDK session ID + the model it was created with, so
+            // a later model switch is detected accurately and forces a new session.
             if (sessionId) {
-              chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, event.sessionId).catch((err) => {
+              chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, event.sessionId, effectiveModel ?? null).catch((err) => {
                 console.error('Failed to store claude_session_id:', err);
               });
             }
@@ -916,7 +942,7 @@ export class ChatService {
     organizationId: string,
     userId: string,
     options: ChatStreamOptions,
-  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string; subAgentNames: string[]; subAgentNameToId: Map<string, string>; subAgentInfoMap: Map<string, { displayName: string; avatar: string | null }>; pluginPaths: string[]; mcpServers: Record<string, import('./claude-agent.service.js').MCPServerSDKConfig> }> {
+  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string; claudeSessionModel?: string; subAgentNames: string[]; subAgentNameToId: Map<string, string>; subAgentInfoMap: Map<string, { displayName: string; avatar: string | null }>; pluginPaths: string[]; mcpServers: Record<string, import('./claude-agent.service.js').MCPServerSDKConfig> }> {
     const scopeId = options.businessScopeId!;
     // mentionAgentId is NOT used as selectedAgentId — it should not change the orchestrator identity.
     // Instead, it's handled by injecting a routing hint into the message so the orchestrator
@@ -993,7 +1019,7 @@ export class ChatService {
       }
       return [a.name, { displayName: a.displayName || a.name, avatar: avatarUrl }];
     }));
-    return { sessionId, workspacePath, agentConfig, skills: scopeForWorkspace.skills, claudeSessionId: session.claude_session_id ?? undefined, subAgentNames: agentsWithSkills.map(a => a.name), subAgentNameToId: new Map(agentsWithSkills.map(a => [a.name, a.id])), subAgentInfoMap, pluginPaths, mcpServers: await this.readSessionMcpServers(workspacePath) };
+    return { sessionId, workspacePath, agentConfig, skills: scopeForWorkspace.skills, claudeSessionId: session.claude_session_id ?? undefined, claudeSessionModel: session.claude_session_model ?? undefined, subAgentNames: agentsWithSkills.map(a => a.name), subAgentNameToId: new Map(agentsWithSkills.map(a => [a.name, a.id])), subAgentInfoMap, pluginPaths, mcpServers: await this.readSessionMcpServers(workspacePath) };
   }
 
   /**
@@ -1067,7 +1093,7 @@ export class ChatService {
     userId: string,
     options: ChatStreamOptions,
     skillsOverride?: SkillForWorkspace[],
-  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string }> {
+  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string; claudeSessionModel?: string }> {
     const agent = await agentRepository.findById(options.agentId!, organizationId);
     if (!agent) throw AppError.notFound(`Agent with ID ${options.agentId} not found`);
 
@@ -1080,6 +1106,7 @@ export class ChatService {
 
     let sessionId = options.sessionId;
     let claudeSessionId: string | undefined;
+    let claudeSessionModel: string | undefined;
     if (!sessionId) {
       const session = await this.createSession({ context: options.context ?? {} }, organizationId, userId);
       sessionId = session.id;
@@ -1092,6 +1119,7 @@ export class ChatService {
         sessionId = newSession.id;
       } else {
         claudeSessionId = session.claude_session_id ?? undefined;
+        claudeSessionModel = session.claude_session_model ?? undefined;
       }
     }
 
@@ -1112,7 +1140,7 @@ export class ChatService {
       agentSelection: extractSelection(agent.model_config),
     });
 
-    return { sessionId, workspacePath, agentConfig, skills, claudeSessionId };
+    return { sessionId, workspacePath, agentConfig, skills, claudeSessionId, claudeSessionModel };
   }
 
   private async loadAgentSkills(organizationId: string, agentId: string): Promise<SkillForWorkspace[]> {

@@ -32,18 +32,26 @@
 
 ## 前置条件
 
+> ⚠️ **部署脚本必须在 ARM64 (AWS Graviton / Apple Silicon) 机器上运行。**
+> 后端 ECS 任务和 AgentCore Runtime 都要求 `linux/arm64` 镜像，AgentCore Runtime **只接受 ARM64**。在 ARM 主机上为原生构建，速度快且可靠。
+> 推荐在一台 **Graviton EC2 实例**（如 `t4g` / `c7g` / `m7g`，Amazon Linux 2023 或 Ubuntu）上执行部署。
+>
+> 在 x86_64 主机上，脚本会自动配置 QEMU（`tonistiigi/binfmt`）做交叉构建，但**明显更慢且偶发不稳定**，不推荐用于正式部署。脚本会在推送后校验 AgentCore 镜像确为 arm64，架构不符会报错退出。
+
 | 工具 | 用途 | ECS 模式 | EC2 模式 |
 |------|------|:--------:|:--------:|
+| **ARM64 (Graviton) 构建主机** | 构建 arm64 镜像（AgentCore 仅支持 ARM64） | ✅ | ✅ |
 | AWS CLI v2 | 基础设施操作 | ✅ | ✅ |
 | Node.js 22+ | 前端构建 | ✅ | ✅ |
-| Docker (buildx, ARM64) | 后端 + AgentCore 容器构建 | ✅ | ✅ |
+| Docker (含 buildx) | 后端 + AgentCore 容器构建 | ✅ | ✅ |
 | SSM Session Manager 插件 | SSH 隧道 | — | ✅ |
 | EC2 Key Pair | SSH 访问 | — | ✅ |
 
-确认 AWS 身份：
+确认 AWS 身份与构建主机架构：
 
 ```bash
 aws sts get-caller-identity
+uname -m   # 期望 aarch64 / arm64（Graviton）；x86_64 需 QEMU 交叉构建（不推荐）
 ```
 
 ## ECS 一键部署（推荐）
@@ -265,17 +273,34 @@ S3 桶名、SecretsManager secret 名、ElastiCache 集群名都以 stack 名为
 3. **Deploy Application** — 通过 SSM 部署代码到 EC2
 4. **Smoke Test** — 健康检查 + 前端可达性验证
 
-## LiteLLM 模型网关（可选）
+## 模型来源配置（在界面中设置）
 
-部署完成后，如需接入第三方模型（Kimi K2.5、GLM 5.1 等），SSH 到 EC2 执行：
+模型来源直接在应用界面配置，**无需 SSH、无需部署脚本、无需改环境变量**。以管理员登录后进入 **Settings → Models（设置 → 模型来源）**。
 
-```bash
-sudo bash /path/to/infra/scripts/setup-litellm.sh
-```
+默认已内置一个组织默认来源：**Amazon Bedrock**（模型 `global.anthropic.claude-opus-4-8`）。
 
-然后编辑 `/opt/litellm/.env` 填入 API Key，重启 `sudo systemctl restart litellm`。
+### 添加 LiteLLM 网关（接入第三方模型，如 Kimi、GLM 等）
 
-访问 `https://your-domain/modelservice/ui/` 管理模型。
+1. Settings → Models → **Add Provider（添加来源）**
+2. **Type** 选择 **LiteLLM Gateway**
+3. 填写：
+   - **Name**：显示名称（如 `Corp LiteLLM`）
+   - **Base URL**：网关地址（如 `https://litellm.example.com`）
+   - **API Key**：网关密钥（仅写入、不回显；编辑时留空表示保留原值）
+   - **Model ID**：要使用的模型 ID（**必填**，如 `claude-opus-4.8`）——对话中直接使用该指定模型，不会列出网关的全部模型
+4. 保存后，可对该来源：**启用/停用**、**设为组织默认（★）**、**编辑**、**删除**
+
+### 添加 / 编辑 Amazon Bedrock 来源
+
+Type 选择 **Amazon Bedrock** 时，**Model ID** 会自动列出当前区域可用的 Bedrock 模型（点 **Refresh** 刷新）供选择；无需 Base URL / API Key（使用平台自身的 AWS 凭证）。
+
+> ⚠️ **仅支持 Anthropic / Claude 模型。** Agent 运行时（AgentCore + Claude Code）只使用 Anthropic Messages 协议（请求带 `metadata` 字段）。Amazon Bedrock 上的 **非 Anthropic 模型（Nova、Titan、Llama 等）** 使用不同的请求格式，会直接报错 `extraneous key [metadata] is not permitted`。因此直连 Bedrock 来源请只选 `*.anthropic.*` / Claude 模型。若为非 Claude 模型，后端会拦截并返回明确提示，而不是把 Bedrock 的原始错误抛给用户。
+
+### 使用非 Anthropic 模型（Nova / Kimi / GLM 等）
+
+这些模型需要通过 **LiteLLM 网关来源** 接入（见上文）。网关会把 Anthropic 协议翻译成各模型的原生格式（并剥离 `metadata` 等不兼容字段），从而让运行时可以驱动它们。即：**直连 Bedrock = 仅 Claude；其他一切走 LiteLLM。**
+
+> 生效范围：启用的来源会出现在对话框的模型选择器中；组织默认来源用于未显式指定模型时的兜底。切换默认来源即改变全局默认模型。
 
 ## 运维
 

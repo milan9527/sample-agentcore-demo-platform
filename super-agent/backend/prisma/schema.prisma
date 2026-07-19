@@ -485,6 +485,10 @@ model chat_sessions {
   business_scope_id String?   @db.Uuid
   agent_id          String?   @db.Uuid
   claude_session_id String?
+  // The model id the current claude_session_id was created with. Used to detect
+  // a model switch: resuming a Claude session keeps its original model, so when
+  // the requested model differs from this we must start a fresh session.
+  claude_session_model String? @db.VarChar(255)
   title             String?
   status            String    @default("idle") // idle | generating | error
   source            String    @default("web") @db.VarChar(20) // web | im

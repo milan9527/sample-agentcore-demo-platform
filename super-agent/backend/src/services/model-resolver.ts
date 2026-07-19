@@ -28,6 +28,22 @@ interface ResolveInput {
 }
 
 /**
+ * On the direct Bedrock path the agent runtime drives Claude Code, which speaks
+ * ONLY the Anthropic Messages schema (it includes a top-level `metadata` field).
+ * Anthropic models on Bedrock accept that; non-Anthropic models (Nova, Titan,
+ * Llama, Mistral, …) use a different schema and reject it with
+ * "extraneous key [metadata] is not permitted". So a Bedrock provider can only
+ * serve Anthropic model ids here — other models must go through a LiteLLM
+ * gateway (which translates the schema). This detects an Anthropic model id,
+ * tolerating region/global inference-profile prefixes (us./eu./apac./global.).
+ */
+export function isAnthropicBedrockModel(modelId: string | undefined): boolean {
+  if (!modelId) return true; // undefined → runtime falls back to its Anthropic default
+  const id = modelId.toLowerCase();
+  return id.includes('anthropic.') || id.startsWith('anthropic') || id.includes('claude');
+}
+
+/**
  * Extracts a ModelSelection from a stored JSON blob (scope.settings or
  * agent.model_config), tolerating the legacy flat `modelId` string shape.
  */
