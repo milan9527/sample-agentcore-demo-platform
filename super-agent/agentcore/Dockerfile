@@ -16,9 +16,14 @@ RUN pip3 install --break-system-packages uv
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# Claude Code Bedrock configuration
+# Claude Code Bedrock configuration.
+# CLAUDE_CODE_DISABLE_THINKING=1: newer Claude models (e.g. Opus 4.8) reject the
+# legacy `thinking.type.enabled` extended-thinking param the CLI sends on Bedrock
+# ("...not supported for this model. Use thinking.type.adaptive..."). Disabling
+# thinking avoids sending that param, keeping the CLI compatible across models.
 ENV CLAUDE_CODE_USE_BEDROCK=1 \
-    ANTHROPIC_MODEL=us.anthropic.claude-opus-4-6-v1 \
+    ANTHROPIC_MODEL=global.anthropic.claude-opus-4-8 \
+    CLAUDE_CODE_DISABLE_THINKING=1 \
     WORKSPACE_S3_REGION=us-west-2
 
 # Install Node.js dependencies (include dev for TypeScript build)

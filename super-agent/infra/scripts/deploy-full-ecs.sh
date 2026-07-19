@@ -920,8 +920,11 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   echo "  [4d] Creating/updating AgentCore Runtime..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
 
-  # Build environment variables JSON
-  ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-6-v1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
+  # Build environment variables JSON.
+  # CLAUDE_CODE_DISABLE_THINKING=1: Opus 4.8 (and other newer models) reject the
+  # legacy `thinking.type.enabled` param the CLI sends on Bedrock; disabling
+  # thinking keeps the runtime compatible across models.
+  ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-8\",\"CLAUDE_CODE_DISABLE_THINKING\":\"1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
   if [ -n "$BEDROCK_AK" ] && [ -n "$BEDROCK_SK" ]; then
     ENV_VARS="$ENV_VARS,\"AWS_ACCESS_KEY_ID\":\"$BEDROCK_AK\",\"AWS_SECRET_ACCESS_KEY\":\"$BEDROCK_SK\""
   fi
