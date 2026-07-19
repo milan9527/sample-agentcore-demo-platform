@@ -1,27 +1,44 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Server, Plus, Trash2, Loader2, Briefcase,
   Users, Zap, TrendingUp, BarChart3,
   CheckCircle2, AlertCircle, Clock, FileText,
   MessageSquare, Shield, Database, Settings, Save,
-  Terminal, Pencil, Sparkles,
+  Terminal, Pencil, Sparkles, Globe, Lock,
 } from 'lucide-react'
 import { useMCP } from '@/services'
 import { useToast } from '@/components'
 import { restClient } from '@/services/api/restClient'
 import type { BusinessScope } from '@/services/businessScopeService'
-import type { MCPServer, MCPServerConfig, Agent } from '@/types'
+import type { MCPServer, MCPServerConfig, Agent, ModelProvider } from '@/types'
+import { modelProviderService } from '@/services/modelProviderService'
 import type { McpServerEntry } from '@/data/mcp-servers'
 import { IMChannelsPanel } from './IMChannelsPanel'
 import { ScopeMemoryPanel } from './ScopeMemoryPanel'
 import { DocGroupsPanel } from './DocGroupsPanel'
+import { ScopeKnowledgePanel } from './ScopeKnowledgePanel'
 import { RehearsalPanel } from './RehearsalPanel'
 import { MCPCatalogPanel, type CustomMcpServer } from './MCPCatalogPanel'
+import { ConnectorPanel } from './ConnectorPanel'
+import { SkillsPanel } from './SkillsPanel'
+import { CustomerServiceSection } from './CustomerServiceSection'
+import { AgentPermissionsPanel } from './AgentPermissionsPanel'
 import {
   getAvatarDisplayUrl,
   getAvatarFallback,
   shouldShowAvatarImage,
 } from '@/utils/avatarUtils'
+import { refreshAgentsStore } from '@/services/useAgents'
+import { translations } from '@/i18n/translations'
+
+/** Module-level t() — no React context dependency */
+function t(key: string): string {
+  const lang = (typeof window !== 'undefined' && localStorage.getItem('super-agent-language')) || 'en'
+  const entry = translations[key]
+  if (!entry) return key
+  return entry[lang as 'en' | 'cn'] ?? entry.en ?? key
+}
 
 interface ScopeProfileProps {
   scope: BusinessScope
@@ -29,7 +46,7 @@ interface ScopeProfileProps {
   allAgents?: Agent[]
   onDeleteScope?: (scopeId: string) => void
   onAddAgent?: (agentId: string, scopeId: string) => void
-  onRemoveAgent?: (agentId: string) => void
+  onRemoveAgent?: (agentId: string, scopeId: string) => void
 }
 
 interface ScopeMcpServer {
@@ -192,10 +209,10 @@ function StatCard({ icon: Icon, label, value, sub, color }: {
 /*  Task Briefing Card (Pinterest-style)                               */
 /* ------------------------------------------------------------------ */
 const statusBadge: Record<TaskBriefing['status'], { bg: string; text: string; label: string }> = {
-  completed: { bg: 'bg-emerald-500/10', text: 'text-emerald-400', label: 'Completed' },
-  flagged: { bg: 'bg-yellow-500/10', text: 'text-yellow-400', label: 'Flagged' },
-  'in-progress': { bg: 'bg-blue-500/10', text: 'text-blue-400', label: 'In Progress' },
-  escalated: { bg: 'bg-orange-500/10', text: 'text-orange-400', label: 'Escalated' },
+  completed: { bg: 'bg-emerald-500/10', text: 'text-emerald-400', label: t('scopeProfile.statusCompleted') },
+  flagged: { bg: 'bg-yellow-500/10', text: 'text-yellow-400', label: t('scopeProfile.statusFlagged') },
+  'in-progress': { bg: 'bg-blue-500/10', text: 'text-blue-400', label: t('scopeProfile.statusInProgress') },
+  escalated: { bg: 'bg-orange-500/10', text: 'text-orange-400', label: t('scopeProfile.statusEscalated') },
 }
 
 function BriefingCard({ briefing }: { briefing: TaskBriefing }) {
@@ -279,7 +296,7 @@ function AgentRow({ agent }: { agent: Agent }) {
         <p className="text-xs text-white font-medium truncate">{agent.displayName}</p>
       </div>
       <span className="text-[10px] text-gray-500">{agent.role}</span>
-      <span className="text-[10px] text-gray-600 w-12 text-right">{agent.metrics?.taskCount ?? 0} tasks</span>
+      <span className="text-[10px] text-gray-600 w-12 text-right">{agent.metrics?.taskCount ?? 0} {t('scopeProfile.tasks')}</span>
     </div>
   )
 }
@@ -290,12 +307,14 @@ function AgentRow({ agent }: { agent: Agent }) {
 export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onAddAgent, onRemoveAgent }: ScopeProfileProps) {
   const { success, error: showError } = useToast()
   const { servers: allServers, getServers, createServer } = useMCP()
+  const navigate = useNavigate()
 
   const [scopeServers, setScopeServers] = useState<ScopeMcpServer[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isAdding, setIsAdding] = useState(false)
   const [showPicker, setShowPicker] = useState(false)
   const [showCatalogPanel, setShowCatalogPanel] = useState(false)
+  const [showConnectorPanel, setShowConnectorPanel] = useState(false)
   const [showAgentPicker, setShowAgentPicker] = useState(false)
   const [editingConfigId, setEditingConfigId] = useState<string | null>(null)
   const [configDraft, setConfigDraft] = useState('')
@@ -504,7 +523,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
 
   const handleRemoveAgentFromScope = async (agent: Agent) => {
     if (onRemoveAgent) {
-      await onRemoveAgent(agent.id)
+      await onRemoveAgent(agent.id, scope.id)
       success(`Removed "${agent.displayName}" from scope`)
     }
   }
@@ -520,6 +539,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
   // Scope-level skills
   const [scopeSkills, setScopeSkills] = useState<Array<{ id: string; name: string; description: string | null; skill_type: string }>>([])
   const [skillsLoading, setSkillsLoading] = useState(true)
+  const [showSkillsPanel, setShowSkillsPanel] = useState(false)
 
   useEffect(() => {
     setPromptDraft(scope.systemPrompt || '')
@@ -542,6 +562,17 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
     }
     loadScopeSkills()
     return () => { cancelled = true }
+  }, [scope.id])
+
+  const reloadScopeSkills = useCallback(async () => {
+    try {
+      const res = await restClient.get<{ data: Array<{ id: string; name: string; description: string | null; skill_type: string }> }>(
+        `/api/skills?business_scope_id=${scope.id}&limit=100`
+      )
+      setScopeSkills(res.data || [])
+    } catch {
+      // ignore
+    }
   }, [scope.id])
 
   const handleSavePrompt = async () => {
@@ -636,14 +667,25 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3">
               <h2 className="text-lg font-bold text-white truncate">{scope.name}</h2>
+              <button
+                onClick={() => {
+                  localStorage.removeItem('super-agent-chat-backend-session')
+                  localStorage.removeItem('super-agent-chat-scope')
+                  navigate(`/chat?scope=${scope.id}&t=${Date.now()}`)
+                }}
+                className="flex items-center gap-1.5 text-[10px] font-semibold px-2.5 py-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors cursor-pointer"
+              >
+                <MessageSquare className="w-3 h-3" />
+                {t('scopeProfile.startChat')}
+              </button>
               <div className="relative">
                 <button
                   className="text-[10px] font-semibold px-2.5 py-1 rounded-full border border-blue-500/30 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors cursor-pointer"
                 >
-                  Business Health Check
+                  {t('scopeProfile.healthCheck')}
                 </button>
                 <span className="absolute -top-2 -right-3 text-[8px] font-medium px-1.5 py-0.5 rounded-full bg-gray-700 text-gray-400 whitespace-nowrap">
-                  Coming Soon
+                  {t('scopeProfile.comingSoon')}
                 </span>
               </div>
             </div>
@@ -652,23 +694,33 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
             )}
           </div>
           {onDeleteScope && (
-            <button
-              onClick={() => onDeleteScope(scope.id)}
-              className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
-              title="Delete scope"
-            >
-              <Trash2 className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => navigate(`/chat?scope=${scope.id}`)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-blue-400 hover:text-blue-300 hover:bg-blue-500/10 rounded-lg transition-colors"
+              >
+                <MessageSquare className="w-4 h-4" />
+                {t('scopeProfile.chatWithAgent')}
+              </button>
+              <button
+                onClick={() => onDeleteScope(scope.id)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
+                title={t('scopeProfile.deleteScope')}
+              >
+                <Trash2 className="w-4 h-4" />
+                {t('scopeProfile.deleteScope')}
+              </button>
+            </div>
           )}
         </div>
 
         {/* Inline KPI strip */}
         <div className="grid grid-cols-4 gap-3 mt-4">
-          <StatCard icon={Users} label="Agents" value={totalAgents}
+          <StatCard icon={Users} label={t('scopeProfile.agents')} value={totalAgents}
             sub={`${activeCount} active · ${busyCount} busy`} color="bg-blue-600/80" />
-          <StatCard icon={Zap} label="Tasks Done" value={totalTasks.toLocaleString()}
+          <StatCard icon={Zap} label={t('scopeProfile.tasksDone')} value={totalTasks.toLocaleString()}
             color="bg-purple-600/80" />
-          <StatCard icon={TrendingUp} label="Response Rate" value={`${avgResponseRate}%`}
+          <StatCard icon={TrendingUp} label={t('scopeProfile.responseRate')} value={`${avgResponseRate}%`}
             color="bg-emerald-600/80" />
           <StatCard icon={BarChart3} label="Skills" value={totalSkills}
             sub={`${scopeServers.length} MCP`} color="bg-amber-600/80" />
@@ -683,14 +735,14 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <Terminal className="w-4 h-4 text-gray-400" />
-              <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">System Prompt</h3>
+              <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">{t('scopeProfile.systemPrompt')}</h3>
             </div>
             {!isEditingPrompt && (
               <button
                 onClick={() => setIsEditingPrompt(true)}
                 className="flex items-center gap-1 text-[10px] px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors"
               >
-                <Pencil className="w-3 h-3" /> Edit
+                <Pencil className="w-3 h-3" /> {t('scopeProfile.edit')}
               </button>
             )}
           </div>
@@ -701,7 +753,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
                 onChange={e => setPromptDraft(e.target.value)}
                 rows={6}
                 className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-blue-500 focus:outline-none resize-y font-mono"
-                placeholder="Define the behavior and personality for this scope..."
+                placeholder={t('scopeProfile.promptPlaceholder')}
               />
               <div className="flex items-center gap-2">
                 <button
@@ -725,11 +777,27 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
               {scope.systemPrompt ? (
                 <p className="text-xs text-gray-400 whitespace-pre-wrap leading-relaxed break-words">{scope.systemPrompt}</p>
               ) : (
-                <p className="text-xs text-gray-600 italic">No system prompt defined. Click Edit to add one.</p>
+                <p className="text-xs text-gray-600 italic">{t('scopeProfile.noPrompt')}</p>
               )}
             </div>
           )}
         </div>
+
+        {/* ============================================================ */}
+        {/*  Model Configuration                                          */}
+        {/* ============================================================ */}
+        <ModelConfigSection scope={scope} onSave={async (selection) => {
+          await restClient.put(`/api/business-scopes/${scope.id}`, {
+            settings: {
+              ...(scope.settings || {}),
+              // New provider+model selection.
+              modelSelection: (selection.providerId || selection.modelId) ? selection : undefined,
+              // Keep legacy modelId in sync for one release / backward-compat.
+              modelId: selection.modelId || undefined,
+            },
+          })
+          success('Model saved')
+        }} onError={showError} />
 
         {/* ============================================================ */}
         {/*  Scope Skills                                                 */}
@@ -738,32 +806,56 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-yellow-400" />
-              <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Skills</h3>
-              <span className="text-[10px] text-gray-600">{scopeSkills.length} equipped</span>
+              <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">{t('scopeProfile.skills')}</h3>
+              <span className="text-[10px] text-gray-600">{scopeSkills.length} {t('scopeProfile.skillsEquipped')}</span>
             </div>
+            <button
+              onClick={() => setShowSkillsPanel(true)}
+              className="flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20 transition-colors"
+            >
+              <Plus className="w-3 h-3" />
+              Add
+            </button>
           </div>
           {skillsLoading ? (
-            <div className="py-4 text-center text-xs text-gray-500">Loading skills...</div>
+            <div className="py-4 text-center text-xs text-gray-500">{t('scopeProfile.loadingSkills')}</div>
           ) : scopeSkills.length === 0 ? (
             <div className="py-4 text-center">
               <Sparkles className="w-5 h-5 text-gray-700 mx-auto mb-1" />
-              <p className="text-xs text-gray-500">No skills equipped</p>
-              <p className="text-[10px] text-gray-600 mt-0.5">Skills can be added from the Skill Workshop or API integrations.</p>
+              <p className="text-xs text-gray-500">{t('scopeProfile.noSkillsEquipped')}</p>
+              <p className="text-[10px] text-gray-600 mt-0.5">{t('scopeProfile.noSkillsHint')}</p>
             </div>
           ) : (
             <div className="space-y-1.5">
-              {scopeSkills.map(skill => (
-                <div key={skill.id} className="flex items-start gap-2 px-2.5 py-2 bg-gray-800/50 rounded-lg min-w-0">
-                  <Sparkles className="w-3 h-3 text-yellow-500/60 flex-shrink-0 mt-0.5" />
-                  <div className="flex-1 min-w-0 overflow-hidden">
-                    <span className="text-xs text-gray-200 font-medium">{skill.name}</span>
-                    {skill.description && (
-                      <p className="text-[10px] text-gray-500 line-clamp-2">{skill.description}</p>
+              {scopeSkills.map(skill => {
+                // Use the first agent in the scope for workshop testing;
+                // fall back to any agent in the org (skill testing doesn't depend on the specific agent)
+                const workshopAgentId = agents.length > 0
+                  ? agents[0].id
+                  : (allAgents.length > 0 ? allAgents[0].id : null)
+                return (
+                  <div key={skill.id} className="flex items-start gap-2 px-2.5 py-2 bg-gray-800/50 rounded-lg min-w-0">
+                    <Sparkles className="w-3 h-3 text-yellow-500/60 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0 overflow-hidden">
+                      <span className="text-xs text-gray-200 font-medium">{skill.name}</span>
+                      {skill.description && (
+                        <p className="text-[10px] text-gray-500 line-clamp-2">{skill.description}</p>
+                      )}
+                    </div>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-gray-700/50 text-gray-500 flex-shrink-0">{skill.skill_type}</span>
+                    {workshopAgentId && (
+                      <button
+                        onClick={() => navigate(`/agents/config/${workshopAgentId}/workshop?skillId=${skill.id}&returnTo=${encodeURIComponent(`/agents?scope=${scope.id}`)}`)}
+                        className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20 transition-colors flex-shrink-0"
+                        title={t('scopeProfile.testSkill')}
+                      >
+                        <Zap className="w-2.5 h-2.5" />
+                        {t('scopeProfile.testSkill')}
+                      </button>
                     )}
                   </div>
-                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-gray-700/50 text-gray-500 flex-shrink-0">{skill.skill_type}</span>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>
@@ -774,19 +866,19 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
         <div>
           <div className="flex items-center gap-2 mb-3">
             <FileText className="w-4 h-4 text-gray-400" />
-            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">What's Happened</h3>
-            <span className="text-[10px] text-gray-600 ml-auto">AI-summarized task briefings</span>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{t('scopeProfile.whatsHappened')}</h3>
+            <span className="text-[10px] text-gray-600 ml-auto">{t('scopeProfile.briefingsSubtitle')}</span>
           </div>
 
           {briefingsLoading ? (
             <div className="py-12 text-center bg-gray-900 border border-gray-800 rounded-xl">
               <Loader2 className="w-6 h-6 text-blue-500 animate-spin mx-auto mb-2" />
-              <p className="text-sm text-gray-500">Loading briefings...</p>
+              <p className="text-sm text-gray-500">{t('scopeProfile.loadingBriefings')}</p>
             </div>
           ) : briefings.length === 0 ? (
             <div className="py-12 text-center bg-gray-900 border border-gray-800 rounded-xl">
               <FileText className="w-8 h-8 text-gray-700 mx-auto mb-2" />
-              <p className="text-sm text-gray-500">No task history yet</p>
+              <p className="text-sm text-gray-500">{t('scopeProfile.noHistory')}</p>
             </div>
           ) : (
             <div className="columns-1 md:columns-2 gap-3 space-y-3">
@@ -809,13 +901,20 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
               <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Agents</h3>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => navigate(`/agents/config/new?scope=${scope.id}`)}
+                className="flex items-center gap-1 px-2 py-1 text-[10px] bg-purple-600 hover:bg-purple-700 rounded text-white transition-colors"
+              >
+                <Plus className="w-3 h-3" />
+                {t('scopeProfile.createAgent')}
+              </button>
               {onAddAgent && (
                 <button
                   onClick={() => setShowAgentPicker(!showAgentPicker)}
                   className="flex items-center gap-1 px-2 py-1 text-[10px] bg-blue-600 hover:bg-blue-700 rounded text-white transition-colors"
                 >
                   <Plus className="w-3 h-3" />
-                  Add Agent
+                  {t('scopeProfile.addAgent')}
                 </button>
               )}
               <div className="flex items-center gap-2 text-[10px] text-gray-600">
@@ -830,7 +929,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
             <div className="border-b border-gray-800 bg-gray-800/50">
               {unassignedAgents.length === 0 ? (
                 <p className="p-3 text-xs text-gray-400">
-                  {allAgents.length === 0 ? 'No agents available.' : 'All agents are already assigned to this scope.'}
+                  {allAgents.length === 0 ? t('scopeProfile.noAgentsAvailable') : t('scopeProfile.allAssigned')}
                 </p>
               ) : (
                 <div className="max-h-40 overflow-y-auto divide-y divide-gray-700/50">
@@ -854,7 +953,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
           )}
 
           {agents.length === 0 ? (
-            <div className="py-4 text-center text-xs text-gray-500">No agents</div>
+            <div className="py-4 text-center text-xs text-gray-500">{t('scopeProfile.noAgents')}</div>
           ) : (
             <div className="divide-y divide-gray-800/50">
               {agents.map(agent => (
@@ -883,12 +982,12 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-800">
             <div className="flex items-center gap-2">
-              <Server className="w-3.5 h-3.5 text-gray-500" />
+              <Server className="w-4 h-4 text-gray-400" />
               <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">MCP Servers</h3>
             </div>
             <button
               onClick={() => setShowCatalogPanel(true)}
-              className="flex items-center gap-1 px-2 py-1 text-[10px] bg-blue-600 hover:bg-blue-700 rounded text-white transition-colors"
+              className="flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors"
             >
               <Plus className="w-3 h-3" />
               Add
@@ -899,7 +998,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
             <div className="border-b border-gray-800 bg-gray-800/50">
               {availableServers.length === 0 ? (
                 <p className="p-3 text-xs text-gray-400">
-                  {allServers.length === 0 ? 'No MCP servers configured.' : 'All servers already assigned.'}
+                  {allServers.length === 0 ? t('scopeProfile.noMcpConfigured') : t('scopeProfile.allMcpAssigned')}
                 </p>
               ) : (
                 <div className="max-h-40 overflow-y-auto divide-y divide-gray-700/50">
@@ -929,7 +1028,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
               <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
             </div>
           ) : scopeServers.length === 0 ? (
-            <div className="py-4 text-center text-xs text-gray-500">No MCP servers assigned</div>
+            <div className="py-4 text-center text-xs text-gray-500">{t('scopeProfile.noMcpServers')}</div>
           ) : (
             <div className="divide-y divide-gray-800/50">
               {scopeServers.map(server => (
@@ -947,7 +1046,7 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
                             {getTypeLabel(server.config, server.host_address)}
                           </span>
                           {server.scope_config && Object.keys(server.scope_config).length > 0 && (
-                            <span className="text-[9px] px-1 py-0.5 rounded bg-cyan-500/15 text-cyan-400">configured</span>
+                            <span className="text-[9px] px-1 py-0.5 rounded bg-cyan-500/15 text-cyan-400">{t('scopeProfile.configured')}</span>
                           )}
                         </div>
                       </div>
@@ -1002,11 +1101,41 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
         </div>
 
         {/* ============================================================ */}
+        {/*  Data Connectors                                               */}
+        {/* ============================================================ */}
+        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-gray-400" />
+              <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">{t('connector.title')}</h3>
+            </div>
+            <button
+              onClick={() => setShowConnectorPanel(true)}
+              className="flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors"
+            >
+              <Settings className="w-3 h-3" />
+              {t('connector.manage')}
+            </button>
+          </div>
+          <p className="text-xs text-gray-500">
+            {t('connector.description')}
+          </p>
+        </div>
+
+        <ConnectorPanel
+          open={showConnectorPanel}
+          onClose={() => setShowConnectorPanel(false)}
+          scopeId={scope.id}
+        />
+
+        {/* ============================================================ */}
         {/*  Knowledge Base (Document Groups)                              */}
         {/* ============================================================ */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
-          <DocGroupsPanel scopeId={scope.id} scopeName={scope.name} />
+          <ScopeKnowledgePanel scopeId={scope.id} />
         </div>
+
+        {/* Legacy Document Groups — hidden; replaced by ScopeKnowledgePanel above */}
 
         {/* ============================================================ */}
         {/*  IM Channels                                                  */}
@@ -1023,12 +1152,35 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
         </div>
 
         {/* ============================================================ */}
+        {/*  Access Control & Permissions                                  */}
+        {/* ============================================================ */}
+        <ScopePermissionsSection scope={scope} />
+
+        {/* ============================================================ */}
         {/*  Agent Evolution (Rehearsals & Proposals)                     */}
         {/* ============================================================ */}
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
           <RehearsalPanel scopeId={scope.id} scopeName={scope.name} />
         </div>
+
+        {/* ============================================================ */}
+        {/*  A2A External Access                                          */}
+        {/* ============================================================ */}
+        <A2AScopeSection agents={agents} scopeId={scope.id} />
+
+        {/* ============================================================ */}
+        {/*  Customer Service                                             */}
+        {/* ============================================================ */}
+        <CustomerServiceSection scope={scope} />
       </div>
+
+      {/* Skills Panel slide-out */}
+      <SkillsPanel
+        open={showSkillsPanel}
+        onClose={() => setShowSkillsPanel(false)}
+        scopeId={scope.id}
+        onScopeSkillsChanged={reloadScopeSkills}
+      />
 
       {/* MCP Server Catalog slide-out panel */}
       <MCPCatalogPanel
@@ -1038,6 +1190,546 @@ export function ScopeProfile({ scope, agents, allAgents = [], onDeleteScope, onA
         onInstall={handleCatalogInstall}
         onCustomInstall={handleCustomInstall}
       />
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/*  Model Configuration Section                                        */
+/* ------------------------------------------------------------------ */
+
+function ModelConfigSection({ scope, onSave, onError }: {
+  scope: { settings?: Record<string, unknown> | null }
+  onSave: (selection: { providerId?: string; modelId?: string }) => Promise<void>
+  onError: (msg: string) => void
+}) {
+  const settings = (scope.settings as Record<string, unknown>) || {}
+  const initialSelection = (settings.modelSelection as { providerId?: string; modelId?: string } | undefined) || {}
+  const initialProviderId = initialSelection.providerId || ''
+  const initialModelId = initialSelection.modelId || (settings.modelId as string) || ''
+
+  const [providers, setProviders] = useState<ModelProvider[]>([])
+  const [selectedProviderId, setSelectedProviderId] = useState(initialProviderId)
+  const [selectedModelId, setSelectedModelId] = useState(initialModelId)
+  const [isSaving, setIsSaving] = useState(false)
+  const [models, setModels] = useState<Array<{ id: string; litellm_model: string; provider: string }>>([])
+  const [isLoadingModels, setIsLoadingModels] = useState(false)
+
+  // Sync if parent scope changes (e.g. switching between scopes)
+  useEffect(() => {
+    const s = (scope.settings as Record<string, unknown>) || {}
+    const sel = (s.modelSelection as { providerId?: string; modelId?: string } | undefined) || {}
+    setSelectedProviderId(sel.providerId || '')
+    setSelectedModelId(sel.modelId || (s.modelId as string) || '')
+  }, [scope.settings])
+
+  // Load providers once.
+  useEffect(() => {
+    modelProviderService.list().then(setProviders).catch(() => setProviders([]))
+  }, [])
+
+  // Load models for the selected provider (litellm only).
+  useEffect(() => {
+    setIsLoadingModels(true)
+    modelProviderService.listModels(selectedProviderId || undefined)
+      .then(setModels)
+      .catch(() => setModels([]))
+      .finally(() => setIsLoadingModels(false))
+  }, [selectedProviderId])
+
+  const persist = async (next: { providerId?: string; modelId?: string }) => {
+    setIsSaving(true)
+    try {
+      await onSave(next)
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Failed to save model')
+      throw err
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleProviderChange = async (providerId: string) => {
+    const prevP = selectedProviderId
+    const prevM = selectedModelId
+    setSelectedProviderId(providerId)
+    setSelectedModelId('') // reset model when provider changes
+    try {
+      await persist({ providerId: providerId || undefined, modelId: undefined })
+    } catch {
+      setSelectedProviderId(prevP)
+      setSelectedModelId(prevM)
+    }
+  }
+
+  const handleModelChange = async (modelId: string) => {
+    const prev = selectedModelId
+    setSelectedModelId(modelId)
+    try {
+      await persist({ providerId: selectedProviderId || undefined, modelId: modelId || undefined })
+    } catch {
+      setSelectedModelId(prev)
+    }
+  }
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Zap className="w-4 h-4 text-purple-400" />
+          <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">{t('scopeProfile.model')}</h3>
+        </div>
+        {isSaving && <Loader2 className="w-3 h-3 animate-spin text-purple-400" />}
+      </div>
+      <div className="space-y-2">
+        {/* Provider selector */}
+        <select
+          value={selectedProviderId}
+          onChange={e => handleProviderChange(e.target.value)}
+          disabled={isSaving}
+          className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-purple-500 focus:outline-none appearance-none cursor-pointer disabled:opacity-50"
+        >
+          <option value="">{t('scopeProfile.providerDefault')}</option>
+          {providers.map(p => (
+            <option key={p.id} value={p.id}>
+              {p.name}{p.isOrgDefault ? ' ★' : ''}
+            </option>
+          ))}
+        </select>
+
+        {/* Model selector (populated for litellm providers) */}
+        {isLoadingModels ? (
+          <div className="flex items-center gap-2 px-3 py-2 text-xs text-gray-500">
+            <Loader2 className="w-3 h-3 animate-spin" /> Loading models...
+          </div>
+        ) : models.length === 0 ? (
+          <input
+            value={selectedModelId}
+            onChange={e => setSelectedModelId(e.target.value)}
+            onBlur={e => handleModelChange(e.target.value)}
+            disabled={isSaving}
+            placeholder={t('scopeProfile.modelDefault')}
+            className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-purple-500 focus:outline-none font-mono disabled:opacity-50"
+          />
+        ) : (
+          <select
+            value={selectedModelId}
+            onChange={e => handleModelChange(e.target.value)}
+            disabled={isSaving}
+            className="w-full px-3 py-2 text-xs bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-purple-500 focus:outline-none font-mono appearance-none cursor-pointer disabled:opacity-50"
+          >
+            <option value="">{t('scopeProfile.modelDefault')}</option>
+            {models.map(m => (
+              <option key={m.litellm_model} value={m.litellm_model}>
+                {m.id} — {m.provider}
+              </option>
+            ))}
+          </select>
+        )}
+        <p className="text-[10px] text-gray-500">
+          {t('scopeProfile.modelHint')}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/*  A2A External Access Section                                        */
+/* ------------------------------------------------------------------ */
+
+function A2AScopeSection({ agents, scopeId }: { agents: Agent[]; scopeId: string }) {
+  const [a2aStates, setA2aStates] = useState<Record<string, boolean>>({})
+  const [saving, setSaving] = useState<string | null>(null)
+
+  // Initialize from agent data
+  useEffect(() => {
+    const states: Record<string, boolean> = {}
+    for (const agent of agents) {
+      states[agent.id] = agent.a2aEnabled ?? false
+    }
+    setA2aStates(states)
+  }, [agents])
+
+  const handleToggle = async (agentId: string) => {
+    const newValue = !a2aStates[agentId]
+    setSaving(agentId)
+    try {
+      await restClient.put(`/api/agents/${agentId}`, {
+        a2a_enabled: newValue,
+      })
+      setA2aStates(prev => ({ ...prev, [agentId]: newValue }))
+      // Trigger global agent store refresh so other views stay in sync
+      refreshAgentsStore()
+    } catch (err) {
+      console.error('Failed to toggle A2A:', err)
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  if (agents.length === 0) return null
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <Shield className="w-4 h-4 text-blue-400" />
+        <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">
+          {t('scopeProfile.a2aTitle')}
+        </h3>
+      </div>
+      <p className="text-[10px] text-gray-500 mb-3">
+        {t('scopeProfile.a2aDescription')}
+      </p>
+      <div className="space-y-1.5">
+        {agents.map(agent => (
+          <div
+            key={agent.id}
+            className="flex items-center justify-between p-2 bg-gray-800/50 border border-gray-700/50 rounded-lg"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="w-6 h-6 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-[10px] font-medium flex-shrink-0">
+                {agent.displayName.charAt(0)}
+              </div>
+              <div className="min-w-0">
+                <p className="text-xs text-white truncate">{agent.displayName}</p>
+                <p className="text-[9px] text-gray-500 truncate">{agent.role}</p>
+              </div>
+            </div>
+            <button
+              onClick={() => handleToggle(agent.id)}
+              disabled={saving === agent.id}
+              className={`relative w-8 h-4 rounded-full transition-colors flex-shrink-0 ${
+                a2aStates[agent.id] ? 'bg-blue-600' : 'bg-gray-600'
+              } ${saving === agent.id ? 'opacity-50' : ''}`}
+            >
+              <span className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform ${
+                a2aStates[agent.id] ? 'translate-x-[16px]' : ''
+              }`} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="mt-2.5 p-2 bg-blue-900/10 border border-blue-500/20 rounded-lg">
+        <p className="text-[9px] text-blue-400">
+          {t('scopeProfile.a2aHint')}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/*  Scope Permissions Section                                          */
+/*  For business scopes: shows scope member management + agent perms   */
+/*  For digital twin scopes: shows delegate management                 */
+/* ------------------------------------------------------------------ */
+
+function ScopePermissionsSection({ scope }: { scope: BusinessScope }) {
+  const isDigitalTwin = scope.scopeType === 'digital_twin'
+
+  // For digital twin scopes, we show the AgentPermissionsPanel
+  // which handles delegate management (the twin itself is the "agent")
+  // For business scopes, we show scope-level access control
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-800">
+        <div className="flex items-center gap-2">
+          <Shield className="w-4 h-4 text-purple-400" />
+          <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">
+            {isDigitalTwin ? t('scopeProfile.delegateManagement') : t('scopeProfile.accessControl')}
+          </h3>
+        </div>
+        {isDigitalTwin && (
+          <p className="text-[10px] text-gray-500 mt-1">
+            {t('scopeProfile.delegateHint')}
+          </p>
+        )}
+        {!isDigitalTwin && (
+          <p className="text-[10px] text-gray-500 mt-1">
+            {t('scopeProfile.accessControlHint')}
+          </p>
+        )}
+      </div>
+
+      {isDigitalTwin ? (
+        // Digital Twin: show agent-level permissions panel for the twin's primary agent
+        <DigitalTwinDelegateSection scopeId={scope.id} />
+      ) : (
+        // Business Scope: show scope membership + visibility controls
+        <BusinessScopeAccessSection scopeId={scope.id} visibility={scope.visibility} />
+      )}
+    </div>
+  )
+}
+
+/**
+ * For Digital Twin scopes: find the primary agent and show its permissions panel.
+ * The "delegate" concept maps to agent_permissions with 'admin' level.
+ */
+function DigitalTwinDelegateSection({ scopeId }: { scopeId: string }) {
+  const [primaryAgentId, setPrimaryAgentId] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    restClient.get<Agent[]>(`/api/business-scopes/${scopeId}/agents`)
+      .then(agents => {
+        // The primary agent is typically the first (and often only) agent in a digital twin scope
+        if (agents.length > 0) {
+          setPrimaryAgentId((agents[0] as any).id)
+        }
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [scopeId])
+
+  if (loading) {
+    return (
+      <div className="p-4 text-center text-gray-500 text-sm">
+        <Loader2 className="w-4 h-4 animate-spin inline mr-2" />
+        {t('common.loading')}
+      </div>
+    )
+  }
+
+  if (!primaryAgentId) {
+    return (
+      <div className="p-4 text-center text-gray-500 text-sm">
+        {t('scopeProfile.noAgentFound')}
+      </div>
+    )
+  }
+
+  return (
+    <AgentPermissionsPanel
+      agentId={primaryAgentId}
+      agentOrigin="digital_twin"
+    />
+  )
+}
+
+/**
+ * For Business Scopes: inline scope membership management.
+ * Shows visibility toggle and member list with role management.
+ */
+function BusinessScopeAccessSection({ scopeId, visibility }: { scopeId: string; visibility: string }) {
+  const [members, setMembers] = useState<Array<{
+    id: string; user_id: string; role: string;
+    name: string | null; email: string | null;
+  }>>([])
+  const [loading, setLoading] = useState(true)
+  const [currentVisibility, setCurrentVisibility] = useState(visibility)
+  const [showAddMember, setShowAddMember] = useState(false)
+  const [selectedUserId, setSelectedUserId] = useState('')
+  const [selectedRole, setSelectedRole] = useState('viewer')
+  const [isAdding, setIsAdding] = useState(false)
+  const [orgMembers, setOrgMembers] = useState<Array<{ user_id: string; name: string; email: string }>>([])
+
+  // Load scope members
+  const loadMembers = useCallback(async () => {
+    try {
+      const res = await restClient.get<{ data: Array<any> }>(`/api/business-scopes/${scopeId}/members`)
+      setMembers(res.data || [])
+    } catch {
+      setMembers([])
+    } finally {
+      setLoading(false)
+    }
+  }, [scopeId])
+
+  useEffect(() => { loadMembers() }, [loadMembers])
+
+  // Load org members for the add picker
+  useEffect(() => {
+    restClient.get<{ data: Array<any> }>('/api/organizations/members')
+      .then(res => setOrgMembers((res.data || []).map((m: any) => ({
+        user_id: m.user_id || m.id,
+        name: m.name || m.full_name || '',
+        email: m.email || m.username || '',
+      }))))
+      .catch(() => setOrgMembers([]))
+  }, [])
+
+  const handleVisibilityChange = async (newVis: string) => {
+    try {
+      await restClient.patch(`/api/business-scopes/${scopeId}/visibility`, { visibility: newVis })
+      setCurrentVisibility(newVis)
+    } catch (err) {
+      console.error('Failed to update visibility:', err)
+    }
+  }
+
+  const handleAddMember = async () => {
+    if (!selectedUserId) return
+    setIsAdding(true)
+    try {
+      await restClient.post(`/api/business-scopes/${scopeId}/members`, {
+        user_id: selectedUserId,
+        role: selectedRole,
+      })
+      await loadMembers()
+      setShowAddMember(false)
+      setSelectedUserId('')
+      setSelectedRole('viewer')
+    } catch (err) {
+      console.error('Failed to add member:', err)
+    } finally {
+      setIsAdding(false)
+    }
+  }
+
+  const handleUpdateRole = async (membershipId: string, newRole: string) => {
+    try {
+      await restClient.patch(`/api/business-scopes/${scopeId}/members/${membershipId}`, { role: newRole })
+      await loadMembers()
+    } catch (err) {
+      console.error('Failed to update role:', err)
+    }
+  }
+
+  const handleRemoveMember = async (membershipId: string) => {
+    if (!window.confirm('确定要移除此成员吗？')) return
+    try {
+      await restClient.delete(`/api/business-scopes/${scopeId}/members/${membershipId}`)
+      await loadMembers()
+    } catch (err) {
+      console.error('Failed to remove member:', err)
+    }
+  }
+
+  // Filter out users already in scope
+  const existingUserIds = new Set(members.map(m => m.user_id))
+  const availableOrgMembers = orgMembers.filter(m => !existingUserIds.has(m.user_id))
+
+  return (
+    <div className="p-4 space-y-4">
+      {/* Visibility toggle */}
+      <div>
+        <label className="text-xs text-gray-400 mb-2 block">{t('scopeProfile.visibility')}</label>
+        <div className="flex gap-2">
+          <button
+            onClick={() => handleVisibilityChange('open')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-colors ${
+              currentVisibility === 'open'
+                ? 'border-green-500/50 bg-green-500/10 text-green-400'
+                : 'border-gray-700 text-gray-400 hover:border-gray-600'
+            }`}
+          >
+            <Globe className="w-3 h-3" />
+            {t('scopeProfile.visibilityOpen')}
+          </button>
+          <button
+            onClick={() => handleVisibilityChange('restricted')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-colors ${
+              currentVisibility === 'restricted'
+                ? 'border-yellow-500/50 bg-yellow-500/10 text-yellow-400'
+                : 'border-gray-700 text-gray-400 hover:border-gray-600'
+            }`}
+          >
+            <Lock className="w-3 h-3" />
+            {t('scopeProfile.visibilityRestricted')}
+          </button>
+        </div>
+      </div>
+
+      {/* Member list */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <label className="text-xs text-gray-400">
+            {t('scopeProfile.members')} ({members.length})
+          </label>
+          <button
+            onClick={() => setShowAddMember(true)}
+            className="flex items-center gap-1 px-2 py-1 text-[10px] text-blue-400 hover:text-blue-300 hover:bg-blue-500/10 rounded transition-colors"
+          >
+            <Plus className="w-3 h-3" />
+            添加成员
+          </button>
+        </div>
+
+        {/* Add member form */}
+        {showAddMember && (
+          <div className="mb-3 p-3 bg-gray-800/50 rounded-lg border border-gray-700 space-y-2">
+            <select
+              value={selectedUserId}
+              onChange={(e) => setSelectedUserId(e.target.value)}
+              className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
+            >
+              <option value="">-- 选择用户 --</option>
+              {availableOrgMembers.map(m => (
+                <option key={m.user_id} value={m.user_id}>
+                  {m.name || m.email}
+                </option>
+              ))}
+            </select>
+            <select
+              value={selectedRole}
+              onChange={(e) => setSelectedRole(e.target.value)}
+              className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
+            >
+              <option value="admin">Admin (可管理)</option>
+              <option value="member">Member (可操作)</option>
+              <option value="viewer">Viewer (只读)</option>
+            </select>
+            <div className="flex gap-2">
+              <button
+                onClick={handleAddMember}
+                disabled={!selectedUserId || isAdding}
+                className="px-3 py-1.5 text-[10px] bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded transition-colors"
+              >
+                {isAdding ? '添加中...' : '确认'}
+              </button>
+              <button
+                onClick={() => setShowAddMember(false)}
+                className="px-3 py-1.5 text-[10px] text-gray-400 hover:text-white transition-colors"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="text-center text-gray-500 text-xs py-2">
+            <Loader2 className="w-3 h-3 animate-spin inline mr-1" />
+            {t('common.loading')}
+          </div>
+        ) : members.length === 0 ? (
+          <p className="text-xs text-gray-500 text-center py-3 bg-gray-800/30 rounded-lg border border-gray-700/50">
+            {t('scopeProfile.noMembers')}
+          </p>
+        ) : (
+          <div className="space-y-1.5 max-h-[240px] overflow-y-auto">
+            {members.map(m => (
+              <div key={m.id} className="flex items-center gap-2 p-2 bg-gray-800/50 rounded-lg border border-gray-700/50">
+                <div className="w-6 h-6 rounded-full bg-gray-700 flex items-center justify-center text-[10px] text-gray-300 font-medium">
+                  {(m.name || m.email || '?').charAt(0).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-white truncate">{m.name || m.email}</p>
+                </div>
+                <select
+                  value={m.role}
+                  onChange={(e) => handleUpdateRole(m.id, e.target.value)}
+                  className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-[10px] text-gray-300"
+                >
+                  <option value="admin">Admin</option>
+                  <option value="member">Member</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+                <button
+                  onClick={() => handleRemoveMember(m.id)}
+                  className="p-1 text-gray-500 hover:text-red-400 transition-colors"
+                  title="移除"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

@@ -8,7 +8,24 @@
 import type { Message } from '@/types'
 import type { ContentBlock } from '@/services/chatStreamService'
 import { streamChat, type ChatStreamHandle } from '@/services/chatStreamService'
-import { restClient } from '@/services/api/restClient'
+import { restClient, getAuthToken } from '@/services/api/restClient'
+
+/**
+ * Convert workspace file paths to raw-file URLs for <img src> rendering.
+ * Same logic as mapApiMessageToMessage in restChatService.ts — used for
+ * fresh (in-memory) messages so they display immediately without waiting
+ * for a round-trip to the backend.
+ */
+function buildAttachedImageUrls(sessionId: string, paths: string[] | undefined): string[] | undefined {
+  if (!paths || paths.length === 0) return undefined
+  const baseUrl = import.meta.env.VITE_API_BASE_URL ?? ''
+  const token = getAuthToken()
+  return paths.map((path) => {
+    const qs = new URLSearchParams({ path })
+    if (token) qs.set('token', token)
+    return `${baseUrl}/api/chat/sessions/${sessionId}/workspace/file/raw?${qs}`
+  })
+}
 
 export interface SessionState {
   sessionId: string
@@ -16,6 +33,8 @@ export interface SessionState {
   isSending: boolean
   streamHandle: ChatStreamHandle | null
   error: string | null
+  /** Error code from the backend (e.g. 'QUOTA_EXCEEDED') for specialized UI handling */
+  errorCode: string | null
 }
 
 type Listener = () => void
@@ -50,6 +69,7 @@ class SessionStreamManager {
         isSending: false,
         streamHandle: null,
         error: null,
+        errorCode: null,
       }
       this.sessions.set(sessionId, state)
     }
@@ -93,7 +113,12 @@ class SessionStreamManager {
     options: {
       businessScopeId: string
       agentId?: string
+      mentionAgentId?: string
+      model?: string
+      modelSelection?: { providerId?: string; modelId?: string }
       sopContext: string
+      attachedFiles?: string[]
+      attachedImages?: string[]
     }
   ): void {
     const state = this.getSession(sessionId)
@@ -103,6 +128,7 @@ class SessionStreamManager {
       type: 'user',
       content: content.trim(),
       timestamp: new Date(),
+      attachedImages: buildAttachedImageUrls(sessionId, options.attachedImages),
     }
 
     const aiMessageId = `ai-${Date.now()}`
@@ -119,25 +145,46 @@ class SessionStreamManager {
     this.notify()
 
     const allBlocks: ContentBlock[] = []
+    let lastModel: string | undefined
 
     const handle = streamChat(
       {
         businessScopeId: options.businessScopeId,
         agentId: options.agentId,
+        mentionAgentId: options.mentionAgentId,
         message: content.trim(),
         sessionId,
+        model: options.model,
+        modelSelection: options.modelSelection,
         context: { sop_context: options.sopContext },
+        attachedFiles: options.attachedFiles,
+        attachedImages: options.attachedImages,
       },
       {
         onAssistant: (event) => {
           allBlocks.push(...event.content)
+          if (event.model) lastModel = event.model
           const serialized = JSON.stringify(allBlocks)
           this.updateMessage(sessionId, aiMessageId, serialized, event.speakerAgentName, event.speakerAgentAvatar)
+        },
+        onResult: (event) => {
+          // result event = AI response complete. Stop loading immediately
+          // instead of waiting for [DONE] (which can be delayed by container cleanup).
+          const s = this.sessions.get(sessionId)
+          if (s) {
+            s.isSending = false
+            const model = lastModel || event.model
+            s.messages = s.messages.map(m =>
+              m.id === aiMessageId ? { ...m, model, tokenUsage: event.token_usage } : m
+            )
+            this.notify()
+          }
         },
         onError: (event) => {
           const s = this.sessions.get(sessionId)
           if (s) {
             s.error = event.message || 'Stream error'
+            s.errorCode = event.code || null
             // If the session/scope was not found (stale localStorage), clear the error
             // message so the UI can prompt the user to re-select a scope
             if (event.code === 'HTTP_ERROR' && event.message?.includes('not found')) {
@@ -156,6 +203,7 @@ class SessionStreamManager {
           const s = this.sessions.get(sessionId)
           if (s) {
             s.streamHandle = null
+            // isSending may already be false (set by onResult). This is a fallback.
             s.isSending = false
             if (allBlocks.length === 0) {
               this.updateMessage(sessionId, aiMessageId, 'No response received')
@@ -325,6 +373,7 @@ class SessionStreamManager {
     const state = this.sessions.get(sessionId)
     if (state) {
       state.error = null
+      state.errorCode = null
       this.notify()
     }
   }

@@ -26,14 +26,22 @@ export interface ChatSessionState {
   isLoading: boolean
   isSending: boolean
   error: string | null
+  /** Error code from backend (e.g. 'QUOTA_EXCEEDED') for specialized UI handling */
+  errorCode: string | null
 }
 
 export interface ChatContextType extends ChatSessionState {
-  sendMessage: (content: string) => Promise<Message | null>
+  sendMessage: (content: string, mentionAgentId?: string, attachedFiles?: string[], attachedImages?: string[]) => Promise<Message | null>
   stopGeneration: () => void
   setActiveSop: (sopId: string) => void
   setSelectedAgent: (agentId: string | null) => void
   setSelectedBusinessScope: (scopeId: string) => void
+  /** Currently selected model override (null = use scope default). */
+  selectedModel: string | null
+  setSelectedModel: (model: string | null) => void
+  /** Currently selected model provider override (null = use scope/org default). */
+  selectedProviderId: string | null
+  setSelectedProviderId: (providerId: string | null) => void
   clearHistory: () => Promise<void>
   clearError: () => void
   refreshContext: () => Promise<void>
@@ -62,11 +70,15 @@ const defaultState: ChatSessionState = {
 
 const defaultContext: ChatContextType = {
   ...defaultState,
-  sendMessage: async () => null,
+  sendMessage: async (_content: string, _mentionAgentId?: string, _attachedFiles?: string[], _attachedImages?: string[]) => null,
   stopGeneration: () => {},
   setActiveSop: () => {},
   setSelectedAgent: () => {},
   setSelectedBusinessScope: () => {},
+  selectedModel: null,
+  setSelectedModel: () => {},
+  selectedProviderId: null,
+  setSelectedProviderId: () => {},
   clearHistory: async () => {},
   clearError: () => {},
   refreshContext: async () => {},
@@ -118,6 +130,8 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
   const [activeSop, setActiveSopState] = useState<string>(() => initialSop || getStoredSop())
   const [selectedAgentId, setSelectedAgentIdState] = useState<string | null>(() => initialAgentId || getStoredAgentId())
   const [selectedBusinessScopeId, setSelectedBusinessScopeIdState] = useState<string | null>(() => initialScopeId || getStoredScopeId())
+  const [selectedModel, setSelectedModel] = useState<string | null>(null)
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null)
   const [context, setContext] = useState<ChatContextData | null>(null)
   const [quickQuestions, setQuickQuestions] = useState<QuickQuestion[]>([])
   const [quickQuestionsLoading, setQuickQuestionsLoading] = useState(false)
@@ -140,7 +154,9 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
   const isSending = managerState?.isSending ?? false
   // Merge manager-level errors with local errors
   const managerError = managerState?.error ?? null
+  const managerErrorCode = managerState?.errorCode ?? null
   const effectiveError = error || managerError
+  const effectiveErrorCode = error ? null : managerErrorCode
 
   // Set agent in REST service when it changes
   useEffect(() => {
@@ -184,9 +200,11 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
 
   // On mount, if we have a stored backend session, load it
   useEffect(() => {
+    console.log('[ChatContext mount] backendSessionId=', backendSessionId, 'scopeId=', selectedBusinessScopeId)
     if (backendSessionId) {
+      console.log('[ChatContext mount] Restoring existing session:', backendSessionId)
       // Load history and attempt reconnection
-      (async () => {
+      ;(async () => {
         try {
           if (shouldUseRestApi()) {
             RestChatService.setCurrentSessionId(backendSessionId)
@@ -212,6 +230,11 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
           console.warn('Failed to restore session on mount:', err)
         }
       })()
+    } else {
+      console.log('[ChatContext mount] No stored session — will create on first message send')
+      // Don't eagerly create a session here. Let sendMessage handle it via
+      // ensureSession. This avoids duplicate session creation from concurrent
+      // code paths (eager create + sendMessage both calling ensureSession).
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []) // Run only on mount
@@ -282,7 +305,7 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
     }
   }, [backendSessionId])
 
-  const sendMessage = useCallback(async (content: string): Promise<Message | null> => {
+  const sendMessage = useCallback(async (content: string, mentionAgentId?: string, attachedFiles?: string[], attachedImages?: string[]): Promise<Message | null> => {
     if (!content.trim()) {
       setError('Message cannot be empty')
       return null
@@ -303,7 +326,14 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
         sessionStreamManager.sendMessage(validSessionId, content, {
           businessScopeId: selectedBusinessScopeId || undefined,
           agentId: selectedAgentId || undefined,
+          mentionAgentId: mentionAgentId || undefined,
+          model: selectedModel || undefined,
+          modelSelection: (selectedProviderId || selectedModel)
+            ? { providerId: selectedProviderId || undefined, modelId: selectedModel || undefined }
+            : undefined,
           sopContext: activeSop,
+          attachedFiles: attachedFiles,
+          attachedImages: attachedImages,
         })
 
         return {
@@ -331,7 +361,10 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
       setError(message)
       return null
     }
-  }, [sessionId, activeSop, selectedAgentId, selectedBusinessScopeId, backendSessionId])
+    // selectedModel/selectedProviderId MUST be deps: without them this callback
+    // captures their initial (null) values, so a model picked in the UI is never
+    // sent (requestSelection=undefined) and the org default is always used.
+  }, [sessionId, activeSop, selectedAgentId, selectedBusinessScopeId, backendSessionId, selectedModel, selectedProviderId])
 
   const setActiveSop = useCallback((sopId: string) => {
     setActiveSopState(sopId)
@@ -349,8 +382,10 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
     setBackendSessionId(null)
     if (shouldUseRestApi()) {
       RestChatService.resetSession()
+      // Session will be created on-demand when user sends first message.
+      // This avoids duplicate session creation from concurrent code paths.
     }
-  }, [])
+  }, [activeSop])
 
   const clearHistory = useCallback(async () => {
     setError(null)
@@ -454,11 +489,16 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
     isLoading,
     isSending,
     error: effectiveError,
+    errorCode: effectiveErrorCode,
     sendMessage,
     stopGeneration,
     setActiveSop,
     setSelectedAgent,
     setSelectedBusinessScope,
+    selectedModel,
+    setSelectedModel,
+    selectedProviderId,
+    setSelectedProviderId,
     clearHistory,
     clearError,
     refreshContext,

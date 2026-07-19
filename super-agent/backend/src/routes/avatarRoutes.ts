@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { avatarService } from '../services/avatarService.js';
 import { authenticate } from '../middleware/auth.js';
+import sharp from 'sharp';
 
 export async function avatarRoutes(fastify: FastifyInstance) {
   // multipart is registered globally in app.ts
@@ -18,8 +19,14 @@ export async function avatarRoutes(fastify: FastifyInstance) {
     }
 
     const buffer = await data.toBuffer();
-    const ext = data.mimetype.split('/')[1] === 'jpeg' ? 'jpg' : data.mimetype.split('/')[1];
-    const filename = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+
+    // Compress: resize to 128x128 and convert to WebP
+    const compressedBuffer = await sharp(buffer)
+      .resize(128, 128, { fit: 'cover' })
+      .webp({ quality: 80 })
+      .toBuffer();
+
+    const filename = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.webp`;
 
     const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
     const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
@@ -28,8 +35,8 @@ export async function avatarRoutes(fastify: FastifyInstance) {
     await s3.send(new PutObjectCommand({
       Bucket: bucket,
       Key: filename,
-      Body: buffer,
-      ContentType: data.mimetype,
+      Body: compressedBuffer,
+      ContentType: 'image/webp',
     }));
 
     return reply.send({ avatarKey: filename });
@@ -210,7 +217,9 @@ export async function avatarRoutes(fastify: FastifyInstance) {
       // Get the image data directly from S3 and stream it
       const imageData = await avatarService.getAvatarData(key);
       
-      reply.header('Content-Type', 'image/png');
+      // Detect content type from file extension
+      const contentType = key.endsWith('.webp') ? 'image/webp' : 'image/png';
+      reply.header('Content-Type', contentType);
       reply.header('Cache-Control', 'public, max-age=86400'); // Cache for 24 hours
       return reply.send(imageData);
     } catch (err) {

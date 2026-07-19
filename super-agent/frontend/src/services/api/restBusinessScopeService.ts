@@ -2,7 +2,7 @@
  * REST Business Scope Service
  * 
  * Implements the business scope service interface using the REST API backend.
- * Replaces Supabase direct access with HTTP calls to super-agent-backend.
+ * Replaces Supabase direct access with HTTP calls to backend.
  */
 
 import { restClient } from './restClient';
@@ -26,6 +26,7 @@ interface ApiBusinessScope {
   avatar?: string | null;
   role?: string | null;
   system_prompt?: string | null;
+  settings?: Record<string, unknown> | null;
 }
 
 /**
@@ -137,6 +138,7 @@ function mapApiBusinessScopeToBusinessScope(apiScope: ApiBusinessScope): Busines
     avatar: apiScope.avatar,
     role: apiScope.role,
     systemPrompt: apiScope.system_prompt,
+    settings: apiScope.settings,
   };
 }
 

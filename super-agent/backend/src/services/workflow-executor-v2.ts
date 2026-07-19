@@ -21,9 +21,12 @@ import { agentRuntime } from './agent-runtime-factory.js';
 import type { AgentConfig, ConversationEvent } from './agent-runtime.js';
 import type { AnyMCPServerConfig } from './claude-agent.service.js';
 import { createWorkflowProgressServer } from './workflow-progress-mcp.js';
-import { provisionWorkflowWorkspace } from './workflow-workspace.js';
+import { provisionWorkflowWorkspace, snapshotWorkspaceToS3, restoreWorkspaceFromSnapshot } from './workflow-workspace.js';
+import { workspaceManager } from './workspace-manager.js';
 import { checkpointService, type CheckpointType } from './checkpoint.service.js';
 import { prisma } from '../config/database.js';
+import { config } from '../config/index.js';
+import { recordTokenUsage } from './token-usage.service.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -200,12 +203,19 @@ function buildResumeBrief(
 
   // Progress reporting
   lines.push('## Progress Reporting (CRITICAL)', '');
-  lines.push('You have access to three workflow progress tools. You MUST call them as you work:');
+  lines.push('Report progress using BOTH methods:');
   lines.push('');
+  lines.push('**Method 1 (preferred):** Use the workflow MCP tools if available:');
   lines.push('1. **Before starting each step**: call `workflow_step_start` with the task ID');
   lines.push('2. **After completing each step**: call `workflow_step_complete` with the task ID and a brief summary');
   lines.push('3. **If a step fails**: call `workflow_step_failed` with the task ID and reason');
   lines.push('');
+  lines.push('**Method 2 (always do this):** Output a progress marker line in your text response:');
+  lines.push('- When starting a step:    `[STEP_START:taskId]`');
+  lines.push('- When completing a step:  `[STEP_COMPLETE:taskId:brief summary]`');
+  lines.push('- When a step fails:       `[STEP_FAILED:taskId:reason]`');
+  lines.push('');
+  lines.push('You MUST output the text markers for every step transition, even if the MCP tools are available.');
   lines.push('Use the EXACT task IDs listed above.');
 
   return lines.join('\n');
@@ -304,21 +314,32 @@ function serializePlanToMissionBrief(
 
   // Progress reporting
   lines.push('## Progress Reporting', '');
-  lines.push('As you work through each step, please report progress using the workflow tools:');
+  lines.push('As you work through each step, report progress using BOTH methods:');
   lines.push('');
+  lines.push('**Method 1 (preferred):** Use the workflow MCP tools if available:');
   lines.push('1. Call `workflow_step_start` with the task ID when beginning a step');
   lines.push('2. Call `workflow_step_complete` with the task ID and a brief summary when done');
   lines.push('3. Call `workflow_step_failed` with the task ID and reason if a step cannot be completed');
   lines.push('');
+  lines.push('**Method 2 (always do this):** Output a progress marker line in your text response:');
+  lines.push('- When starting a step:    `[STEP_START:taskId]`');
+  lines.push('- When completing a step:  `[STEP_COMPLETE:taskId:brief summary]`');
+  lines.push('- When a step fails:       `[STEP_FAILED:taskId:reason]`');
+  lines.push('');
+  lines.push('You MUST output the text markers for every step transition, even if the MCP tools are available.');
+  lines.push('');
   lines.push('## Execution Rules', '');
-  lines.push('- NEVER simulate, mock, or pretend to execute an external API call. If a step requires');
-  lines.push('  an external service (e.g. SendGrid, Slack, GitHub API) and no matching skill or tool');
-  lines.push('  is available, call `workflow_step_failed` with a clear message like:');
-  lines.push('  "Required integration not available: SendGrid. Install the SendGrid skill to enable this step."');
+  lines.push('- The skills listed in "Available API Skills" are INSTALLED in this workspace as SKILL.md files.');
+  lines.push('  Read them (in `.claude/skills/`) to understand the methodology, then execute the step');
+  lines.push('  by following the skill\'s instructions. These are operational guides, not external API endpoints.');
+  lines.push('- When a skill describes data processing, analysis, or report generation, execute it by');
+  lines.push('  performing the analysis and producing the output as described in the skill document.');
+  lines.push('- NEVER simulate or fabricate real external API calls (e.g. actually sending emails via SendGrid,');
+  lines.push('  posting to Slack, or calling a third-party REST API) if no tool/MCP server for that service exists.');
   lines.push('- NEVER fabricate API responses, email delivery confirmations, or inbox polling results.');
-  lines.push('- If a step depends on a real-time external event (e.g. waiting for an email reply),');
-  lines.push('  and no integration exists to monitor that event, fail the step with a clear explanation.');
-  lines.push('- Only use tools and skills that are actually available in the workspace.');
+  lines.push('- If a step explicitly requires calling an external third-party service that has no corresponding');
+  lines.push('  tool or MCP server available, fail the step with a clear explanation.');
+  lines.push('- Only use tools that are actually available in the workspace.');
   lines.push('');
   lines.push('Please proceed through the steps in dependency order.');
 
@@ -334,6 +355,7 @@ async function createExecutionRecord(
   organizationId: string,
   userId: string,
   plan: WorkflowV2Plan,
+  workspaceInfo?: { sessionId: string; scopeId: string },
 ): Promise<string> {
   const execution = await prisma.workflow_executions.create({
     data: {
@@ -345,6 +367,8 @@ async function createExecutionRecord(
       canvas_data: JSON.parse(JSON.stringify(plan)),
       variables: JSON.parse(JSON.stringify(plan.variables || [])),
       trigger_type: 'manual',
+      workspace_session_id: workspaceInfo?.sessionId,
+      workspace_scope_id: workspaceInfo?.scopeId,
     },
   });
 
@@ -388,14 +412,35 @@ async function updateNodeStatus(
   }
 }
 
-async function completeExecution(executionId: string, success: boolean, error?: string): Promise<void> {
+async function completeExecution(executionId: string, success: boolean, error?: string, logs?: unknown[]): Promise<void> {
   try {
+    // When workflow succeeds, finalize any nodes still stuck in 'executing' status.
+    // This can happen when the agent completes a step's work but fails to emit
+    // the STEP_COMPLETE marker or call the workflow_step_complete MCP tool.
+    if (success) {
+      try {
+        await prisma.node_executions.updateMany({
+          where: {
+            execution_id: executionId,
+            status: 'executing',
+          },
+          data: {
+            status: 'finish',
+            completed_at: new Date(),
+          },
+        });
+      } catch (nodeErr) {
+        console.warn(`[workflow-v2] Failed to finalize executing nodes for ${executionId}:`, nodeErr);
+      }
+    }
+
     await prisma.workflow_executions.update({
       where: { id: executionId },
       data: {
         status: success ? 'finish' : 'failed',
         completed_at: new Date(),
         ...(error ? { error_message: error } : {}),
+        ...(logs && logs.length > 0 ? { logs: JSON.parse(JSON.stringify(logs)) } : {}),
       },
     });
   } catch (err) {
@@ -427,10 +472,11 @@ export class WorkflowExecutorV2 {
     // Split plan into segments at checkpoint boundaries
     const segments = splitIntoSegments(plan);
 
-    // Create execution record
+    // Create execution record first so we can use executionId as workspace sessionId
     let executionId: string | undefined;
     if (options?.workflowId) {
       try {
+        // Create record without workspace info first — we'll update it after provisioning
         executionId = await createExecutionRecord(options.workflowId, organizationId, userId, plan);
         // Store segment plan
         await prisma.workflow_executions.update({
@@ -442,10 +488,16 @@ export class WorkflowExecutorV2 {
       }
     }
 
+    // Collect logs for persistence (same pattern as schedule.service)
+    const logs: Array<{ type: string; content?: string; taskId?: string; taskTitle?: string; message?: string; timestamp: string }> = [];
+
     // If no checkpoint nodes, execute the whole plan as one segment
     if (segments.length === 1 && !segments[0]!.checkpointNodeId) {
-      yield* this.executeSegment(plan, segments[0]!, organizationId, scopeId, userId, executionId, timeoutMs);
-      if (executionId) await completeExecution(executionId, true);
+      for await (const event of this.executeSegment(plan, segments[0]!, organizationId, scopeId, userId, executionId, timeoutMs)) {
+        logs.push({ type: event.type, content: event.type === 'log' ? String(event.content ?? '').slice(0, 2000) : undefined, taskId: event.taskId, taskTitle: event.taskTitle, message: event.message, timestamp: new Date().toISOString() });
+        yield event;
+      }
+      if (executionId) await completeExecution(executionId, true, undefined, logs);
       yield { type: 'done' };
       return;
     }
@@ -455,13 +507,36 @@ export class WorkflowExecutorV2 {
     if (!firstSegment || firstSegment.nodes.length === 0) {
       // First node is a checkpoint — skip straight to creating the checkpoint
     } else {
-      yield* this.executeSegment(plan, firstSegment, organizationId, scopeId, userId, executionId, timeoutMs);
+      for await (const event of this.executeSegment(plan, firstSegment, organizationId, scopeId, userId, executionId, timeoutMs)) {
+        logs.push({ type: event.type, content: event.type === 'log' ? String(event.content ?? '').slice(0, 2000) : undefined, taskId: event.taskId, taskTitle: event.taskTitle, message: event.message, timestamp: new Date().toISOString() });
+        yield event;
+      }
     }
 
     // If segment 0 has a checkpoint, create it and pause
     if (firstSegment?.checkpointNodeId) {
       const checkpointNode = plan.nodes.find(n => n.id === firstSegment.checkpointNodeId);
       if (checkpointNode && executionId) {
+        // Snapshot workspace to S3 before pausing so it can be restored on resume
+        try {
+          const exec = await prisma.workflow_executions.findUnique({ where: { id: executionId } });
+          if (exec?.workspace_session_id && exec?.workspace_scope_id) {
+            const wsPath = workspaceManager.getSessionWorkspacePath(
+              organizationId, exec.workspace_scope_id, exec.workspace_session_id,
+            );
+            // In agentcore mode, sync files from agentcore S3 path to local first
+            // so that both the snapshot and the workspace file browser have the latest files.
+            if (config.agentRuntime === 'agentcore') {
+              await workspaceManager.ensureS3SyncedToLocal(
+                organizationId, exec.workspace_scope_id, exec.workspace_session_id,
+              );
+            }
+            await snapshotWorkspaceToS3(wsPath, executionId);
+          }
+        } catch (err) {
+          console.warn('[workflow-v2] Workspace snapshot failed (non-fatal):', err instanceof Error ? err.message : err);
+        }
+
         const inputContext = await checkpointService.buildInputContext(executionId);
         const checkpointType = (checkpointNode.checkpointConfig?.checkpointType as CheckpointType) || 'human_approval';
 
@@ -573,6 +648,21 @@ export class WorkflowExecutorV2 {
       };
     }
 
+    // Restore workspace snapshot from S3 (files produced by previous segments)
+    try {
+      if (execution.workspace_session_id && execution.workspace_scope_id) {
+        const wsPath = workspaceManager.getSessionWorkspacePath(
+          execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id,
+        );
+        const restored = await restoreWorkspaceFromSnapshot(wsPath, executionId);
+        if (restored > 0) {
+          console.log(`[workflow-v2] Restored ${restored} workspace files from snapshot for execution ${executionId}`);
+        }
+      }
+    } catch (err) {
+      console.warn('[workflow-v2] Workspace restore failed (non-fatal):', err instanceof Error ? err.message : err);
+    }
+
     // Execute the segment with resume context
     yield* this.executeSegment(
       plan, segment, execution.organization_id, scopeId, execution.user_id,
@@ -584,6 +674,23 @@ export class WorkflowExecutorV2 {
     if (segment.checkpointNodeId) {
       const checkpointNode = plan.nodes.find(n => n.id === segment.checkpointNodeId);
       if (checkpointNode) {
+        // Snapshot workspace before pausing again
+        try {
+          if (execution.workspace_session_id && execution.workspace_scope_id) {
+            const wsPath = workspaceManager.getSessionWorkspacePath(
+              execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id,
+            );
+            if (config.agentRuntime === 'agentcore') {
+              await workspaceManager.ensureS3SyncedToLocal(
+                execution.organization_id, execution.workspace_scope_id, execution.workspace_session_id,
+              );
+            }
+            await snapshotWorkspaceToS3(wsPath, executionId);
+          }
+        } catch (err) {
+          console.warn('[workflow-v2] Workspace snapshot failed (non-fatal):', err instanceof Error ? err.message : err);
+        }
+
         const inputContext = await checkpointService.buildInputContext(executionId);
         const cpType = (checkpointNode.checkpointConfig?.checkpointType as CheckpointType) || 'human_approval';
         const newCp = await checkpointService.create({
@@ -627,10 +734,10 @@ export class WorkflowExecutorV2 {
     priorOutputs?: Record<string, { title: string; output: unknown }>,
     checkpointResult?: { nodeTitle: string; result: Record<string, unknown> },
   ): AsyncGenerator<WorkflowProgressEvent> {
-    // Provision workspace
+    // Provision workspace — use executionId as sessionId so workspace is traceable
     let workspace;
     try {
-      workspace = await provisionWorkflowWorkspace(organizationId, scopeId);
+      workspace = await provisionWorkflowWorkspace(organizationId, scopeId, executionId);
     } catch (err) {
       const msg = `Failed to provision workspace: ${err instanceof Error ? err.message : String(err)}`;
       yield { type: 'error', message: msg };
@@ -638,7 +745,22 @@ export class WorkflowExecutorV2 {
       return;
     }
 
-    const { workspacePath, agents, skills, scopeSkillNames } = workspace;
+    const { workspacePath, sessionId: workspaceSessionId, scopeId: workspaceScopeId, agents, skills, scopeSkillNames } = workspace;
+
+    // Store workspace info in execution record for later retrieval
+    if (executionId) {
+      try {
+        await prisma.workflow_executions.update({
+          where: { id: executionId },
+          data: {
+            workspace_session_id: workspaceSessionId,
+            workspace_scope_id: workspaceScopeId,
+          },
+        });
+      } catch (err) {
+        console.warn('[workflow-v2] Failed to update workspace info:', err);
+      }
+    }
 
     // Build node title map for this segment
     const nodeTitleMap = new Map<string, string>();
@@ -697,7 +819,7 @@ export class WorkflowExecutorV2 {
     let timedOut = false;
 
     try {
-      const userMessage = `Please execute the following workflow. For each step: (1) call workflow_step_start, (2) do the work, (3) call workflow_step_complete or workflow_step_failed.\n\n${missionBrief}`;
+      const userMessage = `Please execute the following workflow. For each step: (1) output [STEP_START:taskId], (2) do the work, (3) output [STEP_COMPLETE:taskId:summary] or [STEP_FAILED:taskId:reason]. Also call the workflow MCP tools if available.\n\n${missionBrief}`;
 
       const generator = agentRuntime.runConversation(
         {
@@ -706,6 +828,12 @@ export class WorkflowExecutorV2 {
           organizationId,
           userId,
           workspacePath,
+          // Pass workspace session/scope so AgentCore uses the correct S3 prefix
+          // (orgId/scopeId/sessionId/) matching what we store in the DB.
+          // Without these, AgentCore defaults to 'default/ephemeral/' and files
+          // written by the container become invisible to the workspace file API.
+          sessionId: workspaceSessionId,
+          scopeId: workspaceScopeId,
         },
         agentConfig,
         skills,
@@ -714,6 +842,9 @@ export class WorkflowExecutorV2 {
       );
 
       const startTime = Date.now();
+      // Track which taskIds have already been reported via MCP tool callbacks
+      // to avoid duplicate events when both MCP tools and text markers fire.
+      const reportedByMcp = new Set<string>();
 
       for await (const event of generator) {
         if (Date.now() - startTime > timeoutMs) {
@@ -722,13 +853,52 @@ export class WorkflowExecutorV2 {
           break;
         }
 
+        // Drain MCP-based events first and track their taskIds
         while (eventQueue.length > 0) {
-          yield eventQueue.shift()!;
+          const mcpEvent = eventQueue.shift()!;
+          if (mcpEvent.taskId) {
+            reportedByMcp.add(`${mcpEvent.type}:${mcpEvent.taskId}`);
+          }
+          yield mcpEvent;
         }
 
         const textContent = this.extractText(event);
         if (textContent) {
+          // Parse text-based progress markers (fallback for AgentCore runtime
+          // where the in-process MCP server cannot be serialized to the container)
+          const markerEvents = this.parseProgressMarkers(textContent, nodeTitleMap);
+          for (const markerEvent of markerEvents) {
+            const key = `${markerEvent.type}:${markerEvent.taskId}`;
+            if (!reportedByMcp.has(key)) {
+              // Update DB status as well
+              if (executionId && markerEvent.taskId) {
+                const status = markerEvent.type === 'step_start' ? 'executing'
+                  : markerEvent.type === 'step_complete' ? 'finish'
+                  : markerEvent.type === 'step_failed' ? 'failed'
+                  : null;
+                if (status) {
+                  updateNodeStatus(executionId, markerEvent.taskId, status, {
+                    output: markerEvent.type === 'step_complete' ? { summary: markerEvent.message } : undefined,
+                    error: markerEvent.type === 'step_failed' ? markerEvent.message : undefined,
+                  });
+                }
+              }
+              yield markerEvent;
+            }
+          }
+
           yield { type: 'log', content: textContent };
+        }
+
+        // Record token usage from result events
+        if (event.type === 'result' && event.tokenUsage) {
+          recordTokenUsage({
+            organizationId,
+            userId,
+            agentId: agentConfig.id,
+            source: 'workflow',
+            tokenUsage: event.tokenUsage,
+          });
         }
 
         if (event.type === 'error') {
@@ -763,6 +933,47 @@ export class WorkflowExecutorV2 {
       if (typeof content === 'string') return content;
     }
     return null;
+  }
+
+  /**
+   * Parse text-based progress markers from Claude's output.
+   *
+   * Markers:
+   *   [STEP_START:taskId]
+   *   [STEP_COMPLETE:taskId:summary]
+   *   [STEP_FAILED:taskId:reason]
+   *
+   * This is the fallback mechanism for AgentCore runtime where the in-process
+   * MCP progress server cannot be serialized and sent to the remote container.
+   */
+  private parseProgressMarkers(
+    text: string,
+    nodeTitleMap: Map<string, string>,
+  ): WorkflowProgressEvent[] {
+    const events: WorkflowProgressEvent[] = [];
+    const markerRegex = /\[STEP_(START|COMPLETE|FAILED):([^\]:\s]+)(?::([^\]]*))?\]/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = markerRegex.exec(text)) !== null) {
+      const action = match[1]; // START, COMPLETE, or FAILED
+      const taskId = match[2]!;
+      const detail = match[3]?.trim();
+      const taskTitle = nodeTitleMap.get(taskId);
+
+      switch (action) {
+        case 'START':
+          events.push({ type: 'step_start', taskId, taskTitle });
+          break;
+        case 'COMPLETE':
+          events.push({ type: 'step_complete', taskId, taskTitle, message: detail });
+          break;
+        case 'FAILED':
+          events.push({ type: 'step_failed', taskId, taskTitle, message: detail });
+          break;
+      }
+    }
+
+    return events;
   }
 }
 

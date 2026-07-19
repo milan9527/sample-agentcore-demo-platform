@@ -42,9 +42,7 @@ export async function appDataRoutes(fastify: FastifyInstance): Promise<void> {
           where: { app_id: appId, org_id: orgId, collection, ...jsonFilters },
           take: limit,
           skip: offset,
-          orderBy: sortField
-            ? { data: { path: [sortField], sort: order } } as any
-            : { created_at: order },
+          orderBy: { created_at: order },
         }),
         prisma.app_data.count({
           where: { app_id: appId, org_id: orgId, collection, ...jsonFilters },

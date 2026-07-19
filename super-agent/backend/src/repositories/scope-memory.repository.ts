@@ -6,6 +6,8 @@
 import { prisma } from '../config/database.js';
 import type { Prisma } from '@prisma/client';
 
+export type MemoryVisibility = 'scope' | 'user' | 'session';
+
 export interface ScopeMemoryEntity {
   id: string;
   organization_id: string;
@@ -16,6 +18,7 @@ export interface ScopeMemoryEntity {
   category: string;
   tags: string[];
   is_pinned: boolean;
+  visibility: MemoryVisibility;
   created_by: string | null;
   created_at: Date;
   updated_at: Date;
@@ -25,6 +28,8 @@ export interface ListMemoriesOptions {
   category?: string;
   q?: string;
   pinned?: boolean;
+  visibility?: MemoryVisibility;
+  userId?: string;
   limit?: number;
   offset?: number;
 }
@@ -47,12 +52,22 @@ export class ScopeMemoryRepository {
     if (options.category) where.category = options.category;
     if (options.pinned !== undefined) where.is_pinned = options.pinned;
 
+    // Visibility filtering: show scope-level + user's own private memories
+    if (options.visibility) {
+      (where as Record<string, unknown>).visibility = options.visibility;
+    } else if (options.userId) {
+      where.OR = [
+        { visibility: 'scope' } as Prisma.scope_memoriesWhereInput,
+        { visibility: 'user', created_by: options.userId } as Prisma.scope_memoriesWhereInput,
+      ];
+    }
+
     return prisma.scope_memories.findMany({
       where,
       orderBy: [{ is_pinned: 'desc' }, { created_at: 'desc' }],
       take: options.limit ?? 100,
       skip: options.offset ?? 0,
-    }) as Promise<ScopeMemoryEntity[]>;
+    }) as unknown as Promise<ScopeMemoryEntity[]>;
   }
 
   private async searchByText(
@@ -65,19 +80,28 @@ export class ScopeMemoryRepository {
     const limit = options.limit ?? 100;
     const offset = options.offset ?? 0;
 
+    // Visibility filter: scope-level memories + user's own private memories
+    let visibilityFilter = '';
+    const params: unknown[] = [organizationId, scopeId, options.q!];
+    if (options.visibility) {
+      visibilityFilter = `AND visibility = $4`;
+      params.push(options.visibility);
+    } else if (options.userId) {
+      visibilityFilter = `AND (visibility = 'scope' OR (visibility = 'user' AND created_by = $4))`;
+      params.push(options.userId);
+    }
+
     return prisma.$queryRawUnsafe<ScopeMemoryEntity[]>(
       `SELECT id, organization_id, business_scope_id, session_id, title, content,
-              category, tags, is_pinned, created_by, created_at, updated_at
+              category, tags, is_pinned, visibility, created_by, created_at, updated_at
        FROM scope_memories
        WHERE organization_id = $1
          AND business_scope_id = $2
          AND search_vector @@ plainto_tsquery('english', $3)
-         ${categoryFilter} ${pinnedFilter}
+         ${categoryFilter} ${pinnedFilter} ${visibilityFilter}
        ORDER BY is_pinned DESC, ts_rank(search_vector, plainto_tsquery('english', $3)) DESC
        LIMIT ${limit} OFFSET ${offset}`,
-      organizationId,
-      scopeId,
-      options.q!,
+      ...params,
     );
   }
 
@@ -93,8 +117,13 @@ export class ScopeMemoryRepository {
    *      - other:  2K chars  (uncategorized)
    *   3. Human-created memories take priority over auto-distilled within each bucket
    *   4. Total hard cap: 30K chars
+   *
+   * Visibility filtering:
+   *   - Always includes 'scope' visibility memories (shared knowledge)
+   *   - If userId is provided, also includes 'user' visibility memories owned by that user
+   *   - Never includes 'session' visibility memories (those are ephemeral)
    */
-  async findForContext(scopeId: string): Promise<ScopeMemoryEntity[]> {
+  async findForContext(scopeId: string, userId?: string): Promise<ScopeMemoryEntity[]> {
     const PINNED_CAP = 15_000;
     const TOTAL_CAP = 30_000;
     const CATEGORY_BUDGETS: Record<string, number> = {
@@ -104,11 +133,16 @@ export class ScopeMemoryRepository {
     };
     const DEFAULT_BUDGET = 2_000;
 
+    // Build visibility filter: scope memories + user's own private memories
+    const visibilityWhere = userId
+      ? { OR: [{ visibility: 'scope' }, { visibility: 'user', created_by: userId }] }
+      : { visibility: 'scope' };
+
     // 1. Pinned memories (capped)
     const pinned = await prisma.scope_memories.findMany({
-      where: { business_scope_id: scopeId, is_pinned: true },
+      where: { business_scope_id: scopeId, is_pinned: true, ...visibilityWhere } as Prisma.scope_memoriesWhereInput,
       orderBy: { created_at: 'desc' },
-    }) as ScopeMemoryEntity[];
+    }) as unknown as ScopeMemoryEntity[];
 
     const result: ScopeMemoryEntity[] = [];
     let totalChars = 0;
@@ -122,10 +156,10 @@ export class ScopeMemoryRepository {
 
     // 2. Non-pinned memories, ordered: human-created first, then auto-distilled, newest first
     const recent = await prisma.scope_memories.findMany({
-      where: { business_scope_id: scopeId, is_pinned: false },
+      where: { business_scope_id: scopeId, is_pinned: false, ...visibilityWhere } as Prisma.scope_memoriesWhereInput,
       orderBy: { created_at: 'desc' },
       take: 80,
-    }) as ScopeMemoryEntity[];
+    }) as unknown as ScopeMemoryEntity[];
 
     // Sort: human-created (no 'auto-distilled' tag) before auto-distilled
     const isAuto = (m: ScopeMemoryEntity) => m.tags.includes('auto-distilled');
@@ -160,46 +194,50 @@ export class ScopeMemoryRepository {
   async findById(id: string, organizationId: string): Promise<ScopeMemoryEntity | null> {
     return prisma.scope_memories.findFirst({
       where: { id, organization_id: organizationId },
-    }) as Promise<ScopeMemoryEntity | null>;
+    }) as unknown as Promise<ScopeMemoryEntity | null>;
   }
 
   async create(
     data: Omit<ScopeMemoryEntity, 'id' | 'created_at' | 'updated_at'>,
   ): Promise<ScopeMemoryEntity> {
-    return prisma.scope_memories.create({
-      data: {
-        organization_id: data.organization_id,
-        business_scope_id: data.business_scope_id,
-        session_id: data.session_id,
-        title: data.title,
-        content: data.content,
-        category: data.category,
-        tags: data.tags,
-        is_pinned: data.is_pinned,
-        created_by: data.created_by,
-      },
-    }) as Promise<ScopeMemoryEntity>;
+    // Note: `visibility` field requires prisma generate after migration.
+    // Using type assertion until Prisma client is regenerated.
+    const createInput = {
+      organization_id: data.organization_id,
+      business_scope_id: data.business_scope_id,
+      session_id: data.session_id,
+      title: data.title,
+      content: data.content,
+      category: data.category,
+      tags: data.tags,
+      is_pinned: data.is_pinned,
+      visibility: data.visibility ?? 'scope',
+      created_by: data.created_by,
+    };
+    const result = await (prisma.scope_memories.create as Function)({ data: createInput });
+    return result as ScopeMemoryEntity;
   }
 
   async update(
     id: string,
     organizationId: string,
-    data: Partial<Pick<ScopeMemoryEntity, 'title' | 'content' | 'category' | 'tags' | 'is_pinned'>>,
+    data: Partial<Pick<ScopeMemoryEntity, 'title' | 'content' | 'category' | 'tags' | 'is_pinned' | 'visibility'>>,
   ): Promise<ScopeMemoryEntity | null> {
     const existing = await this.findById(id, organizationId);
     if (!existing) return null;
 
-    const updateData: Prisma.scope_memoriesUncheckedUpdateInput = {};
+    const updateData: Record<string, unknown> = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.content !== undefined) updateData.content = data.content;
     if (data.category !== undefined) updateData.category = data.category;
     if (data.tags !== undefined) updateData.tags = data.tags;
     if (data.is_pinned !== undefined) updateData.is_pinned = data.is_pinned;
+    if (data.visibility !== undefined) updateData.visibility = data.visibility;
 
     return prisma.scope_memories.update({
       where: { id },
-      data: updateData,
-    }) as Promise<ScopeMemoryEntity>;
+      data: updateData as Prisma.scope_memoriesUncheckedUpdateInput,
+    }) as unknown as Promise<ScopeMemoryEntity>;
   }
 
   async delete(id: string, organizationId: string): Promise<boolean> {

@@ -22,6 +22,7 @@ export const createChatSessionSchema = z.object({
   agent_id: uuidSchema.optional().nullable(),
   sop_context: z.string().optional().nullable(),
   context: z.record(z.string(), z.unknown()).default({}),
+  provision_workspace: z.boolean().optional(),
 });
 
 /**
@@ -81,9 +82,22 @@ export const chatMessageResponseSchema = z.object({
 export const chatStreamRequestSchema = z.object({
   agent_id: uuidSchema.optional(),
   business_scope_id: uuidSchema.optional(),
+  mention_agent_id: uuidSchema.optional(),
   session_id: uuidSchema.optional(),
   message: z.string().min(1, 'Message is required'),
+  model: z.string().max(200).optional(),
+  /** Provider + model selection (from the chat UI model picker). */
+  model_selection: z
+    .object({
+      providerId: z.string().uuid().optional(),
+      modelId: z.string().max(255).optional(),
+    })
+    .optional(),
   context: z.record(z.string(), z.unknown()).optional(),
+  /** File names recently uploaded by the user (injected as context for the agent). */
+  attached_files: z.array(z.string()).optional(),
+  /** Workspace paths of images attached (for display in chat history). */
+  attached_images: z.array(z.string()).optional(),
 });
 
 /**

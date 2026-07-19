@@ -58,11 +58,21 @@ export interface AssistantEvent {
   speakerAgentAvatar?: string | null;
 }
 
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  total_cost_usd?: number;
+}
+
 export interface ResultEvent {
   type: 'result';
   session_id: string;
   duration_ms?: number;
   num_turns?: number;
+  model?: string;
+  token_usage?: TokenUsage;
 }
 
 export interface HeartbeatEvent {
@@ -117,9 +127,17 @@ export interface ChatStreamCallbacks {
 export interface StreamChatOptions {
   businessScopeId?: string;
   agentId?: string;
+  mentionAgentId?: string;
   message: string;
   sessionId?: string;
+  model?: string;
+  /** Provider + model selection (from the chat provider/model picker). */
+  modelSelection?: { providerId?: string; modelId?: string };
   context?: Record<string, unknown>;
+  /** File names recently uploaded by the user (injected as context for the agent). */
+  attachedFiles?: string[];
+  /** Workspace paths of images attached (stored in message metadata for display). */
+  attachedImages?: string[];
 }
 
 /**
@@ -255,6 +273,8 @@ export function parseSSEData(data: string, eventName?: string): ChatStreamEvent 
             session_id: parsed.session_id ?? '',
             duration_ms: parsed.duration_ms,
             num_turns: parsed.num_turns,
+            model: parsed.model,
+            token_usage: parsed.token_usage,
           } satisfies ResultEvent;
 
         case 'heartbeat':
@@ -354,11 +374,26 @@ export function streamChat(
       if (options.agentId) {
         body.agent_id = options.agentId;
       }
+      if (options.mentionAgentId) {
+        body.mention_agent_id = options.mentionAgentId;
+      }
       if (options.sessionId) {
         body.session_id = options.sessionId;
       }
       if (options.context) {
         body.context = options.context;
+      }
+      if (options.model) {
+        body.model = options.model;
+      }
+      if (options.modelSelection && (options.modelSelection.providerId || options.modelSelection.modelId)) {
+        body.model_selection = options.modelSelection;
+      }
+      if (options.attachedFiles && options.attachedFiles.length > 0) {
+        body.attached_files = options.attachedFiles;
+      }
+      if (options.attachedImages && options.attachedImages.length > 0) {
+        body.attached_images = options.attachedImages;
       }
 
       const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
@@ -371,11 +406,12 @@ export function streamChat(
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({}));
         const errorMessage = errorBody.error || `Request failed with status ${response.status}`;
+        const errorCode = errorBody.code || 'HTTP_ERROR';
         callbacks.onError?.({
           type: 'error',
-          code: 'HTTP_ERROR',
+          code: errorCode,
           message: errorMessage,
-          suggested_action: 'Please try again',
+          suggested_action: errorBody.details?.reason || 'Please try again',
         });
         rejectSessionId!(new Error(errorMessage));
         return;

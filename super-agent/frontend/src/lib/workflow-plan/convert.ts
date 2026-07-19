@@ -27,6 +27,7 @@ const taskTypeToNodeType: Record<TaskType, CanvasNodeType> = {
   condition: 'condition',
   document: 'document',
   codeArtifact: 'codeArtifact',
+  humanApproval: 'humanApproval',
 };
 
 const nodeTypeToTaskType: Record<string, TaskType> = {
@@ -35,6 +36,7 @@ const nodeTypeToTaskType: Record<string, TaskType> = {
   condition: 'condition',
   document: 'document',
   codeArtifact: 'codeArtifact',
+  humanApproval: 'humanApproval',
   start: 'action',
   trigger: 'action',
   end: 'action',

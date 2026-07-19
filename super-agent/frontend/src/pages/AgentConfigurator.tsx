@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, Loader2, Save, CheckCircle, AlertCircle, Plus, X, Pencil, Zap, Upload } from 'lucide-react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
+import { ArrowLeft, Loader2, Save, CheckCircle, AlertCircle, Plus, X, Pencil, Upload } from 'lucide-react'
 import { useTranslation } from '@/i18n'
 import { useAgents } from '@/services'
 import { useBusinessScopes } from '@/services/useBusinessScopes'
 import { restClient } from '@/services/api/restClient'
 import { getAvatarDisplayUrl, shouldShowAvatarImage } from '@/utils/avatarUtils'
-import type { Agent, AgentStatus, Tool } from '@/types'
+import { ModelSelector } from '@/components/ModelSelector'
+import type { Agent, AgentStatus, Tool, ModelSelection } from '@/types'
 
 interface FormState {
   internalName: string
@@ -17,6 +18,12 @@ interface FormState {
   systemPrompt: string
   scope: string[]
   tools: Tool[]
+  // A2A external access
+  a2aEnabled: boolean
+  a2aCapabilities: string
+  a2aExposedSkillIds: string[]
+  // Model provider + model selection
+  modelSelection?: ModelSelection
 }
 
 interface ToastState {
@@ -26,14 +33,16 @@ interface ToastState {
 }
 
 // Simplified status options: Active & Disabled
-const SIMPLE_STATUSES: Array<{ value: AgentStatus; label: string }> = [
-  { value: 'active', label: 'Active' },
-  { value: 'offline', label: 'Disabled' },
+const SIMPLE_STATUSES: Array<{ value: AgentStatus; labelKey: string }> = [
+  { value: 'active', labelKey: 'agentConfig.statusActive' },
+  { value: 'offline', labelKey: 'agentConfig.statusDisabled' },
 ]
 
 export function AgentConfigurator() {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const scopeFromQuery = searchParams.get('scope')
   const { agentId } = useParams<{ agentId: string }>()
   const { getAgentById, updateAgent } = useAgents()
   const { businessScopes } = useBusinessScopes()
@@ -57,6 +66,9 @@ export function AgentConfigurator() {
     systemPrompt: '',
     scope: [],
     tools: [],
+    a2aEnabled: false,
+    a2aCapabilities: '',
+    a2aExposedSkillIds: [],
   })
 
   // Load agent data
@@ -82,6 +94,9 @@ export function AgentConfigurator() {
           systemPrompt: '',
           scope: [],
           tools: [],
+          a2aEnabled: false,
+          a2aCapabilities: '',
+          a2aExposedSkillIds: [],
         })
         setIsLoading(false)
         return
@@ -105,6 +120,10 @@ export function AgentConfigurator() {
           systemPrompt: loadedAgent.systemPrompt || '',
           scope: loadedAgent.scope || [],
           tools: loadedAgent.tools || [],
+          a2aEnabled: loadedAgent.a2aEnabled ?? false,
+          a2aCapabilities: loadedAgent.a2aCapabilities ?? '',
+          a2aExposedSkillIds: loadedAgent.a2aExposedSkillIds ?? [],
+          modelSelection: loadedAgent.modelConfig?.modelSelection,
         })
       } else {
         setError('Agent not found')
@@ -173,7 +192,7 @@ export function AgentConfigurator() {
             : tool
         )
         handleInputChange('tools', updatedTools)
-        showToast('success', 'Skill updated successfully')
+        showToast('success', t('agentConfig.skillUpdated'))
       } catch (err) {
         showToast('error', 'Failed to update skill')
         console.error('Failed to update skill:', err)
@@ -199,7 +218,7 @@ export function AgentConfigurator() {
 
   const handleSave = async () => {
     if (!form.internalName.trim() || !form.displayName.trim()) {
-      showToast('error', 'Name and display name are required')
+      showToast('error', t('agentConfig.nameRequired'))
       return
     }
 
@@ -211,6 +230,7 @@ export function AgentConfigurator() {
         const created = await restClient.post<{ id: string }>('/api/agents', {
           name: form.internalName,
           display_name: form.displayName,
+          business_scope_id: scopeFromQuery || null,
           role: form.role || null,
           avatar: form.avatar || null,
           status: form.status,
@@ -220,9 +240,10 @@ export function AgentConfigurator() {
           origin: 'manual',
         })
         setIsSaving(false)
-        showToast('success', 'Agent created successfully')
-        // Navigate to the new agent's page
-        setTimeout(() => navigate(`/agents?id=${created.id}`), 500)
+        showToast('success', t('agentConfig.agentCreated'))
+        // Navigate back to scope page if created from scope, otherwise to agent detail
+        const returnTo = scopeFromQuery ? `/agents?scope=${scopeFromQuery}` : `/agents?id=${created.id}`
+        setTimeout(() => navigate(returnTo), 500)
       } catch (err) {
         setIsSaving(false)
         showToast('error', err instanceof Error ? err.message : 'Failed to create agent')
@@ -241,6 +262,13 @@ export function AgentConfigurator() {
       systemPrompt: form.systemPrompt,
       scope: form.scope,
       tools: form.tools,
+      a2aEnabled: form.a2aEnabled,
+      a2aCapabilities: form.a2aCapabilities,
+      a2aExposedSkillIds: form.a2aExposedSkillIds,
+      modelConfig: {
+        ...(agent.modelConfig ?? { provider: 'Bedrock', modelId: '', agentType: 'Worker' }),
+        modelSelection: form.modelSelection,
+      },
     })
 
     setIsSaving(false)
@@ -329,15 +357,6 @@ export function AgentConfigurator() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {!isCreateMode && (
-              <button
-                onClick={() => navigate(`/agents/config/${agentId}/workshop`)}
-                className="flex items-center gap-2 px-4 py-2 bg-yellow-600/20 hover:bg-yellow-600/30 border border-yellow-600/40 rounded-lg text-yellow-400 transition-colors"
-              >
-                <Zap className="w-4 h-4" />
-                <span>Skill Workshop</span>
-              </button>
-            )}
             <button
               onClick={handleSave}
               disabled={isSaving}
@@ -438,7 +457,7 @@ export function AgentConfigurator() {
                 />
                 <label className="flex items-center gap-1.5 px-3 py-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 rounded-lg cursor-pointer transition-colors text-sm">
                   <Upload size={14} />
-                  <span>Upload</span>
+                  <span>{t('agentConfig.upload')}</span>
                   <input
                     type="file"
                     accept="image/png,image/jpeg,image/webp,image/gif"
@@ -475,7 +494,7 @@ export function AgentConfigurator() {
           {/* Status */}
           <FormField label={t('agentConfig.status')}>
             <div className="grid grid-cols-2 gap-3">
-              {SIMPLE_STATUSES.map(({ value, label }) => (
+              {SIMPLE_STATUSES.map(({ value, labelKey }) => (
                 <button
                   key={value}
                   type="button"
@@ -486,7 +505,7 @@ export function AgentConfigurator() {
                       : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600'
                   }`}
                 >
-                  {label}
+                  {t(labelKey)}
                 </button>
               ))}
             </div>
@@ -504,6 +523,15 @@ export function AgentConfigurator() {
               className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-colors resize-none"
               placeholder="Define the agent's personality, expertise, and behavior..."
             />
+          </FormField>
+
+          {/* Model provider + model */}
+          <FormField label={t('agentConfig.model')}>
+            <ModelSelector
+              value={form.modelSelection}
+              onChange={(sel: ModelSelection) => setForm(prev => ({ ...prev, modelSelection: sel }))}
+            />
+            <p className="mt-1 text-xs text-gray-500">{t('agentConfig.modelHint')}</p>
           </FormField>
 
           {/* Capabilities Section */}
@@ -574,7 +602,7 @@ export function AgentConfigurator() {
                           type="button"
                           onClick={() => handleEditTool(tool)}
                           className="p-1 hover:bg-gray-700 rounded text-gray-400 hover:text-blue-400"
-                          title="Edit skill"
+                          title={t('agentConfig.editSkill')}
                         >
                           <Pencil className="w-4 h-4" />
                         </button>
@@ -582,7 +610,7 @@ export function AgentConfigurator() {
                           type="button"
                           onClick={() => handleRemoveTool(tool.id)}
                           className="p-1 hover:bg-gray-700 rounded text-gray-400 hover:text-red-400"
-                          title="Remove skill"
+                          title={t('agentConfig.removeSkill')}
                         >
                           <X className="w-4 h-4" />
                         </button>
@@ -644,6 +672,90 @@ export function AgentConfigurator() {
               </div>
             </div>
           </FormField>
+
+          {/* A2A External Access Section */}
+          {!isCreateMode && (
+            <>
+              <SectionHeader title="External Access (A2A)" />
+
+              <FormField label="Allow external systems to call this Agent">
+                <div className="space-y-4">
+                  {/* Toggle */}
+                  <div className="flex items-center justify-between p-3 bg-gray-800/50 border border-gray-700 rounded-lg">
+                    <div>
+                      <p className="text-sm text-white">Enable A2A Protocol</p>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        Enable external discovery and invocation via A2A protocol
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleInputChange('a2aEnabled' as keyof FormState, (!form.a2aEnabled) as any)}
+                      className={`relative w-11 h-6 rounded-full transition-colors ${
+                        form.a2aEnabled ? 'bg-blue-600' : 'bg-gray-600'
+                      }`}
+                    >
+                      <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+                        form.a2aEnabled ? 'translate-x-5' : ''
+                      }`} />
+                    </button>
+                  </div>
+
+                  {/* A2A Config (shown when enabled) */}
+                  {form.a2aEnabled && (
+                    <div className="space-y-3 pl-1">
+                      {/* Capabilities description */}
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Capabilities Description (for external discovery)</label>
+                        <textarea
+                          value={form.a2aCapabilities}
+                          onChange={(e) => handleInputChange('a2aCapabilities' as keyof FormState, e.target.value as any)}
+                          rows={3}
+                          className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:border-blue-500 outline-none transition-colors text-sm resize-none"
+                          placeholder="e.g., Handle customer complaints, check order status, process refunds"
+                        />
+                      </div>
+
+                      {/* Exposed skills checkboxes */}
+                      {form.tools.length > 0 && (
+                        <div>
+                          <label className="block text-xs text-gray-400 mb-1.5">Skills to expose externally</label>
+                          <div className="space-y-1.5">
+                            {form.tools.map(tool => {
+                              const isExposed = form.a2aExposedSkillIds.includes(tool.id)
+                              return (
+                                <label key={tool.id} className="flex items-center gap-2.5 p-2 bg-gray-800/30 border border-gray-700/50 rounded-lg cursor-pointer hover:bg-gray-800/60 transition-colors">
+                                  <input
+                                    type="checkbox"
+                                    checked={isExposed}
+                                    onChange={() => {
+                                      const next = isExposed
+                                        ? form.a2aExposedSkillIds.filter(id => id !== tool.id)
+                                        : [...form.a2aExposedSkillIds, tool.id]
+                                      handleInputChange('a2aExposedSkillIds' as keyof FormState, next as any)
+                                    }}
+                                    className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-blue-600 focus:ring-blue-500"
+                                  />
+                                  <span className="text-sm text-gray-300">{tool.name}</span>
+                                </label>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Info box */}
+                      <div className="p-3 bg-blue-900/10 border border-blue-500/20 rounded-lg">
+                        <p className="text-xs text-blue-400">
+                          When enabled, this Agent can be discovered and invoked by external systems through the A2A protocol endpoint.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </FormField>
+            </>
+          )}
         </div>
       </div>
     </div>

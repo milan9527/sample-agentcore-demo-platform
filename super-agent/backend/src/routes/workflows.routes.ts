@@ -25,6 +25,77 @@ import { paginationSchema, idParamSchema } from '../schemas/common.schema.js';
 import { ZodError } from 'zod';
 import { AppError } from '../middleware/errorHandler.js';
 
+/**
+ * Topological sort of workflow nodes based on edges.
+ * Ensures nodes are ordered so that dependencies come before dependents.
+ * Falls back to original order for nodes not connected by edges.
+ */
+function topologicalSort<T extends { id: string; dependentTasks?: string[] }>(
+  nodes: T[],
+  edges: Array<{ source: string; target: string }>,
+): T[] {
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+  const inDegree = new Map<string, number>();
+  const adjacency = new Map<string, string[]>();
+
+  // Initialize
+  for (const node of nodes) {
+    inDegree.set(node.id, 0);
+    adjacency.set(node.id, []);
+  }
+
+  // Build graph from edges (source → target means source must complete before target)
+  for (const edge of edges) {
+    if (nodeMap.has(edge.source) && nodeMap.has(edge.target)) {
+      adjacency.get(edge.source)!.push(edge.target);
+      inDegree.set(edge.target, (inDegree.get(edge.target) || 0) + 1);
+    }
+  }
+
+  // Also consider dependentTasks (target depends on sources listed in dependentTasks)
+  for (const node of nodes) {
+    if (node.dependentTasks) {
+      for (const dep of node.dependentTasks) {
+        if (nodeMap.has(dep) && nodeMap.has(node.id)) {
+          // dep → node (dep must come before node)
+          if (!adjacency.get(dep)!.includes(node.id)) {
+            adjacency.get(dep)!.push(node.id);
+            inDegree.set(node.id, (inDegree.get(node.id) || 0) + 1);
+          }
+        }
+      }
+    }
+  }
+
+  // Kahn's algorithm
+  const queue: string[] = [];
+  for (const [id, degree] of inDegree) {
+    if (degree === 0) queue.push(id);
+  }
+
+  const sorted: T[] = [];
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    const node = nodeMap.get(id);
+    if (node) sorted.push(node);
+
+    for (const neighbor of adjacency.get(id) || []) {
+      const newDegree = (inDegree.get(neighbor) || 1) - 1;
+      inDegree.set(neighbor, newDegree);
+      if (newDegree === 0) queue.push(neighbor);
+    }
+  }
+
+  // If there are nodes not reached (cycle or disconnected), append them
+  if (sorted.length < nodes.length) {
+    for (const node of nodes) {
+      if (!sorted.includes(node)) sorted.push(node);
+    }
+  }
+
+  return sorted;
+}
+
 function formatSSEEvent(payload: { event?: string; data: string }): string {
   let result = '';
   if (payload.event) result += `event: ${payload.event}\n`;
@@ -929,23 +1000,33 @@ export async function workflowRoutes(fastify: FastifyInstance): Promise<void> {
 
       // Build V2 plan from stored workflow data — filter out start/end/trigger nodes
       const PASSTHROUGH_TYPES = new Set(['trigger', 'start', 'end']);
+      // Map legacy node types to V2 types (canvas saves 'human' but executor expects 'humanApproval')
+      const LEGACY_TYPE_MAP: Record<string, string> = { human: 'humanApproval' };
+
+      const filteredNodes = nodes
+        .filter(n => !PASSTHROUGH_TYPES.has(n.type))
+        .map(n => ({
+          id: n.id,
+          title: n.title || n.label || n.id,
+          type: ((LEGACY_TYPE_MAP[n.type] || n.type) as WorkflowV2Plan['nodes'][0]['type']) || 'agent',
+          prompt: n.prompt || (n.metadata?.prompt as string) || n.title || n.label || n.id,
+          dependentTasks: n.dependentTasks || (n.metadata?.dependentTasks as string[]),
+          agentId: n.agentId || (n.metadata?.agentId as string),
+          checkpointConfig: n.metadata?.checkpointConfig as Record<string, unknown> | undefined,
+        }));
+
+      const edges = ((workflow.connections || []) as Array<{ source?: string; target?: string; from?: string; to?: string }>).map(c => ({
+        source: c.source || c.from || '',
+        target: c.target || c.to || '',
+      }));
+
+      // Topological sort nodes by edges to ensure correct execution order
+      const sortedNodes = topologicalSort(filteredNodes, edges);
+
       const plan: WorkflowV2Plan = {
         title: workflow.name,
-        nodes: nodes
-          .filter(n => !PASSTHROUGH_TYPES.has(n.type))
-          .map(n => ({
-            id: n.id,
-            title: n.title || n.label || n.id,
-            type: (n.type as WorkflowV2Plan['nodes'][0]['type']) || 'agent',
-            prompt: n.prompt || (n.metadata?.prompt as string) || n.title || n.label || n.id,
-            dependentTasks: n.dependentTasks || (n.metadata?.dependentTasks as string[]),
-            agentId: n.agentId || (n.metadata?.agentId as string),
-            checkpointConfig: n.metadata?.checkpointConfig as Record<string, unknown> | undefined,
-          })),
-        edges: ((workflow.connections || []) as Array<{ source?: string; target?: string; from?: string; to?: string }>).map(c => ({
-          source: c.source || c.from || '',
-          target: c.target || c.to || '',
-        })),
+        nodes: sortedNodes,
+        edges,
         variables: variables || [],
       };
 
@@ -980,6 +1061,12 @@ export async function workflowRoutes(fastify: FastifyInstance): Promise<void> {
         for await (const event of generator) {
           if (clientDisconnected) break;
           reply.raw.write(formatSSEEvent({ data: JSON.stringify(event) }));
+        }
+
+        // If client disconnected mid-execution, force-return the generator
+        // to release resources (AgentCore session, workspace locks, etc.)
+        if (clientDisconnected) {
+          generator.return(undefined as any).catch(() => {});
         }
       } catch (error) {
         if (!clientDisconnected) {

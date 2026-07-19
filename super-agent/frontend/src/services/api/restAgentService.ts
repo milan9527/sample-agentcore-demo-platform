@@ -2,7 +2,7 @@
  * REST Agent Service
  * 
  * Implements the agent service interface using the REST API backend.
- * Replaces Supabase direct access with HTTP calls to super-agent-backend.
+ * Replaces Supabase direct access with HTTP calls to backend.
  */
 
 import { restClient } from './restClient';
@@ -26,6 +26,14 @@ interface ApiAgent {
   scope: unknown[];
   system_prompt: string | null;
   model_config: Record<string, unknown>;
+  // A2A fields
+  a2a_enabled?: boolean;
+  a2a_capabilities?: string | null;
+  a2a_exposed_skills?: string[];
+  registry_record_id?: string | null;
+  // Token usage (enriched by backend)
+  tokenUsage?: number;
+  estimatedCostUsd?: number;
   created_at: string;
   updated_at: string;
 }
@@ -42,12 +50,17 @@ function mapApiAgentToAgent(apiAgent: ApiAgent): Agent {
     department: mapBusinessScopeToDepartment(apiAgent.business_scope_id),
     avatar: apiAgent.avatar || apiAgent.display_name.charAt(0).toUpperCase(),
     status: apiAgent.status as Agent['status'],
-    metrics: parseMetrics(apiAgent.metrics),
+    metrics: parseMetrics(apiAgent.metrics, apiAgent.tokenUsage, apiAgent.estimatedCostUsd),
     tools: parseTools(apiAgent.tools),
     scope: parseScope(apiAgent.scope),
     systemPrompt: apiAgent.system_prompt || '',
     modelConfig: parseModelConfig(apiAgent.model_config),
     businessScopeId: apiAgent.business_scope_id || undefined,
+    // A2A
+    a2aEnabled: apiAgent.a2a_enabled ?? false,
+    a2aCapabilities: apiAgent.a2a_capabilities ?? undefined,
+    a2aExposedSkillIds: apiAgent.a2a_exposed_skills ?? [],
+    registryRecordId: apiAgent.registry_record_id ?? undefined,
   };
 }
 
@@ -68,6 +81,10 @@ function mapAgentToApiRequest(agent: Partial<Agent>): Record<string, unknown> {
   if (agent.systemPrompt !== undefined) request.system_prompt = agent.systemPrompt;
   if (agent.modelConfig !== undefined) request.model_config = agent.modelConfig;
   if ('businessScopeId' in agent) request.business_scope_id = agent.businessScopeId || null;
+  // A2A fields
+  if (agent.a2aEnabled !== undefined) request.a2a_enabled = agent.a2aEnabled;
+  if (agent.a2aCapabilities !== undefined) request.a2a_capabilities = agent.a2aCapabilities;
+  if (agent.a2aExposedSkillIds !== undefined) request.a2a_exposed_skills = agent.a2aExposedSkillIds;
   
   return request;
 }
@@ -76,7 +93,7 @@ function mapBusinessScopeToDepartment(businessScopeId: string | null): Departmen
   return (businessScopeId || '__independent__') as Department;
 }
 
-function parseMetrics(metrics: unknown): AgentMetrics {
+function parseMetrics(metrics: unknown, tokenUsage?: number, estimatedCostUsd?: number): AgentMetrics {
   if (typeof metrics === 'object' && metrics !== null) {
     const m = metrics as Record<string, unknown>;
     return {
@@ -85,6 +102,8 @@ function parseMetrics(metrics: unknown): AgentMetrics {
       avgResponseTime: typeof m.avgResponseTime === 'string' ? m.avgResponseTime : '0s',
       subagentInvocations: typeof m.subagentInvocations === 'number' ? m.subagentInvocations : undefined,
       toolCalls: typeof m.toolCalls === 'number' ? m.toolCalls : undefined,
+      tokenUsage: tokenUsage ?? (typeof m.tokenUsage === 'number' ? m.tokenUsage : undefined),
+      estimatedCostUsd: estimatedCostUsd ?? (typeof m.estimatedCostUsd === 'number' ? m.estimatedCostUsd : undefined),
     };
   }
   return { taskCount: 0, responseRate: 0, avgResponseTime: '0s' };
@@ -111,17 +130,24 @@ function parseScope(scope: unknown): string[] {
 function parseModelConfig(config: unknown): ModelConfig {
   if (typeof config === 'object' && config !== null) {
     const c = config as Record<string, unknown>;
+    const sel = c.modelSelection as Record<string, unknown> | undefined;
     return {
       provider: isValidProvider(c.provider) ? c.provider : 'Bedrock',
       modelId: typeof c.modelId === 'string' ? c.modelId : 'claude-3-sonnet',
       agentType: isValidAgentType(c.agentType) ? c.agentType : 'Worker',
+      modelSelection: sel && typeof sel === 'object'
+        ? {
+            providerId: typeof sel.providerId === 'string' ? sel.providerId : undefined,
+            modelId: typeof sel.modelId === 'string' ? sel.modelId : undefined,
+          }
+        : undefined,
     };
   }
   return { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' };
 }
 
-function isValidProvider(value: unknown): value is 'Bedrock' | 'OpenAI' | 'Azure' {
-  return value === 'Bedrock' || value === 'OpenAI' || value === 'Azure';
+function isValidProvider(value: unknown): value is 'Bedrock' | 'OpenAI' | 'Azure' | 'LiteLLM' {
+  return value === 'Bedrock' || value === 'OpenAI' || value === 'Azure' || value === 'LiteLLM';
 }
 
 function isValidAgentType(value: unknown): value is 'Orchestrator' | 'Worker' | 'Supervisor' {
@@ -267,6 +293,49 @@ export const RestAgentService = {
     } catch (error) {
       if (error instanceof ServiceError) throw error;
       throw new ServiceError(`Failed to fetch agents with status "${status}"`, 'UNKNOWN');
+    }
+  },
+
+  /**
+   * Binds an agent to a business scope (M:N relationship).
+   * This adds the agent to the scope without removing it from other scopes.
+   */
+  async bindAgentToScope(agentId: string, businessScopeId: string): Promise<void> {
+    try {
+      await restClient.post(`/api/agents/${agentId}/scopes`, {
+        business_scope_id: businessScopeId,
+      });
+    } catch (error) {
+      if (error instanceof ServiceError) throw error;
+      throw new ServiceError(`Failed to bind agent "${agentId}" to scope "${businessScopeId}"`, 'UNKNOWN');
+    }
+  },
+
+  /**
+   * Unbinds an agent from a business scope (M:N relationship).
+   * This removes the agent from the scope without affecting other scope memberships.
+   */
+  async unbindAgentFromScope(agentId: string, businessScopeId: string): Promise<void> {
+    try {
+      await restClient.delete(`/api/agents/${agentId}/scopes/${businessScopeId}`);
+    } catch (error) {
+      if (error instanceof ServiceError) throw error;
+      throw new ServiceError(`Failed to unbind agent "${agentId}" from scope "${businessScopeId}"`, 'UNKNOWN');
+    }
+  },
+
+  /**
+   * Gets all scope assignments for an agent.
+   */
+  async getAgentScopes(agentId: string): Promise<Array<{ id: string; agent_id: string; business_scope_id: string; is_primary: boolean; assigned_at: string }>> {
+    try {
+      const response = await restClient.get<{ scopes: Array<{ id: string; agent_id: string; business_scope_id: string; is_primary: boolean; assigned_at: string }> }>(
+        `/api/agents/${agentId}/scopes`
+      );
+      return response.scopes;
+    } catch (error) {
+      if (error instanceof ServiceError) throw error;
+      throw new ServiceError(`Failed to get scopes for agent "${agentId}"`, 'UNKNOWN');
     }
   },
 

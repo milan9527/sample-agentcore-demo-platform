@@ -75,6 +75,10 @@ export { PluginsPanel } from './PluginsPanel'
 export { MCPServersPanel } from './MCPServersPanel'
 export { MCPCatalogPanel } from './MCPCatalogPanel'
 
+// Business Scope Dropdown (shared selector)
+export { BusinessScopeDropdown } from './BusinessScopeDropdown'
+export type { ScopeItem } from './BusinessScopeDropdown'
+
 // AI Scope Generator
 export { AIScopeGenerator } from './AIScopeGenerator'
 
@@ -93,3 +97,6 @@ export { CommandCenter } from './CommandCenter'
 // Chat Room Components (group chat with multiple agents)
 export { ChatRoom } from './ChatRoom'
 export { CreateRoomDialog } from './CreateRoomDialog'
+
+// Agent Permissions Panel (agent-level access control)
+export { AgentPermissionsPanel } from './AgentPermissionsPanel'

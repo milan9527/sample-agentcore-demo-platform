@@ -110,6 +110,18 @@ export class WorkflowRepository extends BaseRepository<WorkflowEntity> {
   }
 
   /**
+   * Find workflow by name within a specific business scope.
+   * Used to enforce unique workflow names per scope.
+   */
+  async findByNameInScope(
+    organizationId: string,
+    businessScopeId: string,
+    name: string,
+  ): Promise<WorkflowEntity | null> {
+    return this.findFirst(organizationId, { name, business_scope_id: businessScopeId });
+  }
+
+  /**
    * Find official workflows within an organization.
    *
    * @param organizationId - The organization ID to filter by

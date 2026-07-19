@@ -15,7 +15,7 @@ import type { AgentConfig, ConversationEvent } from './agent-runtime.js';
 export interface GeneratedWorkflowTask {
   id: string;
   title: string;
-  type: 'agent' | 'action' | 'condition' | 'document' | 'codeArtifact';
+  type: 'agent' | 'action' | 'condition' | 'document' | 'codeArtifact' | 'humanApproval';
   prompt: string;
   dependentTasks?: string[];
   agentId?: string;
@@ -95,18 +95,27 @@ This is the most common type. When in doubt, use "agent".
 A deterministic operation described in natural language: API calls, data transformation, database queries, file operations, sending emails/notifications, webhooks. Use this for steps that don't require AI reasoning. The description should clearly state what action to perform — Claude will figure out how to execute it using available skills and tools.
 
 ### condition
-A branching point that evaluates criteria and routes the workflow down different paths. Use this WHENEVER the workflow needs to take different actions based on a previous step's output or a decision point. Common patterns:
-- Approval/rejection decisions (e.g. "if approved, proceed; if rejected, notify")
+A branching point that evaluates criteria and routes the workflow down different paths. Use this for AUTOMATED programmatic branching based on data or previous step outputs. Common patterns:
 - Threshold checks (e.g. "if score > 80, auto-approve; otherwise, escalate")
 - Classification routing (e.g. "if sentiment is negative, escalate; otherwise, auto-respond")
-- Yes/no decisions, pass/fail checks, any binary or multi-path branching
-IMPORTANT: If the user describes "if X then Y, otherwise Z" or "based on the result, do A or B", you MUST use a condition node — do NOT embed the branching logic inside an action or agent node.
+- Data-driven decisions, pass/fail checks, any binary or multi-path branching based on computed values
+IMPORTANT: If the user describes "if X then Y, otherwise Z" or "based on the result, do A or B" where the decision is made by code/AI (not a human), use a condition node.
+NEVER use condition for human approval decisions — use "humanApproval" instead. Condition is for automated branching only.
 
 ### document
 Generates a structured document, report, or formatted output. Use this when the primary output of a step is a deliverable document (PDF report, markdown summary, formatted email draft, etc.).
 
 ### codeArtifact
 Generates or executes code. Use this for steps that produce code snippets, scripts, SQL queries, configuration files, or any programmatic artifact.
+
+### humanApproval
+A human approval checkpoint that pauses the workflow and waits for a person to approve or reject before continuing. Use this WHENEVER the workflow requires human review, sign-off, or authorization before proceeding to the next step. Common patterns:
+- Manager approval for budget, expenses, or purchases
+- Content review before publishing
+- Compliance sign-off before deployment
+- Any step where a human must explicitly approve/reject to continue
+IMPORTANT: Do NOT use a "condition" node to represent human approval decisions. If the workflow requires a real person to review and approve something, you MUST use "humanApproval". Condition nodes are for automated programmatic branching — humanApproval nodes are for real human decision-making that pauses execution.
+The prompt field should describe what the approver needs to review and what criteria they should use to approve or reject.
 
 ## Rules (apply when generating JSON)
 
@@ -116,13 +125,14 @@ Generates or executes code. Use this for steps that produce code snippets, scrip
 4. Reference variables in prompts using @{var:variableName} syntax.
 5. Extract user-configurable inputs as variables (e.g. target audience, data source, language).
 6. Task prompts must be detailed, specific, and actionable — name real systems, use concrete values, specify exact fields and formats. NEVER use vague phrases like "submit to the system" or "send to the platform".
-7. NEVER reference other tasks by their IDs (e.g. "task-3", "task-6") in any node's prompt text. Instead, always refer to other steps by their descriptive title (e.g. "the Security Validation step", "the result from the Approval Decision step"). Task IDs are internal identifiers used only in the dependentTasks array — they must never appear in human-readable prompt text. This applies to ALL node types: agent, action, condition, document, and codeArtifact.
+7. NEVER reference other tasks by their IDs (e.g. "task-3", "task-6") in any node's prompt text. Instead, always refer to other steps by their descriptive title (e.g. "the Security Validation step", "the result from the Approval Decision step"). Task IDs are internal identifiers used only in the dependentTasks array — they must never appear in human-readable prompt text. This applies to ALL node types: agent, action, condition, document, codeArtifact, and humanApproval.
 8. For condition nodes specifically, describe the evaluation criteria and what true/false means without referencing downstream tasks at all (e.g. "Evaluate whether the approval decision is 'approved'. True = approved, False = rejected or timeout"). The workflow engine handles routing based on the canvas edges.
 9. If available agents are listed, assign them to tasks where their role is a strong match. Use the agentId field ONLY when an agent's role clearly fits the task. Do NOT force-assign the same agent to every task — leave agentId empty for tasks where no agent is a good fit.
 10. Keep task count reasonable: 3-8 tasks for most workflows. Consolidate related steps into single tasks rather than creating one task per bullet point.
 11. Do NOT invent agent IDs. Only use IDs from the provided available agents list.
 12. When the user provides a very detailed multi-step description, synthesize it into a concise workflow. Group related steps into logical tasks rather than creating a 1:1 mapping of every sub-step.
 13. OUTPUT FORMAT: Your JSON output must be machine-parseable. Do NOT wrap it in markdown code fences. Do NOT add any text before or after the JSON object. Use proper JSON escaping inside string values: use \\n for newlines, \\" for quotes, \\\\ for backslashes. Never put raw line breaks inside a JSON string value. Use numbered lists (1. 2. 3.) separated by \\n instead of visual line breaks.
+14. HUMAN APPROVAL: Whenever the workflow involves a step where a real person must review, approve, sign off, or authorize something before the workflow can continue, you MUST use type "humanApproval". Do NOT use "action" or "agent" for human approval steps. Do NOT use "condition" to represent a human decision. Examples of humanApproval steps: manager approval, compliance review, budget sign-off, content review before publishing, any gate that requires a human to click approve/reject.
 
 Remember: Ask clarifying questions first if the request is vague. When generating, output ONLY the raw JSON object — no markdown, no code fences, no explanation.`;
 
@@ -161,8 +171,16 @@ const WORKFLOW_PATCH_SYSTEM_PROMPT = `You are a workflow modification assistant.
 - deleteVariable: Remove a variable
   { "op": "deleteVariable", "variableId": "var-1" }
 
+- relayout: Trigger automatic re-layout of all nodes based on their dependency relationships
+  { "op": "relayout" }
+
 ## Valid Task Types
-agent, action, condition, document, codeArtifact
+agent, action, condition, document, codeArtifact, humanApproval
+
+Note: Use "humanApproval" (not "condition") when the workflow requires a real person to review and approve/reject before continuing. Condition nodes are for automated programmatic branching only.
+
+## Layout & Positioning
+Node positions are automatically calculated based on dependency relationships (topological layers). You do NOT need to specify x/y coordinates. When the user asks to "rearrange", "re-layout", "reorganize", or "spread out" nodes, use the "relayout" operation. If the user wants to change the visual structure, modify the dependentTasks relationships between tasks — the layout engine will automatically reposition nodes accordingly.
 
 ## Rules
 1. Return a JSON array of patch operations (even for a single change).
@@ -179,7 +197,7 @@ Remember: Ask if unclear. When generating patches, output ONLY the raw JSON arra
 // ---------------------------------------------------------------------------
 
 /**
- * Fix unescaped control characters inside JSON string values.
+ * Fix unescaped control characters and unescaped quotes inside JSON string values.
  * Walks character by character tracking in-string state.
  */
 function fixUnescapedControlChars(json: string): string {
@@ -187,10 +205,28 @@ function fixUnescapedControlChars(json: string): string {
   let inString = false;
   let escaped = false;
   for (let i = 0; i < json.length; i++) {
-    const ch = json[i];
+    const ch = json[i]!;
     if (escaped) { out.push(ch); escaped = false; continue; }
     if (ch === '\\' && inString) { out.push(ch); escaped = true; continue; }
-    if (ch === '"') { inString = !inString; out.push(ch); continue; }
+    if (ch === '"') {
+      if (!inString) {
+        inString = true;
+        out.push(ch);
+        continue;
+      }
+      // Inside a string — check if this is the real closing quote or unescaped interior quote.
+      // Heuristic: real closing quote is followed by JSON structural char (: , } ])
+      let j = i + 1;
+      while (j < json.length && (json[j] === ' ' || json[j] === '\t' || json[j] === '\r' || json[j] === '\n')) j++;
+      const nextChar: string | undefined = json[j];
+      if (nextChar === ':' || nextChar === ',' || nextChar === '}' || nextChar === ']' || nextChar === undefined) {
+        inString = false;
+        out.push(ch);
+      } else {
+        out.push('\\"');
+      }
+      continue;
+    }
     if (inString) {
       const code = ch.charCodeAt(0);
       if (code < 0x20) {

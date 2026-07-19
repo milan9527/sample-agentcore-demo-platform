@@ -112,7 +112,7 @@ export function createToken(claims: {
 /**
  * Verifies an internal service token. Returns null if invalid.
  */
-function verifyInternalToken(token: string): InternalTokenPayload | null {
+export function verifyInternalToken(token: string): InternalTokenPayload | null {
   const parts = token.split('.');
   if (parts.length !== 3 || parts[0] !== 'internal') return null;
   const data = parts[1]!;

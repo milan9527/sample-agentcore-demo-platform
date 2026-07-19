@@ -4,9 +4,11 @@
  */
 
 import { FastifyInstance } from 'fastify';
-import { stat as fsStat, cp, mkdir, readFile, rm } from 'fs/promises';
+import { stat as fsStat, cp, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { createReadStream, existsSync } from 'fs';
 import { join, extname } from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { authenticate } from '../middleware/auth.js';
 import { config } from '../config/index.js';
 import { prisma } from '../config/database.js';
@@ -14,6 +16,8 @@ import { chatService } from '../services/chat.service.js';
 import { workspaceManager } from '../services/workspace-manager.js';
 import { streamRegistry } from '../services/stream-registry.js';
 import { findAppRoot } from '../services/app-finder.js';
+
+const execFileAsync = promisify(execFile);
 
 const APPS_STORAGE_DIR = join(config.claude.workspaceBaseDir, '_published_apps');
 
@@ -84,6 +88,110 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
         data,
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
       });
+    },
+  );
+
+  /**
+   * GET /api/apps/challenge/current — Get the current weekly challenge
+   *
+   * Returns the active challenge for the marketplace, or null if none.
+   * NOTE: Must be registered BEFORE /:id to avoid parametric route conflict.
+   */
+  fastify.get(
+    '/challenge/current',
+    {
+      preHandler: [authenticate],
+      schema: {
+        description: 'Get the current marketplace challenge',
+        tags: ['Apps'],
+        security: [{ bearerAuth: [] }],
+      },
+    },
+    async (_request, reply) => {
+      // TODO: Replace with DB-backed challenge model
+      const challenge = {
+        id: 'weekly-challenge-1',
+        title: '本周挑战：做一个团队协作工具',
+        description: '使用 AI 创建一个帮助团队协作的工具',
+        deadline: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString(),
+        participants: 42,
+        reward: '⭐ Featured 展示位',
+      };
+      return reply.status(200).send({ data: challenge });
+    },
+  );
+
+  /**
+   * GET /api/apps/creators/top — Get top app creators
+   *
+   * Returns the top creators ranked by total app runs within the org.
+   * NOTE: Must be registered BEFORE /:id to avoid parametric route conflict.
+   */
+  fastify.get(
+    '/creators/top',
+    {
+      preHandler: [authenticate],
+      schema: {
+        description: 'Get top app creators in the org',
+        tags: ['Apps'],
+        security: [{ bearerAuth: [] }],
+      },
+    },
+    async (request, reply) => {
+      const orgId = request.user!.orgId;
+
+      // Aggregate apps by published_by user, count apps and sum usage
+      const apps = await prisma.published_apps.findMany({
+        where: { org_id: orgId, status: 'published' },
+        select: { published_by: true, id: true },
+      });
+
+      // Get usage counts per app
+      const usageCounts = await prisma.app_usage_events.groupBy({
+        by: ['app_id'],
+        where: { org_id: orgId, event_type: 'launch' },
+        _count: { id: true },
+      });
+      const usageMap = new Map(usageCounts.map(u => [u.app_id, u._count.id]));
+
+      // Aggregate by creator
+      const creatorMap = new Map<string, { app_count: number; total_runs: number }>();
+      for (const app of apps) {
+        if (!app.published_by) continue;
+        const existing = creatorMap.get(app.published_by) || { app_count: 0, total_runs: 0 };
+        existing.app_count++;
+        existing.total_runs += usageMap.get(app.id) || 0;
+        creatorMap.set(app.published_by, existing);
+      }
+
+      // Sort by total runs and take top 6
+      const sorted = [...creatorMap.entries()]
+        .sort((a, b) => b[1].total_runs - a[1].total_runs)
+        .slice(0, 6);
+
+      // Resolve user names
+      const userIds = sorted.map(([id]) => id);
+      const users = userIds.length > 0
+        ? await prisma.users.findMany({
+            where: { id: { in: userIds } },
+            select: { id: true, name: true, avatar_url: true },
+          })
+        : [];
+      const userMap = new Map(users.map(u => [u.id, u]));
+
+      const creators = sorted.map(([userId, stats], idx) => {
+        const user = userMap.get(userId);
+        return {
+          id: userId,
+          name: user?.name || 'Unknown',
+          avatar: user?.avatar_url || null,
+          app_count: stats.app_count,
+          total_runs: stats.total_runs,
+          rank: idx + 1,
+        };
+      });
+
+      return reply.status(200).send({ data: creators });
     },
   );
 
@@ -183,6 +291,7 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
       category?: string;
       entry_point?: string;
       status?: string;
+      backend_type?: string;
     };
   }>(
     '/publish-from-workspace',
@@ -204,13 +313,14 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
             category: { type: 'string', enum: ['tool', 'dashboard', 'utility', 'game', 'internal'] },
             entry_point: { type: 'string', description: 'Relative path to the HTML entry point within the folder (default: index.html)' },
             status: { type: 'string', enum: ['published', 'preview'], description: 'App status — "preview" for staging, "published" for marketplace listing' },
+            backend_type: { type: 'string', enum: ['none', 'builtin', 'insforge', 'custom'], description: 'Backend data service type for the app' },
           },
         },
       },
     },
     async (request, reply) => {
       const orgId = request.user!.orgId;
-      const { session_id, folder_path, name, description, icon, category, entry_point, status: requestedStatus } = request.body;
+      const { session_id, folder_path, name, description, icon, category, entry_point, status: requestedStatus, backend_type } = request.body;
       const appStatus = requestedStatus === 'preview' ? 'preview' : 'published';
 
       // 1. Look up the session to get the business_scope_id
@@ -228,6 +338,22 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
           code: 'NO_SCOPE',
         });
       }
+
+      // NOTE: S3 sync before publish is intentionally skipped.
+      // The background sync-back in runConversation() already populates the
+      // local workspace cache after each agent invocation. Blocking here
+      // added seconds of latency for no benefit — the auto-build step below
+      // works on whatever files are already local, and for agentcore the
+      // container has already built dist/ and synced it to S3 → local.
+      // If files are still missing (rare race), the auto-build or entry-point
+      // check will surface a clear error.
+      // if (config.agentRuntime === 'agentcore') {
+      //   try {
+      //     await workspaceManager.ensureS3SyncedToLocal(orgId, scopeId, session_id);
+      //   } catch (err) {
+      //     request.log.warn({ err }, 'S3 sync failed before app publish');
+      //   }
+      // }
 
       // 2. Resolve the folder path within the workspace
       const workspacePath = workspaceManager.getSessionWorkspacePath(orgId, scopeId, session_id);
@@ -260,7 +386,228 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
         }
       }
 
-      // 4. Determine entry point — check common locations
+      // 4. Auto-build: if the folder has a package.json with a build script,
+      //    rebuild when:
+      //    a) No dist/ or build/ output exists yet, OR
+      //    b) Source files are newer than the existing build output.
+      //    This handles both first-time builds and re-builds after the agent
+      //    modifies source files (e.g. adding seed data) without rebuilding.
+      const pkgJsonPath = join(resolvedPath, 'package.json');
+      const hasDist = existsSync(join(resolvedPath, 'dist'));
+      const hasBuild = existsSync(join(resolvedPath, 'build'));
+
+      // Check if source files are newer than the build output
+      let sourceNewerThanBuild = false;
+      if (hasDist || hasBuild) {
+        try {
+          const buildDir = hasDist ? join(resolvedPath, 'dist') : join(resolvedPath, 'build');
+          const buildMtime = (await fsStat(buildDir)).mtimeMs;
+
+          // Check if any source file is newer than the build directory
+          const srcDir = join(resolvedPath, 'src');
+          if (existsSync(srcDir)) {
+            const checkNewer = async (dir: string): Promise<boolean> => {
+              const entries = await import('fs/promises').then(m => m.readdir(dir, { withFileTypes: true }));
+              for (const entry of entries) {
+                const fullPath = join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  if (await checkNewer(fullPath)) return true;
+                } else {
+                  const fileMtime = (await fsStat(fullPath)).mtimeMs;
+                  if (fileMtime > buildMtime) return true;
+                }
+              }
+              return false;
+            };
+            sourceNewerThanBuild = await checkNewer(srcDir);
+          }
+
+          // Also check top-level config files (package.json, vite.config.*, index.html)
+          if (!sourceNewerThanBuild) {
+            for (const configFile of ['package.json', 'index.html', 'vite.config.ts', 'vite.config.js']) {
+              const cfgPath = join(resolvedPath, configFile);
+              if (existsSync(cfgPath)) {
+                const cfgMtime = (await fsStat(cfgPath)).mtimeMs;
+                if (cfgMtime > buildMtime) {
+                  sourceNewerThanBuild = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (sourceNewerThanBuild) {
+            request.log.info({ folder_path }, 'Source files are newer than build output — will rebuild');
+          }
+        } catch (err) {
+          request.log.warn({ err }, 'Failed to check source vs build timestamps, skipping rebuild check');
+        }
+      }
+
+      const needsBuild = !hasDist && !hasBuild;
+
+      // Pre-build: Inject InsForge token into .env so Vite inlines it during build
+      if (config.insforge.enabled && existsSync(join(resolvedPath, '.env'))) {
+        try {
+          const { createHmac } = await import('crypto');
+          const jwtSecret = process.env.INSFORGE_JWT_SECRET || config.insforge.jwtSecret;
+          const header = Buffer.from('{"alg":"HS256","typ":"JWT"}').toString('base64url');
+          const payload = Buffer.from(JSON.stringify({ role: 'authenticated', iss: 'super-agent', exp: 4102444800 })).toString('base64url');
+          const signature = createHmac('sha256', jwtSecret).update(`${header}.${payload}`).digest('base64url');
+          const token = `${header}.${payload}.${signature}`;
+
+          let envContent = await readFile(join(resolvedPath, '.env'), 'utf-8');
+          if (envContent.includes('__INSFORGE_TOKEN__')) {
+            envContent = envContent.replace('__INSFORGE_TOKEN__', token);
+            envContent = envContent.replace(/VITE_INSFORGE_URL=.*/, `VITE_INSFORGE_URL=http://${config.insforge.host}:${config.insforge.portPostgrest}`);
+            await writeFile(join(resolvedPath, '.env'), envContent, 'utf-8');
+            request.log.info({ folder_path }, 'Injected InsForge token into .env before build');
+          }
+        } catch (tokenErr: any) {
+          request.log.warn({ err: tokenErr?.message }, 'Failed to inject InsForge token');
+        }
+      }
+
+      if (existsSync(pkgJsonPath) && (needsBuild || sourceNewerThanBuild)) {
+        try {
+          const pkg = JSON.parse(await readFile(pkgJsonPath, 'utf-8'));
+          const hasBuildScript = pkg.scripts?.build;
+
+          if (hasBuildScript) {
+            request.log.info({ folder_path, reason: needsBuild ? 'no-build-output' : 'source-newer' },
+              needsBuild ? 'No dist/build found — auto-building app' : 'Source files changed — rebuilding app');
+
+            // Ensure Vite projects use relative base path for sub-path deployment.
+            // Published apps are served under /api/apps/<uuid>/static/, not root /.
+            const viteConfigCandidates = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
+            let isViteProject = false;
+            for (const vc of viteConfigCandidates) {
+              const vcPath = join(resolvedPath, vc);
+              if (existsSync(vcPath)) {
+                isViteProject = true;
+                try {
+                  let vcContent = await readFile(vcPath, 'utf-8');
+                  if (!vcContent.includes("base:") && !vcContent.includes("base :")) {
+                    vcContent = vcContent.replace(
+                      /defineConfig\(\s*\{/,
+                      "defineConfig({\n  base: './',",
+                    );
+                    await writeFile(vcPath, vcContent, 'utf-8');
+                    request.log.info({ viteConfig: vc }, 'Injected base: "./" for sub-path deployment');
+                  }
+                } catch { /* non-critical */ }
+
+                // Ensure tsconfig.json exists if the project has .ts/.tsx files
+                // Without it, tsc-based build scripts will fail
+                const tsconfigPath = join(resolvedPath, 'tsconfig.json');
+                if (!existsSync(tsconfigPath)) {
+                  const hasTsFiles = existsSync(join(resolvedPath, 'src', 'main.tsx'))
+                    || existsSync(join(resolvedPath, 'src', 'main.ts'))
+                    || existsSync(join(resolvedPath, 'src', 'App.tsx'));
+                  if (hasTsFiles) {
+                    const minimalTsconfig = JSON.stringify({
+                      compilerOptions: {
+                        target: 'ES2020',
+                        useDefineForClassFields: true,
+                        lib: ['ES2020', 'DOM', 'DOM.Iterable'],
+                        module: 'ESNext',
+                        skipLibCheck: true,
+                        moduleResolution: 'bundler',
+                        allowImportingTsExtensions: true,
+                        isolatedModules: true,
+                        noEmit: true,
+                        jsx: 'react-jsx',
+                        strict: false,
+                        noUnusedLocals: false,
+                        noUnusedParameters: false,
+                      },
+                      include: ['src'],
+                    }, null, 2);
+                    await writeFile(tsconfigPath, minimalTsconfig, 'utf-8');
+                    request.log.info({ folder_path }, 'Generated minimal tsconfig.json for Vite+TS project');
+                  }
+                }
+
+                break;
+              }
+            }
+
+            // Install dependencies and build.
+            // The workspace may have a partial node_modules (runtime deps synced
+            // from S3) but missing devDependencies (vite, etc.) and possibly
+            // missing third-party deps the agent added. Run a full npm install
+            // to ensure everything is present.
+            //
+            // IMPORTANT: Override NODE_ENV to ensure devDependencies (vite,
+            // typescript, etc.) are installed — the backend runs with
+            // NODE_ENV=production which causes npm to skip devDependencies.
+            const buildEnv = { ...process.env, NODE_ENV: 'development' };
+
+            request.log.info({ folder_path }, 'Running npm install');
+            try {
+              const { stderr: installStderr } = await execFileAsync('npm', ['install'], {
+                cwd: resolvedPath,
+                timeout: 120_000,
+                env: buildEnv,
+              });
+              if (installStderr) {
+                request.log.warn({ folder_path, stderr: installStderr.slice(0, 500) }, 'npm install stderr');
+              }
+            } catch (installErr: any) {
+              throw new Error(`npm install failed: ${installErr?.message || 'Unknown error'}`);
+            }
+
+            request.log.info({ folder_path }, 'npm install completed, running build');
+
+            if (isViteProject) {
+              const viteBin = join(resolvedPath, 'node_modules', '.bin', 'vite');
+              try {
+                if (existsSync(viteBin)) {
+                  await execFileAsync(viteBin, ['build'], {
+                    cwd: resolvedPath,
+                    timeout: 60_000,
+                    env: buildEnv,
+                  });
+                } else {
+                  request.log.warn({ folder_path, viteBin }, 'vite binary not found after npm install, falling back to npx');
+                  await execFileAsync('npx', ['vite', 'build'], {
+                    cwd: resolvedPath,
+                    timeout: 60_000,
+                    env: buildEnv,
+                  });
+                }
+              } catch (viteBuildErr: any) {
+                // Vite build may fail due to TypeScript errors — retry with --force or esbuild-only
+                request.log.warn({ folder_path, err: viteBuildErr?.message?.slice(0, 200) }, 'Vite build failed, retrying without type checking');
+                const viteCmd = existsSync(viteBin) ? viteBin : 'npx';
+                const viteArgs = existsSync(viteBin) ? ['build'] : ['vite', 'build'];
+                // Set VITE_CJS_IGNORE_WARNING and skip tsc by using esbuild directly
+                await execFileAsync(viteCmd, viteArgs, {
+                  cwd: resolvedPath,
+                  timeout: 60_000,
+                  env: { ...buildEnv, VITE_CJS_IGNORE_WARNING: 'true', TSC_COMPILE_ON_ERROR: 'true' },
+                });
+              }
+            } else {
+              await execFileAsync('npm', ['run', 'build'], {
+                cwd: resolvedPath,
+                timeout: 60_000,
+                env: buildEnv,
+              });
+            }
+
+            request.log.info({ folder_path }, 'Auto-build completed');
+          }
+        } catch (buildErr: any) {
+          request.log.error({ err: buildErr?.message, folder_path }, 'Auto-build failed');
+          return reply.status(500).send({
+            error: `App build failed: ${buildErr?.message || 'Unknown error'}. Ensure the app has a valid build script.`,
+            code: 'BUILD_FAILED',
+          });
+        }
+      }
+
+      // 5. Determine entry point — check common locations
       //    Prefer dist/ and build/ over root index.html because root index.html
       //    in framework projects (Vite, CRA) is the dev template, not the built output.
       let resolvedEntry = entry_point || 'index.html';
@@ -310,7 +657,7 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
         resolvedEntry = 'index.html'; // entry is now at root of the copied folder
       }
 
-      // 5. Check if this app was already published from the same session + folder
+      // 6. Check if this app was already published from the same session + folder
       const existingApp = await prisma.published_apps.findFirst({
         where: {
           org_id: orgId,
@@ -350,6 +697,31 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
           return reply.status(500).send({ error: 'Failed to copy app bundle', code: 'COPY_FAILED' });
         }
 
+        // Re-execute db-init.sql on upgrade (handles schema migrations)
+        const dbInitPath = join(resolvedPath, 'db-init.sql');
+        if (existsSync(dbInitPath) && config.insforge.enabled) {
+          try {
+            const { execFile: ef } = await import('child_process');
+            const { promisify: p } = await import('util');
+            const execFileP = p(ef);
+            const sqlContent = await readFile(dbInitPath, 'utf-8');
+            await execFileP('psql', [
+              '-h', config.insforge.host,
+              '-p', String(config.insforge.portPostgres),
+              '-U', config.insforge.pgUser,
+              '-d', config.insforge.pgDb,
+              '--no-psqlrc',
+              '-c', sqlContent,
+            ], {
+              timeout: 15_000,
+              env: { ...process.env, PGPASSWORD: config.insforge.pgPassword },
+            });
+            request.log.info({ folder_path }, 'Executed db-init.sql on upgrade');
+          } catch (dbErr: any) {
+            request.log.warn({ err: dbErr?.message }, 'db-init.sql execution failed on upgrade (non-fatal)');
+          }
+        }
+
         // Update DB record
         const app = await prisma.published_apps.update({
           where: { id: existingApp.id },
@@ -382,7 +754,7 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
 
       // ── NEW publish ──
 
-      // 6. Copy bundle to published apps storage
+      // 7. Copy bundle to published apps storage
       await mkdir(APPS_STORAGE_DIR, { recursive: true });
       const appId = crypto.randomUUID();
       const targetDir = join(APPS_STORAGE_DIR, appId);
@@ -396,7 +768,32 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
         });
       }
 
-      // 6. Create DB record
+      // 7.6. Execute db-init.sql if present (creates tables in InsForge)
+      const dbInitPath = join(resolvedPath, 'db-init.sql');
+      if (existsSync(dbInitPath) && config.insforge.enabled) {
+        try {
+          const { execFile: ef } = await import('child_process');
+          const { promisify: p } = await import('util');
+          const execFileP = p(ef);
+          const sqlContent = await readFile(dbInitPath, 'utf-8');
+          await execFileP('psql', [
+            '-h', config.insforge.host,
+            '-p', String(config.insforge.portPostgres),
+            '-U', config.insforge.pgUser,
+            '-d', config.insforge.pgDb,
+            '--no-psqlrc',
+            '-c', sqlContent,
+          ], {
+            timeout: 15_000,
+            env: { ...process.env, PGPASSWORD: config.insforge.pgPassword },
+          });
+          request.log.info({ folder_path }, 'Executed db-init.sql against InsForge');
+        } catch (dbErr: any) {
+          request.log.warn({ err: dbErr?.message, folder_path }, 'db-init.sql execution failed (non-fatal)');
+        }
+      }
+
+      // 8. Create DB record
       const app = await prisma.published_apps.create({
         data: {
           id: appId,
@@ -411,6 +808,7 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
           entry_point: resolvedEntry,
           bundle_path: targetDir,
           published_by: request.user!.id,
+          backend_type: backend_type || 'none',
           metadata: { source_folder: folder_path },
         },
       });
@@ -430,6 +828,7 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.status(201).send({
         ...app,
         access_url: accessUrl,
+        backend_type: app.backend_type,
       });
     },
   );
@@ -524,6 +923,67 @@ export async function appsRoutes(fastify: FastifyInstance): Promise<void> {
         .header('Content-Length', stat.size)
         .header('Cache-Control', 'public, max-age=31536000, immutable')
         .send(createReadStream(filePath));
+    },
+  );
+
+  /**
+   * POST /api/apps/:id/fork — Fork (clone) an existing app
+   *
+   * Creates a copy of the app for the current user.
+   */
+  fastify.post<{ Params: { id: string } }>(
+    '/:id/fork',
+    {
+      preHandler: [authenticate],
+      schema: {
+        description: 'Fork an existing published app',
+        tags: ['Apps'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string', format: 'uuid' } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const orgId = request.user!.orgId;
+      const sourceApp = await prisma.published_apps.findFirst({
+        where: { id: request.params.id, org_id: orgId },
+      });
+      if (!sourceApp) return reply.status(404).send({ error: 'App not found' });
+
+      // Create a copy with new ID
+      const newId = crypto.randomUUID();
+      const targetDir = join(APPS_STORAGE_DIR, newId);
+
+      // Copy bundle
+      try {
+        await mkdir(targetDir, { recursive: true });
+        await cp(sourceApp.bundle_path, targetDir, { recursive: true });
+      } catch {
+        return reply.status(500).send({ error: 'Failed to fork app bundle' });
+      }
+
+      // Create DB record
+      const forkedApp = await prisma.published_apps.create({
+        data: {
+          id: newId,
+          org_id: orgId,
+          name: `${sourceApp.name} (Fork)`,
+          description: sourceApp.description,
+          icon: sourceApp.icon,
+          category: sourceApp.category,
+          version: '1.0.0',
+          status: 'published',
+          entry_point: sourceApp.entry_point,
+          bundle_path: targetDir,
+          published_by: request.user!.id,
+          metadata: { forked_from: sourceApp.id },
+        },
+      });
+
+      return reply.status(201).send(forkedApp);
     },
   );
 

@@ -1,23 +1,27 @@
 import { useState, useCallback, useEffect, useRef, useContext, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Send, ChevronDown, AlertCircle, X, Bot, Layers, MessageSquare, File as FileIcon, Save, Eye, Pencil, Square, Paperclip, Upload, Trash2, Globe, Rocket, RefreshCw, ExternalLink, Brain, Download, Users } from 'lucide-react'
+import { Send, ChevronDown, AlertCircle, X, Bot, Layers, MessageSquare, File as FileIcon, Save, Eye, Pencil, Square, Paperclip, Upload, Trash2, Globe, Rocket, RefreshCw, ExternalLink, Brain, Download, Users, PanelRightClose, PanelRightOpen, Cpu } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github-dark.css'
 import { useTranslation } from '@/i18n'
-import { MessageList, QuickQuestions, WorkspaceExplorer } from '@/components'
+import { MessageList, QuickQuestions, WorkspaceExplorer, useToast } from '@/components'
 import type { FileNode } from '@/components/WorkspaceExplorer'
 import { SessionHistoryPanel } from '@/components/chat/SessionHistoryPanel'
 import { SaveToMemoryModal } from '@/components/chat/SaveToMemoryModal'
 import { WorkspaceActions } from '@/components/WorkspaceActions'
+import { ArtifactListPanel } from '@/components/chat/ArtifactListPanel'
 import { ChatProvider, ChatContext } from '@/services/ChatContext'
 import { AgentService } from '@/services/agentService'
 import { BusinessScopeService, type BusinessScope } from '@/services/businessScopeService'
 import { RestChatRoomService } from '@/services/api/restChatRoomService'
-import type { QuickQuestion, Agent } from '@/types'
+import { RestChatService } from '@/services/api/restChatService'
+import type { QuickQuestion, Agent, ModelProvider } from '@/types'
+import { modelProviderService } from '@/services/modelProviderService'
 import { getAvatarDisplayUrl, getAvatarFallback, shouldShowAvatarImage } from '@/utils/avatarUtils'
 import { restClient } from '@/services/api/restClient'
+import { AgentMentionPopup, type AgentMentionPopupHandle, type MentionAgent } from '@/components/chat/AgentMentionPopup'
 
 // ============================================================================
 // File Tab types & viewer
@@ -32,6 +36,15 @@ interface FileTab {
 
 const PREVIEWABLE_EXTENSIONS = new Set(['md', 'markdown', 'html', 'htm'])
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp'])
+const PDF_EXTENSIONS = new Set(['pdf'])
+const EXCEL_EXTENSIONS = new Set(['xlsx', 'xls', 'xlsb'])
+const OFFICE_DOC_EXTENSIONS = new Set(['doc', 'docx', 'ppt', 'pptx'])
+/** Binary file extensions that must NOT be read as UTF-8 text */
+const BINARY_EXTENSIONS = new Set([
+  ...IMAGE_EXTENSIONS, ...PDF_EXTENSIONS, ...EXCEL_EXTENSIONS,
+  'doc', 'docx', 'ppt', 'pptx', 'zip', 'gz', 'tar', 'rar', '7z',
+  'mp3', 'mp4', 'wav', 'avi', 'mov', 'woff', 'woff2', 'ttf', 'otf', 'eot',
+])
 
 function getFileExtension(path: string): string {
   const dot = path.lastIndexOf('.')
@@ -116,24 +129,36 @@ function HtmlPreview({ content }: { content: string }) {
 }
 
 function FileViewerTab({ path, sessionId }: { path: string; sessionId: string }) {
+  const { t } = useTranslation()
   const [content, setContent] = useState<string | null>(null)
   const [editContent, setEditContent] = useState<string>('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [dirty, setDirty] = useState(false)
-  const [mode, setMode] = useState<'view' | 'edit' | 'preview'>('view')
+  const [mode, setMode] = useState<'view' | 'edit' | 'preview'>(() => {
+    // Default to preview mode for markdown files
+    const fileExt = getFileExtension(path)
+    return PREVIEWABLE_EXTENSIONS.has(fileExt) ? 'preview' : 'view'
+  })
   const [imageUrl, setImageUrl] = useState<string | null>(null)
+  const [binaryBlob, setBinaryBlob] = useState<Blob | null>(null)
+  const [excelData, setExcelData] = useState<{ sheetNames: string[]; sheets: Record<string, string[][]> } | null>(null)
+  const [activeSheet, setActiveSheet] = useState<string>('')
   const ext = getFileExtension(path)
   const canPreview = PREVIEWABLE_EXTENSIONS.has(ext)
   const isImage = IMAGE_EXTENSIONS.has(ext)
+  const isPdf = PDF_EXTENSIONS.has(ext)
+  const isExcel = EXCEL_EXTENSIONS.has(ext)
+  const isOfficeDoc = OFFICE_DOC_EXTENSIONS.has(ext)
+  const isBinary = BINARY_EXTENSIONS.has(ext)
   const highlightedHtml = useHighlightedCode(content, ext)
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
 
-    if (isImage) {
-      // Fetch as blob for images
+    if (isBinary) {
+      // Fetch binary files (images, xlsx, etc.) as blob via the raw endpoint
       const token = localStorage.getItem('local_auth_token') || localStorage.getItem('cognito_id_token')
       const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
       fetch(`${baseUrl}/api/chat/sessions/${sessionId}/workspace/file/raw?path=${encodeURIComponent(path)}`, {
@@ -141,14 +166,33 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
         credentials: 'include',
       })
         .then(res => {
-          if (!res.ok) throw new Error('Failed to load image')
+          if (!res.ok) throw new Error('Failed to load file')
           return res.blob()
         })
-        .then(blob => {
-          if (!cancelled) setImageUrl(URL.createObjectURL(blob))
+        .then(async (blob) => {
+          if (cancelled) return
+          if (isImage) {
+            setImageUrl(URL.createObjectURL(blob))
+          } else if (isExcel) {
+            // Parse Excel file using SheetJS
+            try {
+              const XLSX = await import('xlsx')
+              const arrayBuffer = await blob.arrayBuffer()
+              const workbook = XLSX.read(arrayBuffer, { type: 'array' })
+              const sheets: Record<string, string[][]> = {}
+              for (const name of workbook.SheetNames) {
+                sheets[name] = XLSX.utils.sheet_to_json<string[]>(workbook.Sheets[name]!, { header: 1 })
+              }
+              setExcelData({ sheetNames: workbook.SheetNames, sheets })
+              setActiveSheet(workbook.SheetNames[0] ?? '')
+            } catch {
+              setContent(t('chat.failedToParseExcel'))
+            }
+          }
+          setBinaryBlob(blob)
         })
         .catch(() => {
-          if (!cancelled) setContent('Failed to load image')
+          if (!cancelled) setContent(t('chat.failedToLoadFile'))
         })
         .finally(() => {
           if (!cancelled) setLoading(false)
@@ -165,7 +209,7 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
         setDirty(false)
       }
     }).catch(() => {
-      if (!cancelled) setContent('Failed to load file')
+      if (!cancelled) setContent(t('chat.failedToLoadFile'))
     }).finally(() => {
       if (!cancelled) setLoading(false)
     })
@@ -202,11 +246,14 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
 
   const handleDownload = useCallback(() => {
     const fileName = path.split('/').pop() ?? 'file'
-    if (isImage && imageUrl) {
+    if (isBinary && binaryBlob) {
+      // Download binary files from the original blob to avoid corruption
+      const url = URL.createObjectURL(binaryBlob)
       const a = document.createElement('a')
-      a.href = imageUrl
+      a.href = url
       a.download = fileName
       a.click()
+      URL.revokeObjectURL(url)
     } else if (content !== null) {
       const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)
@@ -216,10 +263,10 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
       a.click()
       URL.revokeObjectURL(url)
     }
-  }, [path, isImage, imageUrl, content])
+  }, [path, isBinary, binaryBlob, content])
 
   if (loading) {
-    return <div className="flex-1 flex items-center justify-center text-gray-500">Loading...</div>
+    return <div className="flex-1 flex items-center justify-center text-gray-500">{t('chat.loading')}</div>
   }
 
   // Image files — render as image, no edit/preview toolbar
@@ -233,16 +280,124 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
             disabled={!imageUrl}
             className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors disabled:opacity-40"
           >
-            <Download className="w-3 h-3" /> Download
+            <Download className="w-3 h-3" /> {t('chat.download')}
           </button>
         </div>
         <div className="flex-1 flex items-center justify-center overflow-auto p-4">
           {imageUrl ? (
             <img src={imageUrl} alt={path} className="max-w-full max-h-full object-contain rounded" />
           ) : (
-            <span className="text-gray-500">Failed to load image</span>
+            <span className="text-gray-500">{t('chat.failedToLoadImage')}</span>
           )}
         </div>
+      </div>
+    )
+  }
+
+  // PDF files — render in browser's native PDF viewer via iframe
+  if (isPdf) {
+    const token = localStorage.getItem('local_auth_token') || localStorage.getItem('cognito_id_token')
+    const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
+    const pdfUrl = `${baseUrl}/api/chat/sessions/${sessionId}/workspace/file/raw?path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
+    return (
+      <div className="flex-1 flex flex-col overflow-hidden bg-gray-950">
+        <iframe src={pdfUrl} className="flex-1 w-full border-0" title={path} />
+      </div>
+    )
+  }
+
+  // Excel files — render as table with sheet tabs
+  if (isExcel) {
+    const rows = excelData && activeSheet ? excelData.sheets[activeSheet] ?? [] : []
+    return (
+      <div className="flex-1 flex flex-col overflow-hidden bg-gray-950">
+        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-gray-800 bg-gray-900/60 text-xs">
+          {excelData && excelData.sheetNames.length > 1 && excelData.sheetNames.map(name => (
+            <button
+              key={name}
+              onClick={() => setActiveSheet(name)}
+              className={`px-2 py-1 rounded transition-colors ${activeSheet === name ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}
+            >
+              {name}
+            </button>
+          ))}
+          <div className="flex-1" />
+          <button
+            onClick={handleDownload}
+            disabled={!binaryBlob}
+            className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors disabled:opacity-40"
+          >
+            <Download className="w-3 h-3" /> {t('chat.download')}
+          </button>
+        </div>
+        <div className="flex-1 overflow-auto">
+          {excelData ? (
+            <table className="w-full text-sm border-collapse">
+              <tbody>
+                {rows.map((row, ri) => (
+                  <tr key={ri} className={ri === 0 ? 'bg-gray-800 sticky top-0' : 'hover:bg-gray-900/50'}>
+                    {(row as unknown[]).map((cell, ci) => {
+                      const Tag = ri === 0 ? 'th' : 'td'
+                      return (
+                        <Tag
+                          key={ci}
+                          className={`border border-gray-700 px-3 py-1.5 text-left whitespace-nowrap ${
+                            ri === 0 ? 'text-white font-medium' : 'text-gray-300'
+                          }`}
+                        >
+                          {cell != null ? String(cell) : ''}
+                        </Tag>
+                      )
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="flex items-center justify-center h-full text-gray-500">
+              {content ?? t('chat.failedToParseExcel')}
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // Office documents (docx, pptx, etc.) — preview as PDF via server-side LibreOffice conversion, download original
+  if (isOfficeDoc) {
+    const token = localStorage.getItem('local_auth_token') || localStorage.getItem('cognito_id_token')
+    const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
+    const pdfPreviewUrl = `${baseUrl}/api/chat/sessions/${sessionId}/workspace/file/pdf-preview?path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
+    return (
+      <div className="flex-1 flex flex-col overflow-hidden bg-gray-950">
+        <div className="flex items-center gap-1 px-3 py-1.5 border-b border-gray-800 bg-gray-900/60 text-xs">
+          <div className="flex-1" />
+          <button
+            onClick={handleDownload}
+            disabled={!binaryBlob}
+            className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors disabled:opacity-40"
+          >
+            <Download className="w-3 h-3" /> {t('chat.download')}
+          </button>
+        </div>
+        <iframe src={pdfPreviewUrl} className="flex-1 w-full border-0" title={path} />
+      </div>
+    )
+  }
+
+  // Other binary files — download only, no preview
+  if (isBinary) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-4 bg-gray-950">
+        <FileIcon className="w-12 h-12 text-gray-600" />
+        <p className="text-gray-400 text-sm">{t('chat.cannotPreview')}</p>
+        <button
+          onClick={handleDownload}
+          disabled={!binaryBlob}
+          className="flex items-center gap-2 px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-500 transition-colors disabled:opacity-40"
+        >
+          <Download className="w-4 h-4" /> {t('chat.download')}
+        </button>
       </div>
     )
   }
@@ -255,20 +410,20 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
           onClick={() => setMode('view')}
           className={`flex items-center gap-1 px-2 py-1 rounded transition-colors ${mode === 'view' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}
         >
-          <Eye className="w-3 h-3" /> View
+          <Eye className="w-3 h-3" /> {t('chat.view')}
         </button>
         <button
           onClick={() => { setMode('edit'); setEditContent(dirty ? editContent : content ?? '') }}
           className={`flex items-center gap-1 px-2 py-1 rounded transition-colors ${mode === 'edit' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}
         >
-          <Pencil className="w-3 h-3" /> Edit
+          <Pencil className="w-3 h-3" /> {t('chat.edit')}
         </button>
         {canPreview && (
           <button
             onClick={() => setMode('preview')}
             className={`flex items-center gap-1 px-2 py-1 rounded transition-colors ${mode === 'preview' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}
           >
-            <Eye className="w-3 h-3" /> Preview
+            <Eye className="w-3 h-3" /> {t('chat.preview')}
           </button>
         )}
         <div className="flex-1" />
@@ -277,7 +432,7 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
           disabled={content === null}
           className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors disabled:opacity-40"
         >
-          <Download className="w-3 h-3" /> Download
+          <Download className="w-3 h-3" /> {t('chat.download')}
         </button>
         {mode === 'edit' && (
           <button
@@ -288,7 +443,7 @@ function FileViewerTab({ path, sessionId }: { path: string; sessionId: string })
             }`}
           >
             <Save className="w-3 h-3" />
-            {saving ? 'Saving...' : dirty ? 'Save' : 'Saved'}
+            {saving ? t('chat.saving') : dirty ? t('chat.save') : t('chat.saved')}
           </button>
         )}
       </div>
@@ -331,6 +486,7 @@ function isPreviewableFile(name: string): boolean {
 }
 
 function AppPreviewTab({ path, sessionId }: { path: string; sessionId: string }) {
+  const { t } = useTranslation()
   const [refreshCount, setRefreshCount] = useState(0)
   const [status, setStatus] = useState<'starting' | 'running' | 'error'>('starting')
   const [errorMsg, setErrorMsg] = useState('')
@@ -372,32 +528,54 @@ function AppPreviewTab({ path, sessionId }: { path: string; sessionId: string })
     ? `${baseUrl}/api/chat/sessions/${sessionId}/preview/?token=${encodeURIComponent(token || '')}&_r=${refreshCount}`
     : `${baseUrl}/api/chat/sessions/${sessionId}/workspace/file/raw?path=${encodeURIComponent(path)}&token=${encodeURIComponent(token || '')}&_r=${refreshCount}`
 
+  const handleDownload = useCallback(() => {
+    const fileName = path.split('/').pop() ?? 'file.html'
+    const downloadUrl = `${baseUrl}/api/chat/sessions/${sessionId}/workspace/file/raw?path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
+    fetch(downloadUrl, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
+    })
+      .then(res => {
+        if (!res.ok) throw new Error('Download failed')
+        return res.blob()
+      })
+      .then(blob => {
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = fileName
+        a.click()
+        URL.revokeObjectURL(url)
+      })
+      .catch(err => console.error('Download failed:', err))
+  }, [path, sessionId, baseUrl, token])
+
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-gray-950">
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-800 bg-gray-900/60 text-xs">
         <Globe className="w-3.5 h-3.5 text-green-400" />
-        <span className="text-gray-300 font-medium">App Preview</span>
+        <span className="text-gray-300 font-medium">{t('chat.appPreview')}</span>
         {useDevServer && (
           <span className="px-1.5 py-0.5 rounded bg-green-600/20 text-green-400 text-[10px] font-medium">DEV</span>
         )}
         <span className="text-gray-600 truncate max-w-[200px]">{path}</span>
         <div className="flex-1" />
         <button
-          onClick={() => setRefreshCount(c => c + 1)}
+          onClick={handleDownload}
           className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors"
-          title="Refresh preview"
+          title={t('chat.downloadFile')}
         >
-          <RefreshCw className="w-3 h-3" />
-          Refresh
+          <Download className="w-3 h-3" />
+          {t('chat.download')}
         </button>
         <button
-          onClick={() => { /* TODO: implement publish flow */ }}
-          className="flex items-center gap-1 px-2 py-1 rounded bg-purple-600 text-white hover:bg-purple-500 transition-colors"
-          title="Publish this app"
+          onClick={() => setRefreshCount(c => c + 1)}
+          className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors"
+          title={t('chat.refreshPreview')}
         >
-          <Rocket className="w-3 h-3" />
-          Publish
+          <RefreshCw className="w-3 h-3" />
+          {t('chat.refresh')}
         </button>
       </div>
 
@@ -405,13 +583,13 @@ function AppPreviewTab({ path, sessionId }: { path: string; sessionId: string })
       {status === 'starting' ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-3 text-gray-400">
           <RefreshCw className="w-6 h-6 animate-spin" />
-          <span className="text-sm">Starting dev server...</span>
-          <span className="text-xs text-gray-600">Running npm install & vite</span>
+          <span className="text-sm">{t('chat.startingDevServer')}</span>
+          <span className="text-xs text-gray-600">{t('chat.runningNpmInstall')}</span>
         </div>
       ) : status === 'error' ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-3 text-red-400">
           <AlertCircle className="w-6 h-6" />
-          <span className="text-sm">Failed to start preview</span>
+          <span className="text-sm">{t('chat.failedToStartPreview')}</span>
           <span className="text-xs text-gray-500 max-w-md text-center">{errorMsg}</span>
         </div>
       ) : (
@@ -420,7 +598,7 @@ function AppPreviewTab({ path, sessionId }: { path: string; sessionId: string })
           src={previewUrl}
           className="flex-1 w-full border-0 bg-white"
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-          title="App Preview"
+          title={t('chat.appPreview')}
         />
       )}
     </div>
@@ -432,6 +610,7 @@ function AppPreviewTab({ path, sessionId }: { path: string; sessionId: string })
 // ============================================================================
 
 function PublishedAppPreviewTab({ url, name }: { url: string; name: string }) {
+  const { t } = useTranslation()
   const [refreshCount, setRefreshCount] = useState(0)
   const token = localStorage.getItem('local_auth_token') || localStorage.getItem('cognito_id_token')
   const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
@@ -441,23 +620,23 @@ function PublishedAppPreviewTab({ url, name }: { url: string; name: string }) {
     <div className="flex-1 flex flex-col overflow-hidden bg-gray-950">
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-800 bg-gray-900/60 text-xs">
         <Eye className="w-3.5 h-3.5 text-blue-400" />
-        <span className="text-gray-300 font-medium">Preview: {name}</span>
+        <span className="text-gray-300 font-medium">{t('chat.preview')}: {name}</span>
         <div className="flex-1" />
         <button
           onClick={() => setRefreshCount(c => c + 1)}
           className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors"
-          title="Refresh preview"
+          title={t('chat.refreshPreview')}
         >
           <RefreshCw className="w-3 h-3" />
-          Refresh
+          {t('chat.refresh')}
         </button>
         <button
           onClick={() => window.open(fullUrl, '_blank')}
           className="flex items-center gap-1 px-2 py-1 rounded text-gray-400 hover:text-white hover:bg-gray-700 transition-colors"
-          title="Open in new tab"
+          title={t('chat.openInNewTab')}
         >
           <ExternalLink className="w-3 h-3" />
-          Pop out
+          {t('chat.popOut')}
         </button>
       </div>
       <iframe
@@ -465,7 +644,7 @@ function PublishedAppPreviewTab({ url, name }: { url: string; name: string }) {
         src={fullUrl}
         className="flex-1 w-full border-0 bg-white"
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-        title={`Preview: ${name}`}
+        title={`${t('chat.preview')}: ${name}`}
       />
     </div>
   )
@@ -483,6 +662,7 @@ interface UnifiedChatSelectorProps {
 }
 
 function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, onSelectIndependentAgent }: UnifiedChatSelectorProps) {
+  const { t } = useTranslation()
   const [isOpen, setIsOpen] = useState(false)
   const [scopes, setScopes] = useState<BusinessScope[]>([])
   const [independentAgents, setIndependentAgents] = useState<Agent[]>([])
@@ -529,7 +709,7 @@ function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, 
   const selectedIndependentAgent = independentAgents.find(a => a.id === selectedAgentId)
 
   // Determine display label
-  let displayLabel = 'Select scope or agent'
+  let displayLabel = t('chat.selectScopeOrAgent')
   let displayIcon: React.ReactNode = <Layers className="w-4 h-4 text-gray-400" />
   if (selectedScope) {
     displayLabel = `${selectedScope.icon || ''} ${selectedScope.name}`.trim()
@@ -553,7 +733,7 @@ function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, 
   if (isLoading) {
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm">
-        <span className="text-gray-400">Loading...</span>
+        <span className="text-gray-400">{t('chat.loading')}</span>
       </div>
     )
   }
@@ -577,7 +757,7 @@ function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, 
               type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search scopes or agents..."
+              placeholder={t('chat.searchScopesAgents')}
               className="w-full px-3 py-1.5 bg-gray-900 border border-gray-600 rounded text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500"
               autoFocus
             />
@@ -588,7 +768,7 @@ function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, 
             {filteredScopes.length > 0 && (
               <>
                 <div className="px-3 py-1.5 text-xs text-gray-500 font-medium uppercase tracking-wider">
-                  Business Scopes
+                  {t('chat.businessScopes')}
                 </div>
                 {filteredScopes.map(scope => (
                   <button
@@ -623,7 +803,7 @@ function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, 
             {filteredAgents.length > 0 && (
               <>
                 <div className="px-3 py-1.5 text-xs text-gray-500 font-medium uppercase tracking-wider border-t border-gray-700">
-                  Independent Agents
+                  {t('chat.independentAgents')}
                 </div>
                 {filteredAgents.map(agent => {
                   const avatarUrl = getAvatarDisplayUrl(agent.avatar)
@@ -663,7 +843,7 @@ function UnifiedChatSelector({ selectedScopeId, selectedAgentId, onSelectScope, 
             )}
 
             {filteredScopes.length === 0 && filteredAgents.length === 0 && (
-              <div className="px-3 py-4 text-sm text-gray-500 text-center">No results found</div>
+              <div className="px-3 py-4 text-sm text-gray-500 text-center">{t('chat.noResultsFound')}</div>
             )}
           </div>
         </div>
@@ -682,6 +862,7 @@ interface BusinessScopeSelectorProps {
 }
 
 function BusinessScopeSelector({ selectedScopeId, onScopeChange }: BusinessScopeSelectorProps) {
+  const { t } = useTranslation()
   const [isOpen, setIsOpen] = useState(false)
   const [scopes, setScopes] = useState<BusinessScope[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -729,7 +910,7 @@ function BusinessScopeSelector({ selectedScopeId, onScopeChange }: BusinessScope
   if (isLoading) {
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm">
-        <span className="text-gray-400">Loading scopes...</span>
+        <span className="text-gray-400">{t('chat.loadingScopesEllipsis')}</span>
       </div>
     )
   }
@@ -744,7 +925,7 @@ function BusinessScopeSelector({ selectedScopeId, onScopeChange }: BusinessScope
         <Layers className="w-4 h-4 text-gray-400" />
         <span className="text-gray-400">Scope:</span>
         <span className="text-white font-medium">
-          {selectedScope ? `${selectedScope.icon || ''} ${selectedScope.name}`.trim() : 'Select scope'}
+          {selectedScope ? `${selectedScope.icon || ''} ${selectedScope.name}`.trim() : t('chat.selectScopeLabel')}
         </span>
         <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
@@ -752,7 +933,7 @@ function BusinessScopeSelector({ selectedScopeId, onScopeChange }: BusinessScope
       {isOpen && (
         <div className="absolute top-full left-0 mt-1 w-64 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-20 overflow-hidden max-h-80 overflow-y-auto">
           {scopes.length === 0 ? (
-            <div className="px-3 py-2 text-sm text-gray-400">No scopes available</div>
+            <div className="px-3 py-2 text-sm text-gray-400">{t('chat.noScopesAvailableMsg')}</div>
           ) : (
             scopes.map((scope) => (
               <button
@@ -798,6 +979,7 @@ interface AgentSelectorProps {
 }
 
 function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: AgentSelectorProps) {
+  const { t } = useTranslation()
   const [isOpen, setIsOpen] = useState(false)
   const [scopeAgents, setScopeAgents] = useState<Agent[]>([])
   const [independentAgents, setIndependentAgents] = useState<Agent[]>([])
@@ -859,7 +1041,7 @@ function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: Agen
   if (isLoadingAgents) {
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm">
-        <span className="text-gray-400">Loading agents...</span>
+        <span className="text-gray-400">{t('chat.loadingAgents')}</span>
       </div>
     )
   }
@@ -908,7 +1090,7 @@ function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: Agen
         <Bot className="w-4 h-4 text-gray-400" />
         <span className="text-gray-400">Agent:</span>
         <span className="text-white font-medium">
-          {selectedAgent?.displayName || (selectedScopeId ? 'Auto (all agents)' : 'Select agent')}
+          {selectedAgent?.displayName || (selectedScopeId ? t('chat.autoAllAgents') : t('chat.selectAgent'))}
         </span>
         <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
@@ -928,9 +1110,9 @@ function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: Agen
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className={`text-sm font-medium ${!selectedAgentId ? 'text-blue-400' : 'text-white'}`}>
-                    Auto (all agents)
+                    {t('chat.autoAllAgents')}
                   </div>
-                  <div className="text-xs text-gray-400">Let the scope route to the right agent</div>
+                  <div className="text-xs text-gray-400">{t('chat.autoAllAgentsHint')}</div>
                 </div>
               </div>
             </button>
@@ -940,7 +1122,7 @@ function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: Agen
           {scopeAgents.length > 0 && (
             <>
               <div className="px-3 py-1.5 text-xs text-gray-500 font-medium uppercase tracking-wider border-t border-gray-700">
-                Scope Agents
+                {t('chat.scopeAgents')}
               </div>
               {scopeAgents.map(renderAgentItem)}
             </>
@@ -950,7 +1132,7 @@ function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: Agen
           {independentAgents.length > 0 && (
             <>
               <div className="px-3 py-1.5 text-xs text-gray-500 font-medium uppercase tracking-wider border-t border-gray-700">
-                Independent Agents
+                {t('chat.independentAgents')}
               </div>
               {independentAgents.map(renderAgentItem)}
             </>
@@ -969,23 +1151,45 @@ function AgentSelector({ selectedAgentId, selectedScopeId, onAgentChange }: Agen
 // Upload Modal
 // ============================================================================
 
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
 function UploadModal({ open, onClose, onConfirm }: {
   open: boolean
   onClose: () => void
   onConfirm: (files: File[]) => void
 }) {
+  const { t } = useTranslation()
   const [files, setFiles] = useState<File[]>([])
   const [dragging, setDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [rejectedFiles, setRejectedFiles] = useState<string[]>([])
+
+  const MAX_FILE_SIZE = 100 * 1024 * 1024 // 100MB
 
   // Reset files when modal opens
-  useEffect(() => { if (open) setFiles([]) }, [open])
+  useEffect(() => { if (open) { setFiles([]); setRejectedFiles([]) } }, [open])
 
   const addFiles = useCallback((newFiles: FileList | File[]) => {
     const arr = Array.from(newFiles)
+    const accepted: File[] = []
+    const rejected: string[] = []
+    for (const f of arr) {
+      if (f.size > MAX_FILE_SIZE) {
+        rejected.push(`${f.name} (${formatFileSize(f.size)})`)
+      } else {
+        accepted.push(f)
+      }
+    }
+    if (rejected.length > 0) {
+      setRejectedFiles(rejected)
+    }
     setFiles(prev => {
       const existing = new Set(prev.map(f => f.name + f.size))
-      const unique = arr.filter(f => !existing.has(f.name + f.size))
+      const unique = accepted.filter(f => !existing.has(f.name + f.size))
       return [...prev, ...unique]
     })
   }, [])
@@ -1019,7 +1223,7 @@ function UploadModal({ open, onClose, onConfirm }: {
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
           <h2 className="text-base font-semibold text-white flex items-center gap-2">
             <Upload className="w-4 h-4 text-blue-400" />
-            Upload to Workspace
+            {t('chat.uploadToWorkspaceTitle')}
           </h2>
           <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
             <X className="w-4 h-4" />
@@ -1046,7 +1250,7 @@ function UploadModal({ open, onClose, onConfirm }: {
             />
             <Paperclip className="w-8 h-8 text-gray-500 mx-auto mb-2" />
             <p className="text-sm text-gray-400">
-              Drag & drop files here, or <span className="text-blue-400">click to browse</span>
+              {t('chat.dragDropFiles')} <span className="text-blue-400">{t('chat.clickToBrowse')}</span>
             </p>
           </div>
 
@@ -1059,7 +1263,7 @@ function UploadModal({ open, onClose, onConfirm }: {
                     <FileIcon className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
                     <span className="text-sm text-gray-300 truncate">{file.name}</span>
                     <span className="text-xs text-gray-600 flex-shrink-0">
-                      {file.size < 1024 ? `${file.size} B` : `${(file.size / 1024).toFixed(1)} KB`}
+                      {formatFileSize(file.size)}
                     </span>
                   </div>
                   <button onClick={() => removeFile(i)} className="text-gray-500 hover:text-red-400 transition-colors flex-shrink-0 ml-2">
@@ -1069,19 +1273,29 @@ function UploadModal({ open, onClose, onConfirm }: {
               ))}
             </div>
           )}
+
+          {/* Rejected files warning */}
+          {rejectedFiles.length > 0 && (
+            <div className="mt-3 px-3 py-2 bg-red-900/30 border border-red-700/50 rounded-lg">
+              <p className="text-xs text-red-400 font-medium mb-1">{t('chat.fileTooLarge')}</p>
+              {rejectedFiles.map((name, i) => (
+                <p key={i} className="text-xs text-red-400/70 truncate">{name}</p>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-gray-800">
           <button onClick={onClose} className="px-4 py-1.5 text-sm text-gray-400 hover:text-white rounded-lg hover:bg-gray-800 transition-colors">
-            Cancel
+            {t('chat.cancel')}
           </button>
           <button
             onClick={() => { onConfirm(files); onClose() }}
             disabled={files.length === 0}
             className="px-4 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Upload {files.length > 0 ? `(${files.length})` : ''}
+            {t('chat.upload')} {files.length > 0 ? `(${files.length})` : ''}
           </button>
         </div>
       </div>
@@ -1094,12 +1308,19 @@ function UploadModal({ open, onClose, onConfirm }: {
 // ============================================================================
 
 interface MessageInputProps {
-  onSend: (message: string) => void
+  onSend: (message: string, mentionAgentId?: string, attachedImages?: string[]) => void
   onStop: () => void
-  onUpload: (files: File[]) => void
+  /** Upload files and return the workspace paths of successfully uploaded files. */
+  onUpload: (files: File[]) => Promise<string[]>
   sessionId: string | null
+  businessScopeId: string | null
   disabled?: boolean
   isSending?: boolean
+  selectedModel: string | null
+  onModelChange: (model: string | null) => void
+  selectedProviderId: string | null
+  onProviderChange: (providerId: string | null) => void
+  scopeDefaultModel?: string | null
 }
 
 /** Flatten a FileNode tree into a list of file paths. */
@@ -1113,11 +1334,21 @@ function flattenFiles(nodes: FileNode[], prefix = ''): string[] {
   return result
 }
 
-function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, isSending = false }: MessageInputProps) {
+function MessageInput({ onSend, onStop, onUpload, sessionId, businessScopeId, disabled = false, isSending = false, selectedModel, onModelChange, selectedProviderId, onProviderChange, scopeDefaultModel }: MessageInputProps) {
   const { t } = useTranslation()
   const [input, setInput] = useState('')
   const [showUpload, setShowUpload] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Pasted image attachments (from clipboard Cmd+V)
+  const [pastedImages, setPastedImages] = useState<File[]>([])
+  const [pastedPreviews, setPastedPreviews] = useState<string[]>([])
+
+  // Unified model selector state: one dropdown, models grouped by provider.
+  const [showModelPicker, setShowModelPicker] = useState(false)
+  const [modelGroups, setModelGroups] = useState<Array<{ provider: ModelProvider; models: Array<{ id: string; litellm_model: string; provider: string }> }>>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const modelPickerRef = useRef<HTMLDivElement>(null)
 
   // File autocomplete state
   const [allFiles, setAllFiles] = useState<string[]>([])
@@ -1127,6 +1358,13 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
   const [atStart, setAtStart] = useState(-1) // cursor position of the '@'
   const acRef = useRef<HTMLDivElement>(null)
 
+  // Agent @mention state
+  const [mentionVisible, setMentionVisible] = useState(false)
+  const [mentionQuery, setMentionQuery] = useState('')
+  const [mentionAtStart, setMentionAtStart] = useState(-1)
+  const [mentionedAgent, setMentionedAgent] = useState<MentionAgent | null>(null)
+  const mentionPopupRef = useRef<AgentMentionPopupHandle>(null)
+
   // Fetch workspace files when sessionId changes
   useEffect(() => {
     if (!sessionId) { setAllFiles([]); return }
@@ -1134,6 +1372,85 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
       .then(res => setAllFiles(flattenFiles(res.files)))
       .catch(() => setAllFiles([]))
   }, [sessionId])
+
+  // Load enabled providers into one grouped list. Chat offers ONLY the single
+  // model the admin configured on each provider (its defaultModelId) — for both
+  // bedrock and litellm. We never fetch the provider's full catalog here:
+  // listing every Bedrock region model or every gateway model would flood the
+  // picker; the admin already picked the intended model at setup time.
+  useEffect(() => {
+    if (!showModelPicker || modelGroups.length > 0) return
+    let cancelled = false
+    setModelsLoading(true)
+    ;(async () => {
+      try {
+        const providers = (await modelProviderService.list()).filter(p => p.enabled)
+        const groups = providers.map((provider) => {
+          const models = provider.defaultModelId
+            ? [{ id: provider.defaultModelId, litellm_model: provider.defaultModelId, provider: provider.type }]
+            : []
+          return { provider, models }
+        })
+        if (!cancelled) setModelGroups(groups)
+      } catch {
+        if (!cancelled) setModelGroups([])
+      } finally {
+        if (!cancelled) setModelsLoading(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [showModelPicker, modelGroups.length])
+
+  // Close model picker on click outside
+  useEffect(() => {
+    if (!showModelPicker) return
+    const handler = (e: MouseEvent) => {
+      if (modelPickerRef.current && !modelPickerRef.current.contains(e.target as Node)) {
+        setShowModelPicker(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showModelPicker])
+
+  // Clean up pasted image preview URLs on unmount or when images change
+  useEffect(() => {
+    return () => {
+      pastedPreviews.forEach(url => URL.revokeObjectURL(url))
+    }
+  }, [pastedPreviews])
+
+  const addPastedImage = useCallback((file: File) => {
+    setPastedImages(prev => [...prev, file])
+    setPastedPreviews(prev => [...prev, URL.createObjectURL(file)])
+  }, [])
+
+  const removePastedImage = useCallback((index: number) => {
+    setPastedPreviews(prev => {
+      URL.revokeObjectURL(prev[index])
+      return prev.filter((_, i) => i !== index)
+    })
+    setPastedImages(prev => prev.filter((_, i) => i !== index))
+  }, [])
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData.items
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.type.startsWith('image/')) {
+        e.preventDefault()
+        const file = item.getAsFile()
+        if (file) {
+          // Generate a meaningful filename with timestamp
+          const ext = item.type.split('/')[1] || 'png'
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+          const namedFile = new File([file], `clipboard-${timestamp}.${ext}`, { type: file.type })
+          addPastedImage(namedFile)
+        }
+        return // Only handle the first image
+      }
+    }
+  }, [addPastedImage])
 
   const filtered = acVisible
     ? allFiles.filter(f => f.toLowerCase().includes(acQuery.toLowerCase())).slice(0, 12)
@@ -1144,6 +1461,12 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
     setAcQuery('')
     setAtStart(-1)
     setAcIndex(0)
+  }, [])
+
+  const dismissMention = useCallback(() => {
+    setMentionVisible(false)
+    setMentionQuery('')
+    setMentionAtStart(-1)
   }, [])
 
   const selectFile = useCallback((filePath: string) => {
@@ -1163,6 +1486,25 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
     }, 0)
   }, [input, atStart, dismissAc])
 
+  const selectMentionAgent = useCallback((agent: MentionAgent) => {
+    // Replace the @query text with @DisplayName and store the agent
+    const before = input.slice(0, mentionAtStart)
+    const cursor = inputRef.current?.selectionStart ?? input.length
+    const after = input.slice(cursor)
+    const newInput = `${before}@${agent.displayName} ${after}`
+    setInput(newInput)
+    setMentionedAgent(agent)
+    dismissMention()
+    // Refocus
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.focus()
+        const pos = before.length + 1 + agent.displayName.length + 1
+        inputRef.current.setSelectionRange(pos, pos)
+      }
+    }, 0)
+  }, [input, mentionAtStart, dismissMention])
+
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value
     setInput(val)
@@ -1175,26 +1517,104 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
       if (val[i] === '@') { foundAt = i; break }
     }
 
-    if (foundAt >= 0 && allFiles.length > 0) {
+    if (foundAt >= 0) {
       const query = val.slice(foundAt + 1, cursor)
-      setAtStart(foundAt)
-      setAcQuery(query)
-      setAcVisible(true)
-      setAcIndex(0)
+      // Determine if this is a file @ or agent @mention
+      // Agent @mention: triggered when @ is at position 0 or preceded by space/newline,
+      // and we have a business scope selected. File @ takes priority if workspace has files.
+      const isStartOfToken = foundAt === 0 || val[foundAt - 1] === ' ' || val[foundAt - 1] === '\n'
+
+      if (isStartOfToken && businessScopeId) {
+        // Show agent mention popup
+        setMentionAtStart(foundAt)
+        setMentionQuery(query)
+        setMentionVisible(true)
+        // Hide file autocomplete
+        dismissAc()
+      } else if (allFiles.length > 0) {
+        // Show file autocomplete
+        setAtStart(foundAt)
+        setAcQuery(query)
+        setAcVisible(true)
+        setAcIndex(0)
+        dismissMention()
+      } else {
+        dismissAc()
+        dismissMention()
+      }
     } else {
       dismissAc()
+      dismissMention()
     }
-  }, [allFiles, dismissAc])
 
-  const handleSubmit = useCallback(() => {
-    if (input.trim() && !disabled) {
-      onSend(input.trim())
-      setInput('')
-      dismissAc()
+    // If user deletes the @mention text, clear the mentioned agent
+    if (mentionedAgent && !val.includes(`@${mentionedAgent.displayName}`)) {
+      setMentionedAgent(null)
     }
-  }, [input, disabled, onSend, dismissAc])
+  }, [allFiles, businessScopeId, mentionedAgent, dismissAc, dismissMention])
+
+  const handleSubmit = useCallback(async () => {
+    if ((input.trim() || pastedImages.length > 0) && !disabled) {
+      const messageContent = input.trim()
+
+      // Snapshot inputs before clearing them, so an async upload doesn't
+      // see empty state.
+      const imagesToUpload = pastedImages.length > 0 ? [...pastedImages] : []
+
+      // Clear input immediately so UX feels snappy; upload runs in background.
+      setInput('')
+      const mentionAgent = mentionedAgent
+      setMentionedAgent(null)
+      setPastedImages([])
+      setPastedPreviews(prev => { prev.forEach(url => URL.revokeObjectURL(url)); return [] })
+      dismissAc()
+      dismissMention()
+
+      // If there are images, upload first to get workspace paths, then send.
+      // The workspace paths are persisted with the message for history display.
+      let attachedImagePaths: string[] | undefined
+      if (imagesToUpload.length > 0) {
+        try {
+          const paths = await onUpload(imagesToUpload)
+          if (paths.length > 0) attachedImagePaths = paths
+        } catch (err) {
+          console.error('Image upload failed:', err)
+        }
+      }
+
+      if (messageContent) {
+        onSend(messageContent, mentionAgent?.id, attachedImagePaths)
+      }
+    }
+  }, [input, pastedImages, disabled, onSend, onUpload, mentionedAgent, dismissAc, dismissMention])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Agent mention popup keyboard navigation
+    if (mentionVisible && mentionPopupRef.current?.hasItems) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        mentionPopupRef.current.moveDown()
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        mentionPopupRef.current.moveUp()
+        return
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault()
+        const agent = mentionPopupRef.current.confirm()
+        if (agent) selectMentionAgent(agent)
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        dismissMention()
+        return
+      }
+    }
+
+    // File autocomplete keyboard navigation
     if (acVisible && filtered.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
@@ -1241,68 +1661,183 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
   return (
     <>
       <UploadModal open={showUpload} onClose={() => setShowUpload(false)} onConfirm={onUpload} />
-      <div className="relative flex items-end gap-2 p-4 border-t border-gray-800 bg-gray-900">
-        {/* File autocomplete dropdown */}
-        {acVisible && filtered.length > 0 && (
-          <div
-            ref={acRef}
-            className="absolute bottom-full left-16 right-16 mb-1 max-h-56 overflow-y-auto bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50"
-          >
-            {filtered.map((f, i) => (
+      <div className="relative flex flex-col border-t border-gray-800 bg-gray-900">
+        {/* Mentioned agent pill — shown above the input when an agent is @mentioned */}
+        {mentionedAgent && (
+          <div className="flex items-center gap-2 px-4 pt-2">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-600/20 text-blue-300 text-xs rounded-full border border-blue-500/30">
+              <Bot className="w-3 h-3" />
+              @{mentionedAgent.displayName}
               <button
-                key={f}
-                onMouseDown={(e) => { e.preventDefault(); selectFile(f) }}
-                className={`flex items-center gap-2 w-full px-3 py-1.5 text-left text-sm transition-colors ${
-                  i === acIndex ? 'bg-blue-600/30 text-white' : 'text-gray-300 hover:bg-gray-700'
-                }`}
+                onClick={() => setMentionedAgent(null)}
+                className="hover:text-white ml-0.5 transition-colors"
+                title={t('chat.removeMention')}
               >
-                <FileIcon className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
-                <span className="truncate">{f}</span>
+                <X className="w-3 h-3" />
               </button>
+            </span>
+            <span className="text-xs text-gray-500">{t('chat.mentionRouteHint')}</span>
+          </div>
+        )}
+
+        {/* Pasted image previews */}
+        {pastedImages.length > 0 && (
+          <div className="flex items-center gap-2 px-4 pt-2 overflow-x-auto">
+            {pastedPreviews.map((url, i) => (
+              <div key={i} className="relative group flex-shrink-0">
+                <img
+                  src={url}
+                  alt={pastedImages[i]?.name || 'pasted image'}
+                  className="w-16 h-16 object-cover rounded-lg border border-gray-700"
+                />
+                <button
+                  onClick={() => removePastedImage(i)}
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 rounded-full flex items-center justify-center
+                             opacity-0 group-hover:opacity-100 transition-opacity shadow-lg"
+                  title={t('chat.removeImage')}
+                >
+                  <X className="w-3 h-3 text-white" />
+                </button>
+                <span className="absolute bottom-0 left-0 right-0 text-[9px] text-center text-gray-400 bg-black/60 rounded-b-lg px-1 truncate">
+                  {pastedImages[i]?.name?.replace('clipboard-', '').split('.')[0] || 'image'}
+                </span>
+              </div>
             ))}
           </div>
         )}
 
-        <button
-          onClick={() => setShowUpload(true)}
-          disabled={isSending}
-          className="p-2 text-gray-400 hover:text-white rounded-lg hover:bg-gray-800 transition-colors
-                     disabled:opacity-50 disabled:cursor-not-allowed"
-          title="Upload files to workspace"
-        >
-          <Paperclip className="w-5 h-5" />
-        </button>
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          onBlur={() => setTimeout(dismissAc, 150)}
-          placeholder={t('chat.placeholder')}
-          disabled={disabled}
-          rows={1}
-          className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg resize-none
-                     text-white placeholder-gray-500 focus:outline-none focus:border-blue-500
-                     disabled:opacity-50 disabled:cursor-not-allowed"
-        />
-        {isSending ? (
+        <div className="relative flex items-end gap-2 p-4">
+          {/* Agent mention popup */}
+          {mentionVisible && businessScopeId && (
+            <AgentMentionPopup
+              ref={mentionPopupRef}
+              scopeId={businessScopeId}
+              query={mentionQuery}
+              onSelect={selectMentionAgent}
+            />
+          )}
+
+          {/* File autocomplete dropdown */}
+          {acVisible && filtered.length > 0 && (
+            <div
+              ref={acRef}
+              className="absolute bottom-full left-16 right-16 mb-1 max-h-56 overflow-y-auto bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50"
+            >
+              {filtered.map((f, i) => (
+                <button
+                  key={f}
+                  onMouseDown={(e) => { e.preventDefault(); selectFile(f) }}
+                  className={`flex items-center gap-2 w-full px-3 py-1.5 text-left text-sm transition-colors ${
+                    i === acIndex ? 'bg-blue-600/30 text-white' : 'text-gray-300 hover:bg-gray-700'
+                  }`}
+                >
+                  <FileIcon className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
+                  <span className="truncate">{f}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
           <button
-            onClick={onStop}
-            className="p-2 bg-red-600 border border-red-600 rounded-lg hover:bg-red-500 hover:border-red-500 transition-colors"
-            title="Stop generation"
+            onClick={() => setShowUpload(true)}
+            disabled={isSending}
+            className="p-2 text-gray-400 hover:text-white rounded-lg hover:bg-gray-800 transition-colors
+                       disabled:opacity-50 disabled:cursor-not-allowed"
+            title={t('chat.uploadToWorkspace')}
           >
-            <Square className="w-5 h-5 text-white fill-white" />
+            <Paperclip className="w-5 h-5" />
           </button>
-        ) : (
-          <button
-            onClick={handleSubmit}
-            disabled={disabled || !input.trim()}
-            className="p-2 bg-blue-600 border border-blue-600 rounded-lg hover:bg-blue-500 hover:border-blue-500 transition-colors
-                       disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600"
-          >
-            <Send className="w-5 h-5 text-white" />
-          </button>
-        )}
+
+          {/* Model selector — per-invocation model override (works in AgentCore + local runtimes) */}
+          <div className="relative" ref={modelPickerRef}>
+            <button
+              type="button"
+              onClick={() => setShowModelPicker(v => !v)}
+              disabled={isSending}
+              className="flex items-center gap-1 p-2 text-gray-400 hover:text-white rounded-lg hover:bg-gray-800 transition-colors disabled:opacity-50 max-w-[160px]"
+              title={t('chat.selectModel')}
+            >
+              <Cpu className="w-5 h-5 shrink-0" />
+              {selectedModel && (
+                <span className="text-xs truncate font-mono">{selectedModel}</span>
+              )}
+            </button>
+            {showModelPicker && (
+              <div className="absolute bottom-full mb-2 left-0 w-72 max-h-96 overflow-y-auto bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 py-1">
+                {/* Default (use scope/org default) */}
+                <button
+                  onClick={() => { onProviderChange?.(null); onModelChange?.(null); setShowModelPicker(false) }}
+                  className={`w-full text-left px-3 py-2 text-xs hover:bg-gray-700 ${!selectedProviderId && !selectedModel ? 'text-blue-400' : 'text-gray-300'}`}
+                >
+                  {scopeDefaultModel ? `${t('chat.scopeDefault')} (${scopeDefaultModel})` : t('chat.scopeDefault')}
+                </button>
+
+                {modelsLoading ? (
+                  <div className="px-3 py-2 text-xs text-gray-500">Loading…</div>
+                ) : modelGroups.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-gray-500">{t('chat.noModels')}</div>
+                ) : (
+                  modelGroups.map(({ provider, models }) => (
+                    <div key={provider.id}>
+                      <div className="mt-1 border-t border-gray-700 px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+                        {provider.name}{provider.isOrgDefault ? ' ★' : ''}
+                      </div>
+                      {models.length === 0 ? (
+                        <div className="px-3 py-1.5 text-[11px] text-gray-600 italic">{t('chat.noModels')}</div>
+                      ) : (
+                        models.map(m => {
+                          const active = selectedProviderId === provider.id && selectedModel === m.litellm_model
+                          return (
+                            <button
+                              key={`${provider.id}:${m.litellm_model}`}
+                              onClick={() => { onProviderChange?.(provider.id); onModelChange?.(m.litellm_model); setShowModelPicker(false) }}
+                              className={`w-full text-left px-3 py-2 text-xs font-mono hover:bg-gray-700 ${active ? 'text-blue-400' : 'text-gray-300'}`}
+                            >
+                              {m.litellm_model}
+                            </button>
+                          )
+                        })
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            onBlur={() => setTimeout(() => { dismissAc(); dismissMention() }, 150)}
+            placeholder={businessScopeId ? t('chat.placeholderWithMention') : t('chat.placeholder')}
+            disabled={disabled}
+            rows={1}
+            className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg resize-none
+                       text-white placeholder-gray-500 focus:outline-none focus:border-blue-500
+                       disabled:opacity-50 disabled:cursor-not-allowed"
+          />
+          {isSending ? (
+            <button
+              onClick={onStop}
+              className="p-2 bg-red-600 border border-red-600 rounded-lg hover:bg-red-500 hover:border-red-500 transition-colors"
+              title={t('chat.stopGeneration')}
+            >
+              <Square className="w-5 h-5 text-white fill-white" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSubmit}
+              disabled={disabled || (!input.trim() && pastedImages.length === 0)}
+              className="p-2 bg-blue-600 border border-blue-600 rounded-lg hover:bg-blue-500 hover:border-blue-500 transition-colors
+                         disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600"
+            >
+              <Send className="w-5 h-5 text-white" />
+            </button>
+          )}
+        </div>
       </div>
     </>
   )
@@ -1315,6 +1850,11 @@ function MessageInput({ onSend, onStop, onUpload, sessionId, disabled = false, i
 function ChatInterfaceContent() {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const toast = useToast()
+  const toastRef = useRef(toast)
+  toastRef.current = toast
+  // Track recently uploaded file names to include as context in the next message
+  const recentlyUploadedFilesRef = useRef<string[]>([])
   const {
     messages,
     quickQuestions,
@@ -1325,6 +1865,7 @@ function ChatInterfaceContent() {
     isLoading,
     isSending,
     error,
+    errorCode,
     sendMessage,
     stopGeneration,
     setSelectedAgent,
@@ -1333,7 +1874,48 @@ function ChatInterfaceContent() {
     loadSession,
     startNewSession,
     clearConversation,
+    selectedModel,
+    setSelectedModel,
+    selectedProviderId,
+    setSelectedProviderId,
   } = useContext(ChatContext)
+
+  // Fetch scope's default model when scope changes
+  const [scopeDefaultModel, setScopeDefaultModel] = useState<string | null>(null)
+  useEffect(() => {
+    if (!selectedBusinessScopeId) { setScopeDefaultModel(null); return }
+    restClient.get<any>(`/api/business-scopes/${selectedBusinessScopeId}`)
+      .then(res => {
+        const modelId = res?.settings?.modelId as string | undefined
+        setScopeDefaultModel(modelId || null)
+      })
+      .catch(() => setScopeDefaultModel(null))
+  }, [selectedBusinessScopeId])
+
+  // Auto-send initial prompt from showcase "Run" button
+  const autoPromptSent = useRef(false)
+  useEffect(() => {
+    if (autoPromptSent.current) return
+    const params = new URLSearchParams(window.location.search)
+    const prompt = params.get('prompt')
+    // Send when: we have a prompt, loading is done, not already sending,
+    // scope is selected (required by sendMessage), and no existing messages
+    // (fresh session from showcase). We intentionally don't check backendSessionId
+    // because ChatContext eagerly creates a session on mount, which would cause
+    // a race: if ensureSession completes before isLoading flips false, backendSessionId
+    // gets set and this effect skips forever. Checking messages.length === 0 is a
+    // more reliable signal that this is a fresh session ready for the showcase prompt.
+    if (prompt && !isLoading && !isSending && selectedBusinessScopeId && messages.length === 0) {
+      autoPromptSent.current = true
+      // Clean the URL so refreshing doesn't re-send
+      const cleanParams = new URLSearchParams(window.location.search)
+      cleanParams.delete('prompt')
+      cleanParams.delete('showcase_case_id')
+      const cleanUrl = cleanParams.toString() ? `${window.location.pathname}?${cleanParams}` : window.location.pathname
+      window.history.replaceState({}, '', cleanUrl)
+      sendMessage(prompt)
+    }
+  }, [isLoading, isSending, selectedBusinessScopeId, messages.length, sendMessage])
 
   // Track workspace + session refresh — increment after each completed response
   const [wsRefreshKey, setWsRefreshKey] = useState(0)
@@ -1347,17 +1929,22 @@ function ChatInterfaceContent() {
     prevSending.current = isSending
   }, [isSending])
 
-  // Also refresh session list when a new backend session is created
+  // Also refresh session list and workspace actions when a new backend session is created
   const prevBackendSessionId = useRef(backendSessionId)
   useEffect(() => {
     if (backendSessionId && backendSessionId !== prevBackendSessionId.current) {
       setSessionRefreshKey(k => k + 1)
+      setWsRefreshKey(k => k + 1)
     }
     prevBackendSessionId.current = backendSessionId
   }, [backendSessionId])
 
   // Resizable workspace panel
   const [panelWidth, setPanelWidth] = useState(288) // 18rem ≈ 288px
+  const [workspaceMode, setWorkspaceMode] = useState<'artifacts' | 'files'>('artifacts')
+  const [panelCollapsed, setPanelCollapsed] = useState(false)
+  // When a file is being previewed, collapse side panels for a clean left-chat / right-preview layout
+  const [previewingFile, setPreviewingFile] = useState<{ path: string; name: string } | null>(null)
 
   // Tab state: 'chat' is always present, file tabs are added dynamically
   const [fileTabs, setFileTabs] = useState<FileTab[]>([])
@@ -1366,27 +1953,29 @@ function ChatInterfaceContent() {
   const [showCreateRoom, setShowCreateRoom] = useState(false)
 
   const handleFileOpen = useCallback((path: string, name: string) => {
-    const preview = isPreviewableFile(name)
-    const tabId = preview ? `preview:${path}` : path
-    // If tab already open, just activate it
-    if (fileTabs.some(t => t.id === tabId)) {
-      setActiveTab(tabId)
-      return
-    }
-    setFileTabs(prev => [...prev, {
-      id: tabId,
-      name,
-      path,
-      kind: preview ? 'preview' : 'file',
-    }])
+    // Open file as a tab in the main content area (used by workspace panel)
+    const tabId = `file:${path}`
+    setFileTabs(prev => {
+      const existing = prev.find(t => t.id === tabId)
+      if (existing) return prev // already open
+      return [...prev, { id: tabId, name, path, kind: 'file' as const }]
+    })
     setActiveTab(tabId)
-  }, [fileTabs])
+  }, [])
+
+  // Open file in left-right split view (used by chat artifact "查看" button)
+  const handleArtifactView = useCallback((path: string, name: string) => {
+    setPreviewingFile({ path, name })
+  }, [])
 
   const handleCloseTab = useCallback((tabId: string, e: React.MouseEvent) => {
     e.stopPropagation()
     setFileTabs(prev => prev.filter(t => t.id !== tabId))
-    // If closing the active tab, switch to chat
-    if (activeTab === tabId) setActiveTab('chat')
+    // If closing the active tab, switch to chat and exit preview mode
+    if (activeTab === tabId) {
+      setActiveTab('chat')
+      setPreviewingFile(null)
+    }
   }, [activeTab])
 
   // -----------------------------------------------------------------------
@@ -1400,9 +1989,12 @@ function ChatInterfaceContent() {
     const onKeyDown = (e: KeyboardEvent) => {
       // Alt+W — close active in-app tab
       if (e.altKey && !e.metaKey && !e.ctrlKey && e.key === 'w') {
-        if (fileTabs.length === 0) return
+        if (fileTabs.length === 0 && !previewingFile) return
         e.preventDefault()
-        if (activeTab !== 'chat') {
+        if (previewingFile) {
+          setPreviewingFile(null)
+          setActiveTab('chat')
+        } else if (activeTab !== 'chat') {
           setFileTabs(prev => prev.filter(t => t.id !== activeTab))
           setActiveTab('chat')
         } else {
@@ -1430,6 +2022,16 @@ function ChatInterfaceContent() {
     return () => window.removeEventListener('preview-ready', onPreviewReady)
   }, [])
 
+  // Listen for artifact-view events (fallback when onArtifactView prop doesn't reach)
+  useEffect(() => {
+    const onArtifactView = (e: Event) => {
+      const { path, name } = (e as CustomEvent).detail
+      if (path && name) handleArtifactView(path, name)
+    }
+    window.addEventListener('artifact-view', onArtifactView)
+    return () => window.removeEventListener('artifact-view', onArtifactView)
+  }, [handleArtifactView])
+
   const handleSelectSession = useCallback((sessionId: string) => {
     setFileTabs([])
     setActiveTab('chat')
@@ -1444,33 +2046,75 @@ function ChatInterfaceContent() {
     setSessionRefreshKey(k => k + 1)
   }, [startNewSession])
 
-  const handleSendMessage = useCallback(async (content: string) => {
+  const handleSendMessage = useCallback(async (content: string, mentionAgentId?: string, attachedImages?: string[]) => {
     // Switch to chat tab when sending a message
     setActiveTab('chat')
-    await sendMessage(content)
+    // Include recently uploaded files as context, then clear the list
+    const files = recentlyUploadedFilesRef.current.length > 0
+      ? [...recentlyUploadedFilesRef.current]
+      : undefined
+    recentlyUploadedFilesRef.current = []
+    await sendMessage(content, mentionAgentId, files, attachedImages)
   }, [sendMessage])
 
-  const handleUploadFile = useCallback(async (files: File[]) => {
-    if (!backendSessionId || files.length === 0) return
+  const handleUploadFile = useCallback(async (files: File[]): Promise<string[]> => {
+    if (!backendSessionId || files.length === 0) return []
+
+    const { success: showSuccess, error: showError } = toastRef.current
+
+    let successCount = 0
+    let failCount = 0
+    const uploadedNames: string[] = []
+
     for (const file of files) {
-      const reader = new FileReader()
-      await new Promise<void>((resolve) => {
-        reader.onload = async () => {
-          const base64 = (reader.result as string).split(',')[1]
-          try {
-            await restClient.post(`/api/chat/sessions/${backendSessionId}/workspace/upload`, {
-              fileName: file.name,
-              content: base64,
-            })
-          } catch (err) {
-            console.error('Upload failed:', file.name, err)
-          }
-          resolve()
+      try {
+        const formData = new FormData()
+        formData.append('file', file, file.name)
+
+        const token = (await import('@/services/auth')).getValidToken
+          ? await (await import('@/services/auth')).getValidToken()
+          : null
+        const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
+
+        const response = await fetch(
+          `${baseUrl}/api/chat/sessions/${backendSessionId}/workspace/upload-file`,
+          {
+            method: 'POST',
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            body: formData,
+          },
+        )
+
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}))
+          throw new Error(body.error || `HTTP ${response.status}`)
         }
-        reader.readAsDataURL(file)
-      })
+
+        successCount++
+        uploadedNames.push(file.name)
+      } catch (err) {
+        failCount++
+        console.error('Upload failed:', file.name, err)
+      }
     }
+
+    // Track uploaded file names so the next message includes them as context
+    if (uploadedNames.length > 0) {
+      recentlyUploadedFilesRef.current = [
+        ...recentlyUploadedFilesRef.current,
+        ...uploadedNames,
+      ]
+    }
+
+    if (successCount > 0) {
+      showSuccess(`${successCount} file(s) uploaded`)
+    }
+    if (failCount > 0) {
+      showError(`${failCount} file(s) failed to upload`)
+    }
+
     setWsRefreshKey(k => k + 1)
+    return uploadedNames
   }, [backendSessionId])
 
   const handleQuickQuestionClick = useCallback((question: QuickQuestion) => {
@@ -1490,14 +2134,16 @@ function ChatInterfaceContent() {
 
   return (
     <div className="flex h-full">
-      {/* Session history panel (left) */}
-      <SessionHistoryPanel
-        businessScopeId={selectedBusinessScopeId}
-        activeSessionId={backendSessionId}
-        onSelectSession={handleSelectSession}
-        onNewSession={handleNewSession}
-        refreshKey={sessionRefreshKey}
-      />
+      {/* Session history panel (left) — hidden during file preview */}
+      {!previewingFile && (
+        <SessionHistoryPanel
+          businessScopeId={selectedBusinessScopeId}
+          activeSessionId={backendSessionId}
+          onSelectSession={handleSelectSession}
+          onNewSession={handleNewSession}
+          refreshKey={sessionRefreshKey}
+        />
+      )}
 
       {/* Main content area */}
       <div className="flex-1 flex flex-col min-w-0">
@@ -1520,10 +2166,10 @@ function ChatInterfaceContent() {
             <button
               onClick={() => setShowCreateRoom(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600/20 border border-purple-500/30 rounded-lg hover:bg-purple-600/30 transition-colors text-sm text-purple-300"
-              title="Create a group chat room with multiple agents"
+              title={t('chat.groupChatHint')}
             >
               <Users className="w-4 h-4" />
-              <span>Group Chat</span>
+              <span>{t('chat.groupChat')}</span>
             </button>
           </div>
           <div className="flex items-center gap-1">
@@ -1531,19 +2177,19 @@ function ChatInterfaceContent() {
               <button
                 onClick={() => setShowSaveMemory(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-purple-400 hover:bg-purple-500/10 rounded-lg transition-colors"
-                title="Save session to scope memory"
+                title={t('chat.saveToMemoryHint')}
               >
                 <Brain className="w-3.5 h-3.5" />
-                <span>Save to Memory</span>
+                <span>{t('chat.saveToMemory')}</span>
               </button>
             )}
             <button
               onClick={clearConversation}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-              title="Clear conversation"
+              title={t('chat.clearConversation')}
             >
               <Trash2 className="w-3.5 h-3.5" />
-              <span>Clear</span>
+              <span>{t('chat.clear')}</span>
             </button>
           </div>
         </div>
@@ -1584,7 +2230,7 @@ function ChatInterfaceContent() {
                   role="button"
                   onClick={(e) => handleCloseTab(tab.id, e)}
                   className="ml-1 rounded hover:bg-gray-600 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
-                  title="Close tab (⌥W)"
+                  title={`${t('chat.closeTab')} (⌥W)`}
                 >
                   <X className="w-3 h-3" />
                 </span>
@@ -1595,10 +2241,23 @@ function ChatInterfaceContent() {
 
         {/* Error Banner */}
         {error && (
-          <div className="mx-4 mt-4 flex items-center gap-2 px-4 py-2 bg-red-500/20 border border-red-500/50 rounded-lg">
-            <AlertCircle className="w-4 h-4 text-red-400" />
-            <span className="text-sm text-red-400 flex-1">{error}</span>
-            <button onClick={clearError} className="text-red-400 hover:text-red-300">
+          <div className={`mx-4 mt-4 flex items-center gap-2 px-4 py-2 rounded-lg ${
+            errorCode === 'QUOTA_EXCEEDED'
+              ? 'bg-orange-500/20 border border-orange-500/50'
+              : 'bg-red-500/20 border border-red-500/50'
+          }`}>
+            <AlertCircle className={`w-4 h-4 ${errorCode === 'QUOTA_EXCEEDED' ? 'text-orange-400' : 'text-red-400'}`} />
+            <div className="flex-1">
+              <span className={`text-sm ${errorCode === 'QUOTA_EXCEEDED' ? 'text-orange-400' : 'text-red-400'}`}>
+                {errorCode === 'QUOTA_EXCEEDED'
+                  ? t('tokenQuota.exceededTitle')
+                  : error}
+              </span>
+              {errorCode === 'QUOTA_EXCEEDED' && (
+                <p className="text-xs text-orange-400/70 mt-0.5">{t('tokenQuota.contactAdmin')}</p>
+              )}
+            </div>
+            <button onClick={clearError} className={`${errorCode === 'QUOTA_EXCEEDED' ? 'text-orange-400 hover:text-orange-300' : 'text-red-400 hover:text-red-300'}`}>
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -1611,10 +2270,10 @@ function ChatInterfaceContent() {
               <div className="text-center">
                 <Layers className="w-16 h-16 text-gray-600 mx-auto mb-4" />
                 <h2 className="text-xl font-semibold text-white mb-2">
-                  Start a Conversation
+                  {t('chat.startConversation')}
                 </h2>
                 <p className="text-gray-400 max-w-md">
-                  Choose a business scope or an independent agent from the dropdown above to start chatting.
+                  {t('chat.startConversationHint')}
                 </p>
               </div>
             </div>
@@ -1627,14 +2286,14 @@ function ChatInterfaceContent() {
                   isLoading={quickQuestionsLoading}
                 />
               ) : (
-                <MessageList messages={messages} isTyping={isSending} />
+                <MessageList messages={messages} isTyping={isSending} onArtifactView={handleArtifactView} onSendMessage={handleSendMessage} />
               )}
               <WorkspaceActions
                 sessionId={backendSessionId}
                 refreshKey={wsRefreshKey}
                 onSendMessage={handleSendMessage}
               />
-              <MessageInput onSend={handleSendMessage} onStop={stopGeneration} onUpload={handleUploadFile} sessionId={backendSessionId} disabled={isSending} isSending={isSending} />
+              <MessageInput onSend={handleSendMessage} onStop={stopGeneration} onUpload={handleUploadFile} sessionId={backendSessionId} businessScopeId={selectedBusinessScopeId} disabled={isSending} isSending={isSending} selectedModel={selectedModel} onModelChange={setSelectedModel} selectedProviderId={selectedProviderId} onProviderChange={setSelectedProviderId} scopeDefaultModel={scopeDefaultModel} />
             </>
           )
         ) : (
@@ -1651,15 +2310,112 @@ function ChatInterfaceContent() {
         )}
       </div>
 
-      {/* Resizable workspace panel */}
-      <WorkspaceExplorer
-        sessionId={backendSessionId}
-        businessScopeId={selectedBusinessScopeId}
-        refreshKey={wsRefreshKey}
-        onFileOpen={handleFileOpen}
-        width={panelWidth}
-        onWidthChange={setPanelWidth}
-      />
+      {/* Right panel: workspace OR file preview */}
+      {previewingFile ? (
+        /* File preview mode — full right panel is the file viewer */
+        <div className="flex-1 flex flex-col border-l border-gray-800 min-w-0">
+          {/* Preview header with close button */}
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-800 bg-gray-900/50 flex-shrink-0">
+            <FileIcon className="w-3.5 h-3.5 text-blue-400" />
+            <span className="text-sm text-white truncate flex-1">{previewingFile.name}</span>
+            <button
+              onClick={() => { setPreviewingFile(null); setActiveTab('chat') }}
+              className="px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors"
+            >
+              关闭预览
+            </button>
+          </div>
+          {/* File content */}
+          {backendSessionId && (
+            <FileViewerTab path={previewingFile.path} sessionId={backendSessionId} />
+          )}
+        </div>
+      ) : (
+        /* Normal mode: workspace panel with mode toggle */
+        panelCollapsed ? (
+          /* Collapsed state — thin icon strip */
+          <div className="border-l border-gray-800 bg-gray-900 flex flex-col items-center py-3 px-1 gap-1 flex-shrink-0 w-12">
+            <button
+              onClick={() => setPanelCollapsed(false)}
+              className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+              title="展开面板"
+            >
+              <PanelRightOpen className="w-4 h-4" />
+            </button>
+          </div>
+        ) : (
+          <div
+            className="border-l border-gray-800 bg-gray-900 flex flex-col flex-shrink-0"
+            style={{ width: panelWidth, minWidth: 200 }}
+          >
+            {/* Mode toggle tabs + collapse button */}
+            <div className="flex border-b border-gray-800 flex-shrink-0">
+              <button
+                onClick={() => setWorkspaceMode('artifacts')}
+                className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+                  workspaceMode === 'artifacts'
+                    ? 'text-blue-400 border-b-2 border-blue-400 bg-gray-800/50'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                📋 产出物
+              </button>
+              <button
+                onClick={() => setWorkspaceMode('files')}
+                className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+                  workspaceMode === 'files'
+                    ? 'text-blue-400 border-b-2 border-blue-400 bg-gray-800/50'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                📁 文件管理
+              </button>
+              <button
+                onClick={() => setPanelCollapsed(true)}
+                className="px-2 py-2 text-gray-500 hover:text-white hover:bg-gray-800 transition-colors"
+                title="收起面板"
+              >
+                <PanelRightClose className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Panel content based on mode */}
+            <div className="flex-1 overflow-hidden">
+              {workspaceMode === 'artifacts' ? (
+                <ArtifactListPanel
+                  sessionId={backendSessionId}
+                  isGenerating={isSending}
+                  onFileOpen={handleFileOpen}
+                  onPreviewApp={(folder) => {
+                    if (!backendSessionId) return
+                    restClient.post<{ id: string; name: string; access_url: string }>('/api/apps/publish-from-workspace', {
+                      session_id: backendSessionId,
+                      folder_path: folder,
+                      name: 'preview',
+                      status: 'preview',
+                    }).then(res => {
+                      window.dispatchEvent(new CustomEvent('preview-ready', {
+                        detail: { url: res.access_url, name: res.name, appId: res.id },
+                      }))
+                    }).catch(err => console.error('[ArtifactPanel] preview failed:', err))
+                  }}
+                  refreshKey={wsRefreshKey}
+                />
+              ) : (
+                <WorkspaceExplorer
+                  sessionId={backendSessionId}
+                  businessScopeId={selectedBusinessScopeId}
+                  refreshKey={wsRefreshKey}
+                  isGenerating={isSending}
+                  onFileOpen={handleFileOpen}
+                  width={panelWidth}
+                  onWidthChange={setPanelWidth}
+                />
+              )}
+            </div>
+          </div>
+        )
+      )}
 
       {/* Save to Memory modal */}
       {showSaveMemory && backendSessionId && selectedBusinessScopeId && (
@@ -1686,8 +2442,30 @@ function ChatInterfaceContent() {
 }
 
 export function Chat() {
+  // Read URL params so showcase "Run" and other deep-links work
+  const params = new URLSearchParams(window.location.search)
+  const urlScope = params.get('scope') || undefined
+  const urlAgent = params.get('agent') || undefined
+  const urlSession = params.get('session') || undefined
+  const urlPrompt = params.get('prompt') || undefined
+
+  // If coming from showcase (has scope but no explicit session), force a fresh
+  // session by clearing the stored session so ChatProvider doesn't restore the old one.
+  if ((urlPrompt || urlScope) && !urlSession) {
+    localStorage.removeItem('super-agent-chat-backend-session')
+    RestChatService.resetSession()
+  }
+
+  // Use a key based on scope+prompt+timestamp to force remount when navigating from Showcase
+  const chatKey = `${urlScope || ''}-${urlSession || ''}-${params.get('t') || '0'}`
+
   return (
-    <ChatProvider>
+    <ChatProvider
+      key={chatKey}
+      initialSessionId={urlSession}
+      initialScopeId={urlScope}
+      initialAgentId={urlAgent}
+    >
       <div className="h-full">
         <ChatInterfaceContent />
       </div>
@@ -1704,6 +2482,7 @@ function CreateRoomQuickDialog({ selectedScopeId, onClose, onCreated }: {
   onClose: () => void;
   onCreated: (roomId: string) => void;
 }) {
+  const { t } = useTranslation()
   const [isCreating, setIsCreating] = useState(false)
 
   const handleCreateFromScope = async () => {
@@ -1722,9 +2501,9 @@ function CreateRoomQuickDialog({ selectedScopeId, onClose, onCreated }: {
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
       <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl" onClick={e => e.stopPropagation()}>
-        <h3 className="text-lg font-semibold text-white mb-4">Create Group Chat Room</h3>
+        <h3 className="text-lg font-semibold text-white mb-4">{t('chat.createGroupChatRoom')}</h3>
         <p className="text-sm text-gray-400 mb-6">
-          Create a room with multiple AI agents that can collaborate. Use @mention to talk to specific agents.
+          {t('chat.createGroupChatDesc')}
         </p>
 
         {selectedScopeId ? (
@@ -1733,17 +2512,17 @@ function CreateRoomQuickDialog({ selectedScopeId, onClose, onCreated }: {
             disabled={isCreating}
             className="w-full px-4 py-3 bg-purple-600 hover:bg-purple-500 disabled:bg-gray-700 text-white rounded-lg transition-colors text-sm font-medium"
           >
-            {isCreating ? 'Creating...' : 'Create from current scope (all agents)'}
+            {isCreating ? t('chat.creating') : t('chat.createFromScope')}
           </button>
         ) : (
-          <p className="text-sm text-yellow-400">Select a business scope first to create a group chat room.</p>
+          <p className="text-sm text-yellow-400">{t('chat.selectScopeFirst')}</p>
         )}
 
         <button
           onClick={onClose}
           className="w-full mt-3 px-4 py-2 text-gray-400 hover:text-white text-sm transition-colors"
         >
-          Cancel
+          {t('chat.cancel')}
         </button>
       </div>
     </div>

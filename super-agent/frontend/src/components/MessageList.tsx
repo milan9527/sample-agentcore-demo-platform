@@ -3,10 +3,13 @@ import { User } from 'lucide-react'
 import type { Message } from '@/types'
 import type { ContentBlock } from '@/services/chatStreamService'
 import { ChatMessage } from './chat/ChatMessage'
+import { useTranslation } from '@/i18n'
 
 interface MessageListProps {
   messages: Message[]
   isTyping?: boolean
+  onArtifactView?: (path: string, name: string) => void
+  onSendMessage?: (message: string) => void
 }
 
 function formatTime(date: Date): string {
@@ -39,9 +42,30 @@ function UserBubble({ message }: { message: Message }) {
         <User className="w-4 h-4 text-blue-400" />
       </div>
       <div className="flex flex-col max-w-[70%] items-end">
-        <div className="px-4 py-2 rounded-2xl bg-blue-600/15 border border-blue-500/20 text-white rounded-br-md">
-          <p className="text-sm whitespace-pre-wrap">{message.content}</p>
-        </div>
+        {message.attachedImages && message.attachedImages.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2 justify-end">
+            {message.attachedImages.map((url, i) => (
+              <a
+                key={i}
+                href={url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block"
+              >
+                <img
+                  src={url}
+                  alt={`attachment ${i + 1}`}
+                  className="max-w-[200px] max-h-[200px] object-cover rounded-lg border border-blue-500/20 hover:border-blue-400/50 transition-colors cursor-pointer"
+                />
+              </a>
+            ))}
+          </div>
+        )}
+        {message.content && (
+          <div className="px-4 py-2 rounded-2xl bg-blue-600/15 border border-blue-500/20 text-white rounded-br-md">
+            <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+          </div>
+        )}
         <span className="text-xs text-gray-500 mt-1 px-1">
           {formatTime(message.timestamp)}
         </span>
@@ -50,7 +74,41 @@ function UserBubble({ message }: { message: Message }) {
   )
 }
 
-function AIBubble({ message, isStreaming }: { message: Message; isStreaming?: boolean }) {
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
+function TokenUsageBadge({ message }: { message: Message }) {
+  const { tokenUsage, model } = message
+  if (!tokenUsage && !model) return null
+
+  const parts: string[] = []
+  if (model) {
+    // Show short model name: "claude-sonnet-4-20250514" → "sonnet-4"
+    const short = model
+      .replace(/^claude-/, '')
+      .replace(/-\d{8}$/, '')
+    parts.push(short)
+  }
+  if (tokenUsage) {
+    const input = tokenUsage.input_tokens ?? 0
+    const output = tokenUsage.output_tokens ?? 0
+    parts.push(`↑${formatTokenCount(input)} ↓${formatTokenCount(output)}`)
+    if (tokenUsage.cache_read_input_tokens && tokenUsage.cache_read_input_tokens > 0) {
+      parts.push(`cache ${formatTokenCount(tokenUsage.cache_read_input_tokens)}`)
+    }
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-600 ml-11 mt-0.5 select-none">
+      {parts.join(' · ')}
+    </span>
+  )
+}
+
+function AIBubble({ message, isStreaming, onArtifactView, onSendMessage }: { message: Message; isStreaming?: boolean; onArtifactView?: (path: string, name: string) => void; onSendMessage?: (message: string) => void }) {
   const contentBlocks = useMemo(
     () => tryParseContentBlocks(message.content),
     [message.content]
@@ -78,6 +136,8 @@ function AIBubble({ message, isStreaming }: { message: Message; isStreaming?: bo
             isStreaming={isStreaming}
             speakerAgentName={message.speakerAgentName}
             speakerAgentAvatar={message.speakerAgentAvatar}
+            onArtifactView={onArtifactView}
+            onSendMessage={onSendMessage}
           />
         </div>
       ) : (
@@ -96,6 +156,7 @@ function AIBubble({ message, isStreaming }: { message: Message; isStreaming?: bo
       <span className="text-xs text-gray-500 mt-1 px-1 ml-11">
         {formatTime(message.timestamp)}
       </span>
+      {!isStreaming && <TokenUsageBadge message={message} />}
     </div>
   )
 }
@@ -117,8 +178,9 @@ function TypingIndicator() {
   )
 }
 
-export function MessageList({ messages, isTyping = false }: MessageListProps) {
+export function MessageList({ messages, isTyping = false, onArtifactView, onSendMessage }: MessageListProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const { t } = useTranslation()
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -127,7 +189,7 @@ export function MessageList({ messages, isTyping = false }: MessageListProps) {
   if (messages.length === 0 && !isTyping) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-500">
-        <p>Start a conversation by sending a message</p>
+        <p>{t('chat.emptyState')}</p>
       </div>
     )
   }
@@ -141,6 +203,8 @@ export function MessageList({ messages, isTyping = false }: MessageListProps) {
               key={message.id}
               message={message}
               isStreaming={isTyping && idx === messages.length - 1}
+              onArtifactView={onArtifactView}
+              onSendMessage={onSendMessage}
             />
       ))}
       {isTyping && !messages.some(m => m.type === 'ai' && !m.content) && <TypingIndicator />}

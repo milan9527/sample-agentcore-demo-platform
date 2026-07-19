@@ -10,11 +10,13 @@ import type { AgentRuntime } from './agent-runtime.js';
 import { ClaudeAgentRuntime } from './agent-runtime-claude.js';
 import { AgentCoreAgentRuntime } from './agent-runtime-agentcore.js';
 import { OpenClawAgentRuntime } from './agent-runtime-openclaw.js';
+import { BerriAIAgentRuntime } from './agent-runtime-berriai.js';
 
-export type AgentRuntimeName = 'claude' | 'agentcore' | 'openclaw';
+export type AgentRuntimeName = 'claude' | 'agentcore' | 'openclaw' | 'berriai';
 
 function resolveRuntimeName(): AgentRuntimeName {
   const env = process.env.AGENT_RUNTIME?.toLowerCase().trim();
+  if (env === 'berriai') return 'berriai';
   if (env === 'openclaw') return 'openclaw';
   if (env === 'agentcore') return 'agentcore';
   return 'claude'; // default
@@ -22,6 +24,8 @@ function resolveRuntimeName(): AgentRuntimeName {
 
 function createRuntime(name: AgentRuntimeName): AgentRuntime {
   switch (name) {
+    case 'berriai':
+      return new BerriAIAgentRuntime();
     case 'openclaw':
       return new OpenClawAgentRuntime();
     case 'agentcore':

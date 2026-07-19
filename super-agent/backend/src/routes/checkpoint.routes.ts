@@ -191,4 +191,35 @@ export async function checkpointRoutes(fastify: FastifyInstance): Promise<void> 
       });
     }
   );
+
+  /**
+   * GET /api/workflows/checkpoints/processed
+   * List processed (resolved/cancelled/expired) checkpoints for the organization.
+   */
+  fastify.get(
+    '/checkpoints/processed',
+    { preHandler: [authenticate] },
+    async (request, reply) => {
+      const checkpoints = await checkpointService.listProcessed(request.user!.orgId);
+
+      return reply.status(200).send({
+        data: checkpoints.map(c => ({
+          id: c.id,
+          executionId: c.executionId,
+          nodeId: c.nodeId,
+          nodeTitle: c.nodeTitle,
+          checkpointType: c.checkpointType,
+          status: c.status,
+          config: c.config,
+          inputContext: c.inputContext,
+          result: c.result,
+          createdAt: c.createdAt,
+          resolvedAt: c.resolvedAt,
+          expiresAt: c.expiresAt,
+          resolvedBy: c.resolvedBy,
+          resolvedBySource: c.resolvedBySource,
+        })),
+      });
+    }
+  );
 }

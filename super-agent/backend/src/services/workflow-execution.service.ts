@@ -420,6 +420,51 @@ export class WorkflowExecutionService extends EventEmitter {
 
       // 9. Update status based on result
       if (result.success) {
+        // Check if node is paused (human approval)
+        if (result.paused) {
+          // Update node status to paused
+          await workflowExecutionRepository.updateNodeStatus(
+            executionId,
+            nodeId,
+            'paused',
+            {
+              outputData: result.output,
+            }
+          );
+
+          // Create checkpoint record for the approval inbox
+          try {
+            const { checkpointService } = await import('./checkpoint.service.js');
+            const checkpointConfig = (nodeData.data?.metadata as Record<string, unknown>)?.checkpointConfig as Record<string, unknown> | undefined;
+            const inputContext = await checkpointService.buildInputContext(executionId);
+
+            await checkpointService.create({
+              executionId,
+              nodeId,
+              nodeTitle: nodeData.data?.title || nodeId,
+              checkpointType: 'human_approval',
+              config: checkpointConfig || { instructions: nodeData.data?.contentPreview || '' },
+              inputContext,
+              organizationId: context.organizationId || '',
+              expiresInSeconds: (checkpointConfig?.expiresInSeconds as number) || undefined,
+            });
+          } catch (err) {
+            console.warn(`[workflow-exec] Failed to create checkpoint for node ${nodeId}:`, err);
+          }
+
+          // Update execution status to paused
+          await workflowExecutionRepository.updateStatus(executionId, 'paused');
+
+          // Emit node paused event
+          this.emitWorkflowEvent('node:paused', executionId, nodeId, {
+            status: 'paused',
+            result: result.output,
+          });
+
+          // Do NOT queue child nodes — wait for approval
+          return;
+        }
+
         // Update node status to finish with output
         await workflowExecutionRepository.updateNodeStatus(
           executionId,

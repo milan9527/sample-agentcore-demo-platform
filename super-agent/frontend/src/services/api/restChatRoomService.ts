@@ -13,8 +13,11 @@ export interface RoomMember {
   id: string;
   session_id: string;
   agent_id: string;
-  role: 'primary' | 'member';
+  role: 'leader' | 'member';
   is_active: boolean;
+  is_leader: boolean;
+  leader_instructions: string | null;
+  source_scope_id: string | null;
   joined_at: string;
   agent: {
     id: string;
@@ -24,6 +27,7 @@ export interface RoomMember {
     avatar: string | null;
     system_prompt: string | null;
     status: string;
+    business_scope_id: string | null;
   };
 }
 
@@ -57,6 +61,15 @@ export interface RoomMessage {
   agent_id: string | null;
   mention_agent_id: string | null;
   metadata: Record<string, unknown>;
+  collaboration_meta?: {
+    sourceAgentId: string;
+    sourceAgentName: string;
+    targetAgentId?: string;
+    targetAgentName?: string;
+    messageType: 'delegation' | 'report' | 'question' | 'synthesis';
+    round: number;
+    swarmSessionId?: string;
+  } | null;
   created_at: string;
 }
 
@@ -89,6 +102,14 @@ export const RestChatRoomService = {
     return restClient.post<ChatRoom>('/api/chat/rooms/from-scope', { business_scope_id: businessScopeId });
   },
 
+  async createCrossScopeRoom(options: {
+    title?: string;
+    primary_scope_id?: string;
+    members: Array<{ agent_id: string; scope_id: string }>;
+  }): Promise<ChatRoom> {
+    return restClient.post<ChatRoom>('/api/chat/rooms/cross-scope', options);
+  },
+
   async getRoom(roomId: string): Promise<ChatRoom> {
     return restClient.get<ChatRoom>(`/api/chat/rooms/${roomId}`);
   },
@@ -103,12 +124,22 @@ export const RestChatRoomService = {
     return res.members;
   },
 
-  async addMember(roomId: string, agentId: string): Promise<void> {
-    await restClient.post(`/api/chat/rooms/${roomId}/members`, { agent_id: agentId });
+  async addMember(roomId: string, agentId: string, sourceScopeId?: string): Promise<void> {
+    await restClient.post(`/api/chat/rooms/${roomId}/members`, {
+      agent_id: agentId,
+      source_scope_id: sourceScopeId,
+    });
   },
 
   async removeMember(roomId: string, agentId: string): Promise<void> {
     await restClient.delete(`/api/chat/rooms/${roomId}/members/${agentId}`);
+  },
+
+  async setLeader(roomId: string, agentId: string, isLeader: boolean, instructions?: string): Promise<{ members: RoomMember[] }> {
+    return restClient.put<{ members: RoomMember[] }>(`/api/chat/rooms/${roomId}/members/${agentId}/leader`, {
+      is_leader: isLeader,
+      leader_instructions: instructions,
+    });
   },
 
   // Messaging

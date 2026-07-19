@@ -2,7 +2,7 @@
  * API Layer Module
  * 
  * This module exports REST API clients and services.
- * The platform uses REST API backend (super-agent-backend) for all data operations.
+ * The platform uses REST API backend (backend) for all data operations.
  * 
  * Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.7
  */
@@ -95,6 +95,20 @@ export type {
   UpdateScheduleRequest,
 } from './restScheduleService';
 
+export { RestSupportService } from './restSupportService';
+export type {
+  SupportConversation,
+  CustomerProfile,
+  FaqArticle,
+  AgentGroup,
+  EscalationRule,
+  ResponseTemplate,
+  BusinessHoursConfig,
+  MetricsSummary,
+  KnowledgeGap,
+  GapReport,
+} from './restSupportService';
+
 // =============================================================================
 // API Mode Detection
 // =============================================================================
@@ -125,3 +139,12 @@ export const MCPService = RestMCPService;
 export const ChatService = RestChatService;
 export const OrganizationService = RestOrganizationService;
 export const BusinessScopeService = RestBusinessScopeService;
+
+// Approval Service
+export { RestApprovalService } from './restApprovalService';
+export type {
+  Checkpoint,
+  CheckpointConfig,
+  CheckpointInputContext,
+  CheckpointStatus,
+} from './restApprovalService';

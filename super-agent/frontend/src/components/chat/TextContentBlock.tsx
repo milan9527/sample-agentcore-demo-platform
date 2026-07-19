@@ -1,10 +1,10 @@
 /**
  * TextContentBlock Component
  *
- * Renders a text content block with full markdown formatting
- * using react-markdown with GFM (GitHub Flavored Markdown) support.
- *
- * Requirements: 9.1
+ * Renders a text content block with full markdown formatting.
+ * Includes:
+ * - Path sanitization (hides absolute workspace paths, shows friendly names)
+ * - Knowledge base source citations
  *
  * @module components/chat/TextContentBlock
  */
@@ -17,7 +17,45 @@ interface TextContentBlockProps {
   block: TextContentBlockType;
 }
 
+/**
+ * Sanitize technical paths in AI responses to show user-friendly file names.
+ * 
+ * Transforms:
+ *   /tmp/workspaces/abc/def/documents/报告.md → documents/报告.md
+ *   /workspace/documents/报告.md → documents/报告.md
+ *   保存在 `/workspace/output/file.docx` → 保存在 `output/file.docx`
+ */
+function sanitizePaths(text: string): string {
+  // Replace absolute workspace paths with relative ones
+  return text
+    // /tmp/workspaces/<id>/<id>/path → path
+    .replace(/\/tmp\/workspaces\/[^/]+\/[^/]+\//g, '')
+    // /workspace/path → path
+    .replace(/\/workspace\//g, '')
+    // /workspaces/<id>/<id>/path → path
+    .replace(/\/workspaces\/[^/]+\/[^/]+\//g, '')
+    // /workspaces/<id>/path → path
+    .replace(/\/workspaces\/[^/]+\//g, '')
+    // /home/<user>/path → path
+    .replace(/\/home\/[^/]+\//g, '')
+}
+
+/**
+ * Detect and format knowledge base source citations.
+ * Patterns like "来源：filename.pdf" or "Source: filename" get styled.
+ */
+function formatSourceCitations(text: string): string {
+  // Add a visual marker for source citations
+  // Pattern: 【来源：xxx】or (来源: xxx) or Source: xxx
+  return text
+    .replace(/[【\[]来源[：:]\s*([^\]】]+)[】\]]/g, '📌 来源：$1')
+    .replace(/\(来源[：:]\s*([^)]+)\)/g, '📌 来源：$1')
+}
+
 export function TextContentBlock({ block }: TextContentBlockProps) {
+  // Pre-process text: sanitize paths and format citations
+  const processedText = formatSourceCitations(sanitizePaths(block.text));
+
   return (
     <div className="text-sm text-gray-100 leading-relaxed prose prose-invert prose-sm max-w-none" data-testid="text-content-block">
       <Markdown
@@ -33,7 +71,7 @@ export function TextContentBlock({ block }: TextContentBlockProps) {
           ul: ({ children }) => <ul className="list-disc pl-5 mb-2 space-y-0.5">{children}</ul>,
           ol: ({ children }) => <ol className="list-decimal pl-5 mb-2 space-y-0.5">{children}</ol>,
           li: ({ children }) => <li className="text-gray-200">{children}</li>,
-          // Inline code
+          // Inline code — also sanitize paths inside code blocks
           code: ({ className, children }) => {
             const isBlock = className?.includes('language-');
             if (isBlock) {
@@ -45,9 +83,11 @@ export function TextContentBlock({ block }: TextContentBlockProps) {
                 </div>
               );
             }
+            // For inline code, sanitize paths to show friendly names
+            const text = typeof children === 'string' ? sanitizePaths(children) : children;
             return (
               <code className="bg-gray-700 text-gray-200 px-1.5 py-0.5 rounded text-xs font-mono">
-                {children}
+                {text}
               </code>
             );
           },
@@ -85,7 +125,7 @@ export function TextContentBlock({ block }: TextContentBlockProps) {
           td: ({ children }) => <td className="px-3 py-1.5 text-gray-300 border-b border-gray-800">{children}</td>,
         }}
       >
-        {block.text}
+        {processedText}
       </Markdown>
     </div>
   );

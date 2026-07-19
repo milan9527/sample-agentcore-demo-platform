@@ -21,16 +21,23 @@ function buildV2Plan(
     metadata?: Record<string, unknown>;
   }>;
 
+  // Map legacy node types to V2 types (canvas saves 'human' but executor expects 'humanApproval')
+  const LEGACY_TYPE_MAP: Record<string, string> = { human: 'humanApproval' };
+  const PASSTHROUGH_TYPES = new Set(['trigger', 'start', 'end']);
+
   return {
     title: workflow.name,
-    nodes: nodes.map(n => ({
-      id: n.id,
-      title: n.title || n.label || n.id,
-      type: (n.type as 'agent' | 'action' | 'condition' | 'document' | 'codeArtifact') || 'agent',
-      prompt: n.prompt || (n.metadata?.prompt as string) || n.title || n.label || n.id,
-      dependentTasks: n.dependentTasks || (n.metadata?.dependentTasks as string[]),
-      agentId: n.agentId || (n.metadata?.agentId as string),
-    })),
+    nodes: nodes
+      .filter(n => !PASSTHROUGH_TYPES.has(n.type))
+      .map(n => ({
+        id: n.id,
+        title: n.title || n.label || n.id,
+        type: ((LEGACY_TYPE_MAP[n.type] || n.type) as WorkflowV2Plan['nodes'][0]['type']) || 'agent',
+        prompt: n.prompt || (n.metadata?.prompt as string) || n.title || n.label || n.id,
+        dependentTasks: n.dependentTasks || (n.metadata?.dependentTasks as string[]),
+        agentId: n.agentId || (n.metadata?.agentId as string),
+        checkpointConfig: n.metadata?.checkpointConfig as Record<string, unknown> | undefined,
+      })),
     edges: ((workflow.connections || []) as Array<{ source?: string; target?: string; from?: string; to?: string }>).map(c => ({
       source: c.source || c.from || '',
       target: c.target || c.to || '',
@@ -192,7 +199,7 @@ class ScheduleService {
     if (newEnabled && nextRunAt) {
       await this.createOrUpdateScheduledRecord(scheduleId, organizationId, nextRunAt);
     } else {
-      await this.deleteScheduledRecords(scheduleId);
+      await this.deleteScheduledRecords(scheduleId, organizationId);
     }
 
     return this.mapToScheduleConfig(updated);
@@ -220,7 +227,7 @@ class ScheduleService {
     });
 
     // Delete pending scheduled records
-    await this.deleteScheduledRecords(scheduleId);
+    await this.deleteScheduledRecords(scheduleId, organizationId);
   }
 
   /**
@@ -622,13 +629,13 @@ class ScheduleService {
   /**
    * Delete pending scheduled records
    */
-  private async deleteScheduledRecords(scheduleId: string): Promise<void> {
-    await prisma.schedule_execution_records.deleteMany({
-      where: {
-        schedule_id: scheduleId,
-        status: 'scheduled',
-      },
-    });
+  private async deleteScheduledRecords(scheduleId: string, organizationId?: string): Promise<void> {
+    const where: Record<string, unknown> = {
+      schedule_id: scheduleId,
+      status: 'scheduled',
+    };
+    if (organizationId) where.organization_id = organizationId;
+    await prisma.schedule_execution_records.deleteMany({ where });
   }
 
   private mapToScheduleConfig(schedule: any): ScheduleConfig {

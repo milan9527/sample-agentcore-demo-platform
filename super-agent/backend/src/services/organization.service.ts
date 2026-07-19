@@ -12,6 +12,7 @@ import {
   membershipRepository,
   type MembershipEntity,
 } from '../repositories/membership.repository.js';
+import { modelProviderRepository } from '../repositories/model-provider.repository.js';
 import { AppError } from '../middleware/errorHandler.js';
 import type {
   CreateOrganizationInput,
@@ -22,6 +23,18 @@ import type {
   UpdateMembershipInput,
   MembershipFilter,
 } from '../schemas/membership.schema.js';
+
+/** Default model for a new org's seeded Bedrock provider (Claude Opus 4.8). */
+const DEFAULT_BEDROCK_MODEL_ID = 'global.anthropic.claude-opus-4-8';
+
+/**
+ * A membership enriched with the member's profile fields (email/name) for the
+ * frontend. Returned by list/update endpoints; the base row has neither field.
+ */
+export type EnrichedMembership = MembershipEntity & {
+  email?: string | null;
+  name?: string | null;
+};
 
 /**
  * Pagination options for list queries
@@ -132,6 +145,26 @@ export class OrganizationService {
       organization.id
     );
 
+    // Seed a default Amazon Bedrock provider (Claude Opus 4.8) so the org has a
+    // working model out of the box — model resolution, the chat picker, and
+    // Settings → Models all rely on there being an org-default provider.
+    try {
+      await modelProviderRepository.create({
+        organization_id: organization.id,
+        name: 'Amazon Bedrock',
+        type: 'bedrock',
+        base_url: null,
+        credential_id: null,
+        default_model_id: DEFAULT_BEDROCK_MODEL_ID,
+        is_org_default: true,
+        status: 'active',
+        created_by: userId,
+      });
+    } catch (err) {
+      // Non-fatal: the org still works; an admin can add a provider manually.
+      console.warn('[organization] Failed to seed default Bedrock provider:', err);
+    }
+
     return organization;
   }
 
@@ -222,7 +255,7 @@ export class OrganizationService {
     organizationId: string,
     filters?: MembershipFilter,
     pagination?: PaginationOptions
-  ): Promise<PaginatedResponse<MembershipEntity>> {
+  ): Promise<PaginatedResponse<EnrichedMembership>> {
     const page = pagination?.page ?? 1;
     const limit = pagination?.limit ?? 0;
     const noPagination = limit === 0;
@@ -347,7 +380,7 @@ export class OrganizationService {
     data: UpdateMembershipInput,
     organizationId: string,
     currentUserId: string
-  ): Promise<MembershipEntity> {
+  ): Promise<EnrichedMembership> {
     const existing = await membershipRepository.findById(id, organizationId);
 
     if (!existing) {
@@ -379,6 +412,22 @@ export class OrganizationService {
 
     if (!updated) {
       throw AppError.notFound(`Membership with ID ${id} not found`);
+    }
+
+    // Enrich with profile data so the frontend receives name/email immediately
+    if (updated.user_id) {
+      const { prisma } = await import('../config/database.js');
+      const profile = await prisma.profiles.findUnique({
+        where: { id: updated.user_id },
+        select: { username: true, full_name: true },
+      });
+      if (profile) {
+        return {
+          ...updated,
+          email: profile.username ?? (updated as any).invited_email ?? null,
+          name: profile.full_name ?? null,
+        };
+      }
     }
 
     return updated;

@@ -8,15 +8,22 @@ import {
   Rocket,
   FolderKanban,
   Star,
+  Headphones,
+  Database,
+  ClipboardCheck,
 } from 'lucide-react'
 import type { NavigationPage } from '@/types'
 import { useTranslation } from '@/i18n'
+import { usePendingApprovals } from '@/hooks/usePendingApprovals'
+import { useFeatureToggles, type OptionalFeature } from '@/services/FeatureTogglesContext'
 
 interface NavItemConfig {
   id: NavigationPage
   icon: React.ReactNode
   tooltipKey: string
   path: string
+  /** If set, this item is optional and only shown when the feature is enabled. */
+  feature?: OptionalFeature
 }
 
 const navItems: NavItemConfig[] = [
@@ -24,7 +31,7 @@ const navItems: NavItemConfig[] = [
     id: 'dashboard',
     icon: <LayoutDashboard className="w-5 h-5" />,
     tooltipKey: 'nav.dashboard',
-    path: '/',
+    path: '/dashboard',
   },
   {
     id: 'chat',
@@ -45,28 +52,52 @@ const navItems: NavItemConfig[] = [
     path: '/agents',
   },
   {
-    id: 'projects',
-    icon: <FolderKanban className="w-5 h-5" />,
-    tooltipKey: 'nav.projects',
-    path: '/projects',
-  },
-  {
     id: 'tools',
     icon: <Wrench className="w-5 h-5" />,
     tooltipKey: 'nav.tools',
     path: '/tools',
   },
   {
+    id: 'starred',
+    icon: <Star className="w-5 h-5" />,
+    tooltipKey: 'nav.starred',
+    path: '/showcase',
+    feature: 'starred',
+  },
+  {
+    id: 'approvals',
+    icon: <ClipboardCheck className="w-5 h-5" />,
+    tooltipKey: 'nav.approvals',
+    path: '/approvals',
+    feature: 'approvals',
+  },
+  {
+    id: 'projects',
+    icon: <FolderKanban className="w-5 h-5" />,
+    tooltipKey: 'nav.projects',
+    path: '/projects',
+    feature: 'projects',
+  },
+  {
+    id: 'knowledge',
+    icon: <Database className="w-5 h-5" />,
+    tooltipKey: 'nav.knowledge',
+    path: '/knowledge',
+    feature: 'knowledge',
+  },
+  {
     id: 'apps',
     icon: <Rocket className="w-5 h-5" />,
     tooltipKey: 'nav.apps',
     path: '/apps',
+    feature: 'apps',
   },
   {
-    id: 'starred',
-    icon: <Star className="w-5 h-5" />,
-    tooltipKey: 'nav.starred',
-    path: '/starred',
+    id: 'support',
+    icon: <Headphones className="w-5 h-5" />,
+    tooltipKey: 'nav.support',
+    path: '/support',
+    feature: 'support',
   },
 ]
 
@@ -79,17 +110,25 @@ export function Sidebar({ onAvatarClick, isAdminMenuOpen }: SidebarProps) {
   const navigate = useNavigate()
   const location = useLocation()
   const { t } = useTranslation()
+  const { pendingCount } = usePendingApprovals()
+  const { isEnabled } = useFeatureToggles()
+
+  // Core items always show; optional items only when their feature is enabled.
+  const visibleNavItems = navItems.filter((item) => !item.feature || isEnabled(item.feature))
 
   const getActivePage = (): NavigationPage => {
     const path = location.pathname
-    if (path === '/') return 'dashboard'
+    if (path === '/dashboard') return 'dashboard'
     if (path.startsWith('/chat')) return 'chat'
     if (path.startsWith('/workflow')) return 'workflow'
+    if (path.startsWith('/approvals')) return 'approvals'
     if (path.startsWith('/agents')) return 'agents'
     if (path.startsWith('/projects')) return 'projects'
     if (path.startsWith('/tools')) return 'tools'
+    if (path.startsWith('/knowledge')) return 'knowledge'
     if (path.startsWith('/apps')) return 'apps'
-    if (path.startsWith('/starred')) return 'starred'
+    if (path.startsWith('/support')) return 'support'
+    if (path.startsWith('/starred') || path.startsWith('/showcase')) return 'starred'
     return 'dashboard'
   }
 
@@ -108,7 +147,7 @@ export function Sidebar({ onAvatarClick, isAdminMenuOpen }: SidebarProps) {
 
       {/* Navigation Items */}
       <nav className="flex flex-col gap-1 flex-1">
-        {navItems.map((item) => {
+        {visibleNavItems.map((item) => {
           const isActive = activePage === item.id
           return (
             <button
@@ -126,6 +165,12 @@ export function Sidebar({ onAvatarClick, isAdminMenuOpen }: SidebarProps) {
               title={t(item.tooltipKey)}
             >
               {item.icon}
+              {/* Pending approvals badge */}
+              {item.id === 'approvals' && pendingCount > 0 && (
+                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 flex items-center justify-center bg-red-500 text-white text-[10px] font-bold rounded-full">
+                  {pendingCount > 99 ? '99+' : pendingCount}
+                </span>
+              )}
               {/* Active indicator */}
               {isActive && (
                 <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 bg-blue-400 rounded-r-full" />
@@ -149,7 +194,7 @@ export function Sidebar({ onAvatarClick, isAdminMenuOpen }: SidebarProps) {
             hover:ring-2 hover:ring-blue-400 hover:ring-offset-2 hover:ring-offset-gray-900
             ${isAdminMenuOpen ? 'ring-2 ring-blue-400 ring-offset-2 ring-offset-gray-900' : ''}
           `}
-          title="Admin Menu"
+          title={t('sidebar.adminMenu')}
         >
           <img 
             src="https://api.dicebear.com/9.x/avataaars/svg?seed=Admin" 

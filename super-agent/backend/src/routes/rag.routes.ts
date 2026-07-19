@@ -3,6 +3,10 @@
  *
  * Semantic search over document chunks + indexing management.
  * All routes require authentication.
+ *
+ * Supports two query modes:
+ *   1. ?scope_id=xxx — searches via scope's bound knowledge bases (or legacy doc groups)
+ *   2. ?knowledge_base_ids=id1,id2 — searches specific knowledge bases directly
  */
 
 import { FastifyInstance } from 'fastify';
@@ -11,8 +15,16 @@ import { ragRetrieverService } from '../services/rag/rag-retriever.service.js';
 import { documentIndexerService, isRagEnabled } from '../services/rag/document-indexer.service.js';
 
 export async function ragRoutes(fastify: FastifyInstance): Promise<void> {
-  /** GET /api/rag/search — semantic search over scope's document chunks */
-  fastify.get<{ Querystring: { scope_id: string; q: string; top_k?: string; min_similarity?: string } }>(
+  /** GET /api/rag/search — semantic search over document chunks */
+  fastify.get<{
+    Querystring: {
+      scope_id?: string;
+      knowledge_base_ids?: string;
+      q: string;
+      top_k?: string;
+      min_similarity?: string;
+    };
+  }>(
     '/search',
     { preHandler: [authenticate] },
     async (request, reply) => {
@@ -20,19 +32,34 @@ export async function ragRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(400).send({ error: 'RAG is not enabled', code: 'RAG_DISABLED' });
       }
 
-      const { scope_id, q, top_k, min_similarity } = request.query;
-      if (!scope_id || !q) {
-        return reply.status(400).send({ error: 'scope_id and q are required', code: 'VALIDATION_ERROR' });
+      const { scope_id, knowledge_base_ids, q, top_k, min_similarity } = request.query;
+      if (!q) {
+        return reply.status(400).send({ error: 'q (query) is required', code: 'VALIDATION_ERROR' });
       }
 
-      const results = await ragRetrieverService.retrieve(
-        q,
-        scope_id,
-        top_k ? parseInt(top_k, 10) : 5,
-        min_similarity ? parseFloat(min_similarity) : 0.5,
-      );
+      const topK = top_k ? parseInt(top_k, 10) : 5;
+      const minSim = min_similarity ? parseFloat(min_similarity) : 0.5;
 
-      return reply.send({ data: results });
+      // Path 1: Direct knowledge base IDs
+      if (knowledge_base_ids) {
+        const ids = knowledge_base_ids.split(',').map(id => id.trim()).filter(Boolean);
+        if (ids.length === 0) {
+          return reply.status(400).send({ error: 'knowledge_base_ids must contain at least one ID', code: 'VALIDATION_ERROR' });
+        }
+        const results = await ragRetrieverService.retrieveByKnowledgeBases(q, ids, topK, minSim);
+        return reply.send({ data: results });
+      }
+
+      // Path 2: Scope-based (tries knowledge bases first, falls back to legacy)
+      if (scope_id) {
+        const results = await ragRetrieverService.retrieve(q, scope_id, topK, minSim);
+        return reply.send({ data: results });
+      }
+
+      return reply.status(400).send({
+        error: 'Either scope_id or knowledge_base_ids is required',
+        code: 'VALIDATION_ERROR',
+      });
     },
   );
 

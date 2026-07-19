@@ -17,7 +17,7 @@ Build full-stack web applications with persistent data storage on the Super Agen
 ## Architecture
 
 Apps on this platform are:
-- **Frontend**: React/Vue/vanilla HTML+JS built with Vite
+- **Frontend**: React + Vite (built to static files, served by the platform)
 - **Backend**: The platform provides a built-in Data API — no custom server needed
 - **Data**: Stored as JSONB documents in collections, queryable with filters and aggregations
 
@@ -70,11 +70,26 @@ When building an app, always include this helper module. Create it as `src/api.j
 
 ```typescript
 // src/api.ts — Platform Data API client
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? window.location.origin;
-const APP_ID = import.meta.env.VITE_APP_ID ?? '';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || window.location.origin;
+
+// Extract APP_ID from the URL path: /api/apps/{uuid}/static/...
+function getAppId(): string {
+  const envId = import.meta.env.VITE_APP_ID;
+  if (envId && envId !== 'preview' && envId.length > 10) return envId;
+  // Auto-detect from URL when served by the platform
+  const match = window.location.pathname.match(/\/api\/apps\/([a-f0-9-]{36})\//);
+  if (match) return match[1];
+  return '';
+}
+const APP_ID = getAppId();
 
 function getToken(): string {
-  return localStorage.getItem('cognito_id_token') ?? '';
+  // Try URL query param first (injected by platform iframe), then localStorage
+  const urlToken = new URLSearchParams(window.location.search).get('token');
+  if (urlToken) return urlToken;
+  return localStorage.getItem('cognito_id_token')
+    || localStorage.getItem('local_auth_token')
+    || '';
 }
 
 function headers(): HeadersInit {
@@ -105,7 +120,7 @@ export const db = {
     if (opts?.sort) params.set('sort', opts.sort);
     if (opts?.order) params.set('order', opts.order);
     const qs = params.toString();
-    return request('GET', `/${collection}${qs ? '?' + qs : ''}`);
+    return request('GET', `/${collection}${qs ? '?' + qs : ''}`).then((res: any) => res?.data || []);
   },
   get: (collection: string, id: string) => request('GET', `/${collection}/${id}`),
   create: (collection: string, data: object) => request('POST', `/${collection}`, data),
@@ -120,19 +135,60 @@ export const db = {
 
 ### Project Setup
 
-1. Use Vite + React (or vanilla if simple)
-2. Always set `base: './'` in `vite.config.ts` for sub-path deployment
-3. Use `<HashRouter>` instead of `<BrowserRouter>` for React Router apps
-4. Include the `src/api.ts` client SDK above in every app that needs data
+1. Always use Vite + React (TypeScript or JavaScript)
+2. Always set `base: './'` in `vite.config.ts` or `vite.config.js`
+3. Always use `<HashRouter>` instead of `<BrowserRouter>` for React Router apps
+4. Always include the `src/api.ts` client SDK above in every app that needs data
+5. Always create a `tsconfig.json` if using TypeScript files (.tsx/.ts)
+
+### CRITICAL — vite.config.js
+
+Every app MUST have this vite config:
+
+```javascript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  base: './',
+  plugins: [react()],
+})
+```
+
+### CRITICAL — tsconfig.json
+
+If the project uses .tsx or .ts files, ALWAYS create `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": false
+  },
+  "include": ["src"]
+}
+```
 
 ### Environment Variables
 
-Set these in `.env` for local dev, they're auto-injected in production:
+Create `.env` in the app root:
 
 ```
-VITE_API_BASE_URL=http://localhost:3000
-VITE_APP_ID=<uuid-after-publish>
+VITE_API_BASE_URL=
 ```
+
+> Note: Leave `VITE_API_BASE_URL` empty — the SDK automatically uses `window.location.origin`.
+> The APP_ID is auto-detected from the URL path when served by the platform.
+> No manual configuration needed.
 
 ### Data Modeling
 
@@ -142,31 +198,52 @@ VITE_APP_ID=<uuid-after-publish>
 - Store numeric values as numbers (not strings) for aggregation support
 - Use ISO date strings for date fields
 
-### Example: Expense Tracker Data Model
-
-```
-Collection: expenses
-{ "title": "Team lunch", "amount": 85.50, "department": "Engineering", "status": "pending", "date": "2026-02-15", "submitted_by": "alice@co.com" }
-
-Collection: departments
-{ "name": "Engineering", "budget": 50000, "manager": "bob@co.com" }
-```
-
 ### Authentication
 
-The app runs inside an authenticated iframe on the platform. The user's Cognito token is available in `localStorage` as `cognito_id_token`. The `src/api.ts` client SDK handles this automatically.
+The app runs inside an authenticated iframe on the platform. The user's token is available in `localStorage` as `cognito_id_token` or `local_auth_token`. The `src/api.ts` client SDK handles this automatically.
 
-### Preview & Publish
+### package.json build script
 
-After building the app:
-1. Use the `app-publisher` skill to preview or publish
-2. The Data API becomes available immediately after publish
-3. The `APP_ID` is returned by the publish step — update `.env` or hardcode it
+IMPORTANT: Use `vite build` directly, NOT `tsc -b && vite build`:
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}
+```
+
+### Styling
+- Use plain CSS or Tailwind (via CDN link in index.html)
+- Keep it clean and professional
+- Support dark mode if possible
+- Make it responsive (mobile-friendly)
+
+## Project Structure
+
+```
+app/
+├── .env                    # API config (auto-injected on publish)
+├── index.html              # Vite entry point
+├── package.json            # Must have "build": "vite build"
+├── tsconfig.json           # Required for .tsx/.ts files
+├── vite.config.js          # Must have base: './'
+└── src/
+    ├── api.ts              # Data API client SDK
+    ├── main.tsx            # React entry
+    ├── App.tsx             # Root component with HashRouter
+    ├── App.css             # Global styles
+    └── pages/              # Page components
+```
 
 ## Workflow
 
-1. Scaffold the Vite project with `npm create vite@latest`
-2. Add the `src/api.ts` client SDK
-3. Build the UI with React components
-4. Use `db.list()`, `db.create()`, `db.aggregate()` etc. for all data operations
-5. Test locally, then use `app-publisher` to deploy
+1. Create the app directory (e.g., `app/`)
+2. Set up package.json, vite.config.js, tsconfig.json
+3. Create `src/api.ts` with the SDK template
+4. Build the UI with React components
+5. Use `db.list()`, `db.create()`, `db.aggregate()` etc. for all data operations
+6. The platform will auto-build and serve the app when user clicks Preview/Publish

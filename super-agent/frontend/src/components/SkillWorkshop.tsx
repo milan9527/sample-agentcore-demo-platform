@@ -9,7 +9,7 @@
  */
 
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowLeft, Send, Loader2, Package, Search, Plus, X, Check,
   Download, ExternalLink, FileText, ChevronLeft, Save, Zap,
@@ -20,9 +20,10 @@ import { restClient } from '@/services/api/restClient';
 import {
   getEquippedSkills, equipSkill, unequipSkill, getInstalledSkills,
   saveWorkshopSkills, installMarketplaceSkill, streamWorkshopChat,
-  consolidateChatToSkill,
+  consolidateChatToSkill, resetWorkshopSession,
   type EquippedSkill,
 } from '@/services/workshopService';
+import { useTranslation } from '@/i18n';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -134,7 +135,16 @@ function InstalledSkillRow({
 export function SkillWorkshop() {
   const { agentId } = useParams<{ agentId: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { success: showSuccess, error: showError } = useToast();
+  const { t } = useTranslation();
+
+  // Pre-equip skill ID from URL query param (e.g. ?skillId=xxx)
+  const preEquipSkillId = searchParams.get('skillId');
+  // Return path from URL query param (e.g. ?returnTo=/agents?scope=xxx)
+  const returnTo = searchParams.get('returnTo');
+  // Single-skill test mode: when skillId is provided, only equip that one skill
+  const isSingleSkillMode = !!preEquipSkillId;
 
   // Agent info
   const [agentName, setAgentName] = useState('Agent');
@@ -187,13 +197,47 @@ export function SkillWorkshop() {
       setAgentRole(res.data.role || '');
     }).catch(() => {});
 
+    // In single-skill mode, don't load existing equipped skills — we only want the target skill
+    if (isSingleSkillMode) {
+      setIsLoadingEquipped(false);
+      return;
+    }
+
     // Load equipped skills
     setIsLoadingEquipped(true);
     getEquippedSkills(agentId)
       .then(setEquippedSkills)
       .catch(err => setError(err.message))
       .finally(() => setIsLoadingEquipped(false));
-  }, [agentId]);
+  }, [agentId, isSingleSkillMode]);
+
+  // Auto-equip a skill from URL query param (?skillId=xxx)
+  const preEquipDoneRef = useRef(false);
+  useEffect(() => {
+    if (!agentId || !preEquipSkillId || preEquipDoneRef.current) return;
+    preEquipDoneRef.current = true;
+
+    async function setupSingleSkill() {
+      try {
+        if (isSingleSkillMode) {
+          // Reset the backend workshop session to empty, then equip only the target skill
+          await resetWorkshopSession(agentId!);
+        }
+        const skill = await equipSkill(agentId!, preEquipSkillId!);
+        if (isSingleSkillMode) {
+          setEquippedSkills([skill]);
+        } else {
+          setEquippedSkills(prev => {
+            if (prev.some(s => s.id === skill.id)) return prev;
+            return [...prev, skill];
+          });
+        }
+      } catch {
+        // Skill may not be found — ignore
+      }
+    }
+    setupSingleSkill();
+  }, [agentId, preEquipSkillId, isSingleSkillMode]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -225,7 +269,10 @@ export function SkillWorkshop() {
 
     try {
       console.log('[SkillWorkshop] Sending message, sessionId:', chatSessionIdRef.current);
-      const { reader: readerPromise } = streamWorkshopChat(agentId, userMsg.content, chatSessionIdRef.current || undefined);
+      const skillTestPrompt = isSingleSkillMode
+        ? `You are a skill testing assistant. Your only job is to test the equipped skill by following its instructions precisely. Do not assume any other role or identity. Focus on demonstrating the skill's capabilities.`
+        : undefined;
+      const { reader: readerPromise } = streamWorkshopChat(agentId, userMsg.content, chatSessionIdRef.current || undefined, skillTestPrompt);
       const reader = await readerPromise;
       const decoder = new TextDecoder();
       let buffer = '';
@@ -454,22 +501,22 @@ export function SkillWorkshop() {
       {/* Header */}
       <header className="border-b border-gray-800 px-4 py-3 flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-3">
-          <button onClick={() => navigate(`/agents/config/${agentId}`)}
+          <button onClick={() => navigate(returnTo || `/agents/config/${agentId}`)}
             className="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-colors">
             <ArrowLeft className="w-5 h-5" />
           </button>
           <Zap className="w-5 h-5 text-yellow-400" />
           <div>
-            <h1 className="text-base font-semibold">Skill Workshop</h1>
+            <h1 className="text-base font-semibold">{t('workshop.title')}</h1>
             <p className="text-xs text-gray-500">{agentName}{agentRole ? ` — ${agentRole}` : ''}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500">{equippedSkills.length} skill(s) equipped</span>
+          <span className="text-xs text-gray-500">{t('workshop.skillsEquipped').replace('{n}', String(equippedSkills.length))}</span>
           <button onClick={handleSave} disabled={isSaving}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:bg-gray-700 text-white text-sm rounded-lg transition-colors">
             {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-            Save Skills
+            {t('workshop.saveSkills')}
           </button>
         </div>
       </header>
@@ -483,8 +530,8 @@ export function SkillWorkshop() {
             {messages.length === 0 && (
               <div className="flex flex-col items-center justify-center h-full text-gray-500">
                 <Bot className="w-12 h-12 mb-3 opacity-40" />
-                <p className="text-sm">Send a message to test the agent with equipped skills</p>
-                <p className="text-xs mt-1 text-gray-600">Equip skills from the right panel, then chat to see how they work</p>
+                <p className="text-sm">{t('workshop.chatEmpty')}</p>
+                <p className="text-xs mt-1 text-gray-600">{t('workshop.chatEmptyHint')}</p>
               </div>
             )}
             {messages.map(msg => (
@@ -518,7 +565,7 @@ export function SkillWorkshop() {
                       <button onClick={() => handleEquipConsolidated(skill.id)} disabled={equippingId === skill.id}
                         className="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 text-white rounded-md transition-colors flex items-center gap-1 flex-shrink-0">
                         {equippingId === skill.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-                        Equip
+                        {t('workshop.equip')}
                       </button>
                     </div>
                   </div>
@@ -532,7 +579,7 @@ export function SkillWorkshop() {
                   title="Consolidate chat into a skill"
                   className="px-3 py-2.5 bg-yellow-600/20 hover:bg-yellow-600/30 disabled:bg-gray-800 disabled:text-gray-600 text-yellow-400 rounded-lg transition-colors flex items-center gap-1.5 text-xs flex-shrink-0">
                   {isConsolidating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <BookOpen className="w-3.5 h-3.5" />}
-                  Consolidate
+                  {t('workshop.consolidate')}
                 </button>
               )}
               <input
@@ -559,17 +606,17 @@ export function SkillWorkshop() {
             {rightView === 'detail' ? (
               <button onClick={() => setRightView('marketplace')}
                 className="flex items-center gap-1 text-sm text-gray-400 hover:text-white transition-colors">
-                <ChevronLeft className="w-4 h-4" /> Back
+                <ChevronLeft className="w-4 h-4" /> {t('workshop.back')}
               </button>
             ) : (
               <>
                 <button onClick={() => setRightView('equipped')}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors ${rightView === 'equipped' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>
-                  Equipped ({equippedSkills.length})
+                  {t('workshop.equipped')} ({equippedSkills.length})
                 </button>
                 <button onClick={handleShowInstalled}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors ${rightView === 'installed' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>
-                  Installed
+                  {t('skills.tabInstalled')}
                 </button>
                 <button onClick={() => setRightView('marketplace')}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors ${rightView === 'marketplace' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>
@@ -599,8 +646,8 @@ export function SkillWorkshop() {
               ) : equippedSkills.length === 0 ? (
                 <div className="text-center py-8 text-gray-500">
                   <Zap className="w-8 h-8 mx-auto mb-2 opacity-40" />
-                  <p className="text-sm">No skills equipped</p>
-                  <p className="text-xs mt-1">Browse installed skills or the marketplace to equip</p>
+                  <p className="text-sm">{t('workshop.noEquipped')}</p>
+                  <p className="text-xs mt-1">{t('workshop.noEquippedHint')}</p>
                 </div>
               ) : (
                 equippedSkills.map(skill => (
@@ -623,8 +670,8 @@ export function SkillWorkshop() {
               ) : installedSkills.length === 0 ? (
                 <div className="text-center py-8 text-gray-500">
                   <Package className="w-8 h-8 mx-auto mb-2 opacity-40" />
-                  <p className="text-sm">No skills installed</p>
-                  <p className="text-xs mt-1">Install skills from the marketplace first</p>
+                  <p className="text-sm">{t('workshop.noInstalled')}</p>
+                  <p className="text-xs mt-1">{t('workshop.noInstalledHint')}</p>
                 </div>
               ) : (
                 installedSkills.map(skill => (
@@ -649,7 +696,7 @@ export function SkillWorkshop() {
                       value={marketQuery}
                       onChange={e => setMarketQuery(e.target.value)}
                       onKeyDown={e => e.key === 'Enter' && handleMarketSearch()}
-                      placeholder="Search skills..."
+                      placeholder={t('workshop.searchSkills')}
                       className="w-full pl-8 pr-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-xs placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors"
                     />
                   </div>
@@ -662,7 +709,7 @@ export function SkillWorkshop() {
                 {isSearching ? (
                   <div className="flex items-center justify-center py-8">
                     <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
-                    <span className="ml-2 text-xs text-gray-400">Searching...</span>
+                    <span className="ml-2 text-xs text-gray-400">{t('workshop.searching')}</span>
                   </div>
                 ) : marketResults.length > 0 ? (
                   marketResults.map(skill => (
@@ -680,7 +727,7 @@ export function SkillWorkshop() {
                       <div className="flex gap-1.5 mt-2">
                         <button onClick={() => handleViewDetail(skill)} disabled={isLoadingDetail}
                           className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition-colors flex items-center gap-1">
-                          <FileText className="w-3 h-3" /> Details
+                          <FileText className="w-3 h-3" /> {t('workshop.details')}
                         </button>
                         <button onClick={() => handleInstallAndEquip(skill.installRef)}
                           disabled={installingRef === skill.installRef}
@@ -688,7 +735,7 @@ export function SkillWorkshop() {
                           {installingRef === skill.installRef
                             ? <Loader2 className="w-3 h-3 animate-spin" />
                             : <Download className="w-3 h-3" />}
-                          Install & Equip
+                          {t('workshop.installEquip')}
                         </button>
                       </div>
                     </div>
@@ -696,12 +743,12 @@ export function SkillWorkshop() {
                 ) : marketQuery && !isSearching ? (
                   <div className="text-center py-8 text-gray-500">
                     <Package className="w-8 h-8 mx-auto mb-2 opacity-40" />
-                    <p className="text-xs">No results for "{marketQuery}"</p>
+                    <p className="text-xs">{t('workshop.noResults').replace('{q}', marketQuery)}</p>
                   </div>
                 ) : (
                   <div className="text-center py-8 text-gray-500">
                     <Package className="w-8 h-8 mx-auto mb-2 opacity-40" />
-                    <p className="text-xs">Search the skills.sh marketplace</p>
+                    <p className="text-xs">{t('skills.searchPrompt')}</p>
                   </div>
                 )}
               </>
@@ -723,7 +770,7 @@ export function SkillWorkshop() {
                     disabled={!!installingRef}
                     className="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 text-white rounded transition-colors flex items-center gap-1">
                     {installingRef ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
-                    Install & Equip
+                    {t('workshop.installEquip')}
                   </button>
                 </div>
                 {selectedDetail.skillMdContent ? (
@@ -738,7 +785,7 @@ export function SkillWorkshop() {
                 ) : (
                   <div className="p-4 bg-gray-900 border border-gray-800 rounded-lg text-center text-gray-500">
                     <FileText className="w-6 h-6 mx-auto mb-1 opacity-50" />
-                    <p className="text-xs">No documentation found</p>
+                    <p className="text-xs">{t('workshop.noDocs')}</p>
                   </div>
                 )}
               </div>

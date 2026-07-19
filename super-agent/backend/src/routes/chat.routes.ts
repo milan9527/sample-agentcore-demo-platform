@@ -5,8 +5,14 @@
  */
 
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { stat as fsStat } from 'fs/promises';
+import { stat as fsStat, mkdtemp, writeFile as fsWriteFile, readFile as fsReadFile, rm } from 'fs/promises';
 import { createReadStream } from 'fs';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+const execFileAsync = promisify(execFile);
 import http from 'http';
 import { chatService } from '../services/chat.service.js';
 import { streamRegistry } from '../services/stream-registry.js';
@@ -17,6 +23,7 @@ import { devServerManager } from '../services/dev-server-manager.js';
 import { sanitizeEvent } from '../services/output-sanitizer.js';
 import { generateQuickQuestions } from '../services/quick-questions.service.js';
 import { authenticate, requireModifyAccess } from '../middleware/auth.js';
+import { enforceTokenQuota } from '../middleware/token-quota.js';
 import { scopeAccessService } from '../services/scopeAccess.service.js';
 import {
   chatStreamRequestSchema,
@@ -123,6 +130,35 @@ function buildTreeFromEntries(
   return mapToNodes(root, '');
 }
 
+// ---------------------------------------------------------------------------
+// Workspace file-tree cache (TTL-based, avoids hitting AgentCore/S3 on every poll)
+// ---------------------------------------------------------------------------
+interface WorkspaceCacheEntry {
+  data: import('../services/workspace-manager.js').WorkspaceFileNode[];
+  workspacePath: string | null;
+  expiresAt: number;
+}
+const workspaceFileCache = new Map<string, WorkspaceCacheEntry>();
+const WORKSPACE_CACHE_TTL_MS = 4_000; // 4 seconds — keep short so workspace updates appear quickly during generation
+
+function getCachedWorkspaceFiles(sessionId: string): WorkspaceCacheEntry | null {
+  const entry = workspaceFileCache.get(sessionId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    workspaceFileCache.delete(sessionId);
+    return null;
+  }
+  return entry;
+}
+
+function setCachedWorkspaceFiles(sessionId: string, data: WorkspaceCacheEntry['data'], workspacePath: string | null): void {
+  workspaceFileCache.set(sessionId, {
+    data,
+    workspacePath,
+    expiresAt: Date.now() + WORKSPACE_CACHE_TTL_MS,
+  });
+}
+
 /**
  * Register chat routes on the Fastify instance.
  * All routes require authentication and filter by organization_id.
@@ -136,7 +172,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.post<StreamChatRequest>(
     '/stream',
     {
-      preHandler: [authenticate],
+      preHandler: [authenticate, enforceTokenQuota],
       schema: {
         description: 'Stream a chat response using Server-Sent Events',
         tags: ['Chat'],
@@ -147,9 +183,20 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
           properties: {
             agent_id: { type: 'string', format: 'uuid' },
             business_scope_id: { type: 'string', format: 'uuid' },
+            mention_agent_id: { type: 'string', format: 'uuid' },
             session_id: { type: 'string', format: 'uuid' },
             message: { type: 'string', minLength: 1 },
+            model: { type: 'string' },
+            model_selection: {
+              type: 'object',
+              properties: {
+                providerId: { type: 'string', format: 'uuid' },
+                modelId: { type: 'string' },
+              },
+            },
             context: { type: 'object' },
+            attached_files: { type: 'array', items: { type: 'string' } },
+            attached_images: { type: 'array', items: { type: 'string' } },
           },
         },
         response: {
@@ -176,12 +223,33 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         await scopeAccessService.requireAccess(request.user!, data.business_scope_id, 'viewer');
       }
 
+      // Enforce agent-level invoke permission
+      const targetAgentId = data.mention_agent_id || data.agent_id;
+      if (targetAgentId && request.user!.role !== 'owner' && request.user!.role !== 'admin') {
+        const { agentAccessService } = await import('../services/agentAccess.service.js');
+        const canInvoke = await agentAccessService.checkAccess(
+          request.user!.id, request.user!.orgId, targetAgentId, 'invoke',
+        );
+        if (!canInvoke) {
+          return reply.status(403).send({
+            error: 'You do not have permission to invoke this agent.',
+            code: 'AGENT_ACCESS_DENIED',
+            requestId: request.id,
+          });
+        }
+      }
+
       await chatService.streamChat(reply, request.user!.orgId, request.user!.id, {
         agentId: data.agent_id,
         businessScopeId: data.business_scope_id,
+        mentionAgentId: data.mention_agent_id,
         sessionId: data.session_id,
         message: data.message,
+        model: data.model,
+        modelSelection: data.model_selection,
         context: data.context,
+        attachedFiles: data.attached_files,
+        attachedImages: data.attached_images,
       });
     }
   );
@@ -445,6 +513,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
             agent_id: { type: 'string', format: 'uuid', nullable: true },
             sop_context: { type: 'string', nullable: true },
             context: { type: 'object', default: {} },
+            provision_workspace: { type: 'boolean', default: false },
           },
         },
         response: {
@@ -467,6 +536,20 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
       const data = validateSchema(createChatSessionSchema, request.body);
 
       const session = await chatService.createSession(data, request.user!.orgId, request.user!.id);
+
+      // Fire-and-forget workspace provisioning — return the session ID immediately
+      // so the frontend can show the chat UI without waiting. The workspace will
+      // be ready by the time the first message arrives (prepareScopeSession calls
+      // ensureWorkspaceUpToDate as a fallback if provisioning hasn't finished).
+      if (data.provision_workspace && session.business_scope_id) {
+        chatService.provisionSessionWorkspace(
+          session.id, request.user!.orgId,
+        ).then(() => {
+          console.log(`[chat] Workspace provisioned successfully for session ${session.id}`);
+        }).catch(err => {
+          console.warn(`[chat] Eager workspace provisioning failed for session ${session.id}:`, err instanceof Error ? err.message : err);
+        });
+      }
 
       return reply.status(201).send(session);
     }
@@ -615,6 +698,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
                 session_id: { type: 'string' },
                 type: { type: 'string', enum: ['user', 'ai'] },
                 content: { type: 'string' },
+                metadata: { type: 'object', additionalProperties: true },
                 created_at: { type: 'string' },
               },
             },
@@ -768,6 +852,13 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request, reply) => {
       const { id } = validateSchema(idParamSchema, request.params);
+
+      // Check cache first — avoids hitting AgentCore/S3 on every 5s poll
+      const cached = getCachedWorkspaceFiles(id);
+      if (cached) {
+        return reply.status(200).send({ files: cached.data, workspacePath: cached.workspacePath });
+      }
+
       const session = await chatService.getSessionById(id, request.user!.orgId);
 
       const context = session.context as Record<string, unknown> | null;
@@ -783,13 +874,30 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         const { config: appConfig } = await import('../config/index.js');
         let files;
         if (appConfig.agentRuntime === 'agentcore') {
-          // Use InvokeAgentRuntimeCommandCommand to query container directly
+          // Local-first strategy: return local workspace instantly if available,
+          // then let subsequent polls pick up the authoritative AgentCore/S3 data.
+          const localFiles = await workspaceManager.listWorkspaceFiles(
+            request.user!.orgId,
+            scopeIdForPath,
+            session.id,
+          );
+
+          if (localFiles && localFiles.length > 0) {
+            // Local workspace exists — return immediately with a short cache TTL.
+            // The next poll (after cache expires) will try AgentCore for fresh data.
+            const wsPath = workspaceManager.getSessionWorkspacePath(
+              request.user!.orgId, scopeIdForPath, session.id,
+            );
+            setCachedWorkspaceFiles(id, localFiles, wsPath);
+            return reply.status(200).send({ files: localFiles, workspacePath: wsPath });
+          }
+
+          // No local workspace — try AgentCore container, then S3
           try {
             const entries = await agentCoreCommandService.listWorkspaceFiles(session.id);
             files = buildTreeFromEntries(entries);
           } catch (cmdErr) {
             // Expected when session has no active microVM (idle >15min or no messages yet).
-            // Silently fall back to S3.
             files = await workspaceManager.listWorkspaceFilesFromS3(
               request.user!.orgId,
               scopeIdForPath,
@@ -804,11 +912,18 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
           );
         }
 
+        const wsPath = files ? workspaceManager.getSessionWorkspacePath(
+          request.user!.orgId, scopeIdForPath, session.id,
+        ) : null;
+
+        // Cache the result
+        if (files) {
+          setCachedWorkspaceFiles(id, files, wsPath);
+        }
+
         return reply.status(200).send({
           files: files ?? [],
-          workspacePath: files ? workspaceManager.getSessionWorkspacePath(
-            request.user!.orgId, scopeIdForPath, session.id,
-          ) : null,
+          workspacePath: wsPath,
         });
       } catch (err) {
         console.warn(`[workspace] Failed to list files for session ${id}:`, err instanceof Error ? err.message : err);
@@ -857,8 +972,9 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
   /**
    * DELETE /api/chat/sessions/:id/workspace/skills/:skillName
    * Delete a skill folder from the session's workspace.
+   * Query param: removeFromScope=true to also unbind the skill from the scope definition.
    */
-  fastify.delete<{ Params: { id: string; skillName: string } }>(
+  fastify.delete<{ Params: { id: string; skillName: string }; Querystring: { removeFromScope?: string } }>(
     '/sessions/:id/workspace/skills/:skillName',
     {
       preHandler: [authenticate],
@@ -872,6 +988,12 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
           properties: {
             id: { type: 'string', format: 'uuid' },
             skillName: { type: 'string', minLength: 1 },
+          },
+        },
+        querystring: {
+          type: 'object',
+          properties: {
+            removeFromScope: { type: 'string', enum: ['true', 'false'] },
           },
         },
       },
@@ -893,6 +1015,23 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
 
       if (!deleted) {
         return reply.status(404).send({ error: 'Skill not found in workspace' });
+      }
+
+      // If removeFromScope=true, also unbind the skill from the scope definition
+      if (request.query.removeFromScope === 'true' && session.business_scope_id) {
+        try {
+          const { skillService: svc } = await import('../services/skill.service.js');
+          const skill = await svc.findByName(request.user!.orgId, request.params.skillName);
+          if (skill && skill.business_scope_id === session.business_scope_id) {
+            await svc.unbindSkillFromScope(
+              request.user!.orgId,
+              skill.id,
+              session.business_scope_id,
+            );
+          }
+        } catch (err) {
+          console.warn('[workspace] Failed to unbind skill from scope:', err instanceof Error ? err.message : err);
+        }
       }
 
       // In agentcore mode, also delete from the container
@@ -1023,13 +1162,6 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(404).send({ error: 'File not found' });
       }
 
-      let fileStat;
-      try {
-        fileStat = await fsStat(resolvedPath);
-      } catch {
-        return reply.status(404).send({ error: 'File not found' });
-      }
-
       const ext = request.query.path.split('.').pop()?.toLowerCase() || '';
       const mimeMap: Record<string, string> = {
         png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
@@ -1038,14 +1170,211 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         html: 'text/html', htm: 'text/html',
         css: 'text/css', js: 'application/javascript', mjs: 'application/javascript',
         json: 'application/json',
+        xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        xls: 'application/vnd.ms-excel',
+        xlsb: 'application/vnd.ms-excel.sheet.binary.macroEnabled.12',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        doc: 'application/msword',
+        pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        ppt: 'application/vnd.ms-powerpoint',
+        zip: 'application/zip',
+        gz: 'application/gzip',
+        tar: 'application/x-tar',
+        csv: 'text/csv',
       };
       const contentType = mimeMap[ext] || 'application/octet-stream';
+
+      // Try local filesystem first
+      let fileStat;
+      try {
+        fileStat = await fsStat(resolvedPath);
+      } catch {
+        // Local file not found — in agentcore mode, fall back to Command API then S3
+        const { config: appConfig } = await import('../config/index.js');
+        if (appConfig.agentRuntime === 'agentcore') {
+          const isBinaryContent = !contentType.startsWith('text/') && contentType !== 'application/json' && contentType !== 'application/javascript';
+
+          // Try reading from the agentcore container via Command API (text only — Command API returns strings)
+          if (!isBinaryContent) {
+            try {
+              const cmdContent = await agentCoreCommandService.readFile(session.id, request.query.path);
+              if (cmdContent !== null) {
+                const buf = Buffer.from(cmdContent, 'utf-8');
+                return reply
+                  .type(contentType)
+                  .header('Content-Length', buf.length)
+                  .send(buf);
+              }
+            } catch {
+              // Command API failed, try S3 fallback
+            }
+          }
+
+          // Try S3 fallback — use raw binary read for binary content types
+          if (isBinaryContent) {
+            const s3Buffer = await workspaceManager.readWorkspaceFileFromS3Raw(
+              request.user!.orgId,
+              session.business_scope_id,
+              session.id,
+              request.query.path,
+            );
+            if (s3Buffer !== null) {
+              return reply
+                .type(contentType)
+                .header('Content-Length', s3Buffer.length)
+                .send(s3Buffer);
+            }
+          } else {
+            const s3Content = await workspaceManager.readWorkspaceFileFromS3(
+              request.user!.orgId,
+              session.business_scope_id,
+              session.id,
+              request.query.path,
+            );
+            if (s3Content !== null) {
+              const buf = Buffer.from(s3Content, 'utf-8');
+              return reply
+                .type(contentType)
+                .header('Content-Length', buf.length)
+                .send(buf);
+            }
+          }
+        }
+        return reply.status(404).send({ error: 'File not found' });
+      }
 
       const stream = createReadStream(resolvedPath);
       return reply
         .type(contentType)
         .header('Content-Length', fileStat.size)
         .send(stream);
+    },
+  );
+
+  /**
+   * GET /api/chat/sessions/:id/workspace/file/pdf-preview
+   * Convert a docx/pptx/doc/ppt file to PDF on-the-fly using LibreOffice headless
+   * and return the PDF for in-browser preview.
+   */
+  fastify.get<{ Params: { id: string }; Querystring: { path: string; token?: string } }>(
+    '/sessions/:id/workspace/file/pdf-preview',
+    {
+      preHandler: [authenticate],
+      schema: {
+        description: 'Convert an Office document to PDF for preview',
+        tags: ['Chat'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string', format: 'uuid' } },
+        },
+        querystring: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: { type: 'string', minLength: 1 },
+            token: { type: 'string', description: 'Auth token for iframe src' },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = validateSchema(idParamSchema, request.params);
+      const session = await chatService.getSessionById(id, request.user!.orgId);
+
+      if (!session.business_scope_id) {
+        return reply.status(404).send({ error: 'No workspace for this session' });
+      }
+
+      const filePath = request.query.path;
+      const ext = filePath.split('.').pop()?.toLowerCase() || '';
+      const allowedExts = new Set(['doc', 'docx', 'ppt', 'pptx']);
+      if (!allowedExts.has(ext)) {
+        return reply.status(400).send({ error: 'Only doc/docx/ppt/pptx files can be converted to PDF' });
+      }
+
+      // Read the original binary file
+      let sourceBuffer: Buffer | null = null;
+
+      // Try local filesystem first
+      const resolvedPath = workspaceManager.resolveWorkspaceFilePath(
+        request.user!.orgId,
+        session.business_scope_id,
+        session.id,
+        filePath,
+      );
+
+      if (resolvedPath) {
+        try {
+          sourceBuffer = await fsReadFile(resolvedPath);
+        } catch {
+          // Local file not found, try fallbacks
+        }
+      }
+
+      // Fallback: S3 raw read (agentcore mode)
+      if (!sourceBuffer) {
+        const { config: appConfig } = await import('../config/index.js');
+        if (appConfig.agentRuntime === 'agentcore') {
+          sourceBuffer = await workspaceManager.readWorkspaceFileFromS3Raw(
+            request.user!.orgId,
+            session.business_scope_id,
+            session.id,
+            filePath,
+          );
+        }
+      }
+
+      if (!sourceBuffer) {
+        return reply.status(404).send({ error: 'File not found' });
+      }
+
+      // Convert to PDF using LibreOffice headless
+      // Detect the correct binary name: macOS uses 'soffice', Linux uses 'libreoffice'
+      let sofficeBin: string | null = null;
+      for (const candidate of ['libreoffice', 'soffice']) {
+        try {
+          await execFileAsync('which', [candidate]);
+          sofficeBin = candidate;
+          break;
+        } catch { /* not found, try next */ }
+      }
+      if (!sofficeBin) {
+        return reply.status(500).send({ error: 'LibreOffice is not installed. Install it with: brew install --cask libreoffice (macOS) or apt-get install libreoffice-core (Ubuntu)' });
+      }
+
+      let tmpDir: string | null = null;
+      try {
+        tmpDir = await mkdtemp(join(tmpdir(), 'pdf-preview-'));
+        const inputFile = join(tmpDir, `input.${ext}`);
+        await fsWriteFile(inputFile, sourceBuffer);
+
+        await execFileAsync(sofficeBin, [
+          '--headless',
+          '--norestore',
+          '--convert-to', 'pdf',
+          '--outdir', tmpDir,
+          inputFile,
+        ], { timeout: 30_000 });
+
+        const pdfPath = join(tmpDir, 'input.pdf');
+        const pdfBuffer = await fsReadFile(pdfPath);
+
+        return reply
+          .type('application/pdf')
+          .header('Content-Length', pdfBuffer.length)
+          .header('Content-Disposition', 'inline')
+          .send(pdfBuffer);
+      } catch (err) {
+        console.error('[pdf-preview] LibreOffice conversion failed:', err instanceof Error ? err.message : err);
+        return reply.status(500).send({ error: 'PDF conversion failed. Ensure LibreOffice is installed on the server.' });
+      } finally {
+        // Clean up temp directory
+        if (tmpDir) {
+          rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+        }
+      }
     },
   );
 
@@ -1163,6 +1492,67 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   /**
+   * POST /api/chat/sessions/:id/workspace/upload-file
+   * Upload a file via multipart/form-data to the session workspace.
+   * Supports large files (up to 100MB) without base64 overhead.
+   */
+  fastify.post<{ Params: { id: string } }>(
+    '/sessions/:id/workspace/upload-file',
+    {
+      preHandler: [authenticate],
+      schema: {
+        description: 'Upload a file via multipart/form-data to the session workspace',
+        tags: ['Chat'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string', format: 'uuid' } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = validateSchema(idParamSchema, request.params);
+      const session = await chatService.getSessionById(id, request.user!.orgId);
+
+      if (!session.business_scope_id) {
+        return reply.status(404).send({ error: 'No workspace for this session' });
+      }
+
+      const data = await request.file();
+      if (!data) {
+        return reply.status(400).send({ error: 'No file provided' });
+      }
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of data.file) {
+        chunks.push(chunk);
+      }
+
+      if (data.file.truncated) {
+        return reply.status(413).send({ error: 'File too large. Maximum size is 100MB.' });
+      }
+
+      const buffer = Buffer.concat(chunks);
+      const fileName = data.filename;
+
+      const ok = await workspaceManager.writeWorkspaceFileRaw(
+        request.user!.orgId,
+        session.business_scope_id,
+        session.id,
+        fileName,
+        buffer,
+      );
+
+      if (!ok) {
+        return reply.status(400).send({ error: 'Failed to upload file' });
+      }
+
+      return reply.status(200).send({ path: fileName, uploaded: true });
+    },
+  );
+
+  /**
    * POST /api/chat/quick-questions
    * Generate LLM-powered contextual quick questions based on business scope and conversation.
    */
@@ -1272,6 +1662,22 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         session.business_scope_id,
         session.id,
       );
+
+      // In agentcore mode, ensure local workspace is synced from S3 before
+      // starting the dev server. The container writes files to S3 and the
+      // sync-back to local is fire-and-forget, so files may not be present yet.
+      const { config: appConfig } = await import('../config/index.js');
+      if (appConfig.agentRuntime === 'agentcore') {
+        try {
+          await workspaceManager.ensureS3SyncedToLocal(
+            request.user!.orgId,
+            session.business_scope_id,
+            session.id,
+          );
+        } catch (err) {
+          console.warn(`[preview] S3 sync failed for session ${id}:`, err instanceof Error ? err.message : err);
+        }
+      }
 
       try {
         const port = await devServerManager.ensureDevServer(session.id, workspacePath);
@@ -1412,6 +1818,17 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(200).send({ apps: [] });
       }
 
+      // In agentcore mode, the local workspace is a cache that gets synced
+      // from S3 in the background after each agent invocation (fire-and-forget
+      // in runConversation). We skip the blocking S3 sync here because:
+      //   1. detect-apps only needs to know IF an app exists (folder structure),
+      //      not whether file contents are up-to-date.
+      //   2. The publish-from-workspace endpoint does its own ensureS3SyncedToLocal
+      //      before actually copying the bundle, so freshness is guaranteed at
+      //      publish/preview time.
+      //   3. Blocking here adds seconds of latency to every detect-apps call,
+      //      making the app-detector bar feel sluggish after each agent response.
+
       const wsPath = workspaceManager.getSessionWorkspacePath(
         request.user!.orgId,
         session.business_scope_id,
@@ -1442,7 +1859,22 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
           try {
             const { readFile: rf } = await import('fs/promises');
             const pkg = JSON.parse(await rf(pkgPath, 'utf-8'));
-            name = pkg.name || null;
+            // Use package.json name only if it's meaningful (not generic)
+            const pkgName = pkg.name || null;
+            if (pkgName && !['app', 'my-app', 'vite-project', 'react-app', 'my-project'].includes(pkgName)) {
+              name = pkgName;
+            }
+          } catch { /* ignore */ }
+        }
+        // Fallback: try to extract <title> from index.html
+        if (!name) {
+          try {
+            const { readFile: rf } = await import('fs/promises');
+            const htmlContent = await rf(join(wsPath, rootEntry), 'utf-8');
+            const titleMatch = htmlContent.match(/<title[^>]*>([^<]+)<\/title>/i);
+            if (titleMatch && titleMatch[1] && !['Vite App', 'React App', 'Vite + React', 'Document', 'Index'].includes(titleMatch[1].trim())) {
+              name = titleMatch[1].trim();
+            }
           } catch { /* ignore */ }
         }
         apps.push({
@@ -1463,7 +1895,7 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
         try {
           const entries = await readdir(basePath, { withFileTypes: true });
           for (const entry of entries) {
-            if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+            if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'build') continue;
             const dirPath = join(basePath, entry.name);
             const relFolder = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
             const candidates = ['dist/index.html', 'build/index.html', 'index.html'];
@@ -1476,7 +1908,22 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
                 try {
                   const { readFile: rf } = await import('fs/promises');
                   const pkg = JSON.parse(await rf(pkgPath, 'utf-8'));
-                  name = pkg.name || null;
+                  const pkgName = pkg.name || null;
+                  if (pkgName && !['app', 'my-app', 'vite-project', 'react-app', 'my-project'].includes(pkgName)) {
+                    name = pkgName;
+                  }
+                } catch { /* ignore */ }
+              }
+              // Fallback: try HTML title
+              if (!name) {
+                try {
+                  const { readFile: rf } = await import('fs/promises');
+                  const entryPath = found.includes('/') ? join(dirPath, found) : join(dirPath, found);
+                  const htmlContent = await rf(entryPath, 'utf-8');
+                  const titleMatch = htmlContent.match(/<title[^>]*>([^<]+)<\/title>/i);
+                  if (titleMatch && titleMatch[1] && !['Vite App', 'React App', 'Vite + React', 'Document', 'Index'].includes(titleMatch[1].trim())) {
+                    name = titleMatch[1].trim();
+                  }
                 } catch { /* ignore */ }
               }
               apps.push({
@@ -1512,27 +1959,35 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
       });
 
       // Build maps from source_folder → app record
-      const publishedMap = new Map<string, { id: string; published_at: Date | null; version: string }>();
-      const previewMap = new Map<string, string>();
+      const publishedMap = new Map<string, { id: string; published_at: Date | null; version: string; name: string }>();
+      const previewMap = new Map<string, { id: string; name: string }>();
       for (const pa of knownApps) {
         const meta = pa.metadata as Record<string, unknown> | null;
         const srcFolder = meta?.source_folder as string | undefined;
         if (!srcFolder) continue;
         if (pa.status === 'published') {
-          publishedMap.set(srcFolder, { id: pa.id, published_at: pa.published_at, version: pa.version });
+          publishedMap.set(srcFolder, { id: pa.id, published_at: pa.published_at, version: pa.version, name: pa.name });
         } else if (pa.status === 'preview') {
-          previewMap.set(srcFolder, pa.id);
+          previewMap.set(srcFolder, { id: pa.id, name: pa.name });
         }
       }
 
-      // Enrich detected apps with published/preview status
+      // Enrich detected apps with published/preview status.
+      // Use the DB name (set by user during publish) over the package.json name
+      // so that user-edited names survive page refreshes.
       for (const app of apps) {
         const folder = app.folder === '.' ? '.' : app.folder;
         const pubMatch = publishedMap.get(folder);
         app.publishedAppId = pubMatch?.id || null;
         app.publishedAt = pubMatch?.published_at?.toISOString() || null;
         app.publishedVersion = pubMatch?.version || null;
-        app.previewAppId = previewMap.get(folder) || null;
+        app.previewAppId = previewMap.get(folder)?.id || null;
+
+        // Prefer the user-edited name from the most recent publish/preview
+        const dbName = pubMatch?.name || previewMap.get(folder)?.name;
+        if (dbName) {
+          app.name = dbName;
+        }
       }
 
       return reply.status(200).send({ apps });

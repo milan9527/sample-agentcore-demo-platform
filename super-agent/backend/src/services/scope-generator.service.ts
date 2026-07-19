@@ -1,20 +1,22 @@
 /**
  * Scope Generator Service
  *
- * Uses the Claude Agent SDK to generate a business scope + agents
- * from a free-text business description.
+ * Uses the configured Agent Runtime (claude or agentcore) to generate a
+ * business scope + agents from a free-text business description.
+ *
+ * The active runtime is determined by the AGENT_RUNTIME env var via the
+ * shared agent-runtime-factory. When running under AgentCore the workspace
+ * files live in S3 — the service waits for sync-back or reads directly
+ * from S3 before checking for scope-config.json.
  */
 
-import { ClaudeAgentRuntime } from './agent-runtime-claude.js';
+import { agentRuntime } from './agent-runtime-factory.js';
 import type { AgentConfig, ConversationEvent } from './agent-runtime.js';
-
-// Scope/twin generation always uses local Claude runtime (not AgentCore),
-// because the generator needs direct workspace file access.
-const generatorRuntime = new ClaudeAgentRuntime();
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
+import { config } from '../config/index.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -98,7 +100,244 @@ Skill guidelines:
 - Prefer examples and step-by-step procedures over general descriptions
 - Skills should encode domain knowledge the agent wouldn't inherently have
 
-Remember: Write the final JSON to "scope-config.json" in the current directory. This is mandatory.`;
+Remember: Write the final JSON to "scope-config.json" in the current directory. This is mandatory.
+
+CRITICAL BEHAVIORAL RULES:
+- NEVER ask clarifying questions. NEVER ask the user for more information. Work with whatever input is provided, no matter how brief or vague.
+- If the business description is short or ambiguous, make reasonable assumptions and generate a complete configuration immediately.
+- Your ONLY job is to analyze the input and produce the JSON file. Do not engage in conversation.
+- Start working immediately upon receiving the user message. Do not output preamble or ask for confirmation.`;
+
+// ---------------------------------------------------------------------------
+// Language instruction helpers
+// ---------------------------------------------------------------------------
+
+const LANGUAGE_INSTRUCTIONS: Record<string, string> = {
+  en: `
+LANGUAGE REQUIREMENT: All generated content MUST be in English.
+- scope.name, scope.description: English
+- agent.displayName, agent.role, agent.systemPrompt: English
+- skill.name (kebab-case, always English), skill.description, skill.body: English
+- Even if the user's business description is in another language, translate and generate all output in English.`,
+  cn: `
+LANGUAGE REQUIREMENT: All generated content MUST be in Chinese (中文).
+- scope.name, scope.description: 中文
+- agent.displayName, agent.role, agent.systemPrompt: 中文
+- skill.name: 保持 kebab-case 英文格式（如 "analyze-risk"），但 skill.description 和 skill.body 必须使用中文
+- 即使用户的业务描述是英文的，也必须将所有输出翻译为中文生成。
+- 请确保系统提示词（systemPrompt）使用流畅、专业的中文撰写。`,
+};
+
+/**
+ * Build the full system prompt with language-specific instructions appended.
+ */
+function buildSystemPrompt(language?: string): string {
+  const langKey = language === 'cn' ? 'cn' : 'en';
+  return SCOPE_GENERATOR_SYSTEM_PROMPT + '\n' + LANGUAGE_INSTRUCTIONS[langKey];
+}
+
+// ---------------------------------------------------------------------------
+// JSON sanitization helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Fix unescaped control characters and unescaped quotes inside JSON string values.
+ * Walks character by character tracking in-string state.
+ *
+ * This handles the common case where LLMs generate Chinese text containing
+ * unescaped ASCII double quotes (e.g. 你是一名"专业"的风险策略师) which breaks
+ * JSON.parse(). The heuristic: a real closing quote is followed by a JSON
+ * structural character (: , } ]), otherwise it's an interior quote that needs escaping.
+ */
+function fixUnescapedJsonChars(json: string): string {
+  const out: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i]!;
+    if (escaped) { out.push(ch); escaped = false; continue; }
+    if (ch === '\\' && inString) { out.push(ch); escaped = true; continue; }
+    if (ch === '"') {
+      if (!inString) {
+        inString = true;
+        out.push(ch);
+        continue;
+      }
+      // Inside a string — check if this is the real closing quote or unescaped interior quote.
+      // Heuristic: real closing quote is followed by JSON structural char (: , } ])
+      let j = i + 1;
+      while (j < json.length && (json[j] === ' ' || json[j] === '\t' || json[j] === '\r' || json[j] === '\n')) j++;
+      const nextChar: string | undefined = json[j];
+      if (nextChar === ':' || nextChar === ',' || nextChar === '}' || nextChar === ']' || nextChar === undefined) {
+        inString = false;
+        out.push(ch);
+      } else {
+        // Interior quote — escape it
+        out.push('\\"');
+      }
+      continue;
+    }
+    if (inString) {
+      const code = ch.charCodeAt(0);
+      if (code < 0x20) {
+        if (ch === '\n') { out.push('\\n'); continue; }
+        if (ch === '\r') { out.push('\\r'); continue; }
+        if (ch === '\t') { out.push('\\t'); continue; }
+        if (ch === '\b') { out.push('\\b'); continue; }
+        if (ch === '\f') { out.push('\\f'); continue; }
+        out.push('\\u' + code.toString(16).padStart(4, '0'));
+        continue;
+      }
+    }
+    out.push(ch);
+  }
+  return out.join('');
+}
+
+/**
+ * Attempt to parse a JSON string with automatic sanitization on failure.
+ * First tries raw JSON.parse; if that fails, applies fixUnescapedJsonChars
+ * and retries. Returns the parsed value or throws.
+ */
+function robustJsonParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // Attempt sanitization and retry
+    const sanitized = fixUnescapedJsonChars(raw);
+    return JSON.parse(sanitized);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/** Maximum number of repair attempts when the generated JSON is invalid. */
+const MAX_REPAIR_ATTEMPTS = 2;
+
+/**
+ * Validate that a string is valid JSON conforming to the GeneratedScopeConfig
+ * schema. Returns the parsed config on success, or a descriptive error string
+ * on failure.
+ */
+function validateScopeConfigJson(raw: string): { ok: true; config: GeneratedScopeConfig } | { ok: false; error: string } {
+  let parsed: unknown;
+  try {
+    parsed = robustJsonParse(raw);
+  } catch (e) {
+    return { ok: false, error: `Invalid JSON: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, error: 'Root value must be a JSON object' };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+
+  // --- scope ---
+  if (!obj.scope || typeof obj.scope !== 'object' || Array.isArray(obj.scope)) {
+    return { ok: false, error: 'Missing or invalid "scope" object' };
+  }
+  const scope = obj.scope as Record<string, unknown>;
+  for (const field of ['name', 'description', 'icon', 'color']) {
+    if (typeof scope[field] !== 'string' || (scope[field] as string).trim().length === 0) {
+      return { ok: false, error: `scope.${field} must be a non-empty string` };
+    }
+  }
+
+  // --- agents ---
+  if (!Array.isArray(obj.agents) || obj.agents.length === 0) {
+    return { ok: false, error: '"agents" must be a non-empty array' };
+  }
+
+  for (let i = 0; i < obj.agents.length; i++) {
+    const agent = obj.agents[i] as Record<string, unknown>;
+    for (const field of ['name', 'displayName', 'role', 'systemPrompt']) {
+      if (typeof agent[field] !== 'string' || (agent[field] as string).trim().length === 0) {
+        return { ok: false, error: `agents[${i}].${field} must be a non-empty string` };
+      }
+    }
+    if (!Array.isArray(agent.skills)) {
+      return { ok: false, error: `agents[${i}].skills must be an array` };
+    }
+    for (let j = 0; j < (agent.skills as unknown[]).length; j++) {
+      const skill = (agent.skills as Record<string, unknown>[])[j];
+      for (const field of ['name', 'description', 'body']) {
+        if (typeof skill[field] !== 'string' || (skill[field] as string).trim().length === 0) {
+          return { ok: false, error: `agents[${i}].skills[${j}].${field} must be a non-empty string` };
+        }
+      }
+    }
+  }
+
+  return { ok: true, config: parsed as GeneratedScopeConfig };
+}
+
+// ---------------------------------------------------------------------------
+// AgentCore S3 file reading helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Read scope-config.json content, with S3 fallback for AgentCore mode.
+ *
+ * In AgentCore mode the container writes files to S3 via hooks. The Stop hook
+ * runs as fire-and-forget, so the file may not be in S3 yet when we first check.
+ * This function retries S3 reads with backoff to handle the sync delay.
+ */
+async function readConfigFile(
+  localPath: string,
+  s3Prefix: string | undefined,
+): Promise<string | null> {
+  // Fast path: file already on disk
+  if (existsSync(localPath)) {
+    return readFile(localPath, 'utf-8');
+  }
+
+  // In AgentCore mode, poll S3 with retries (container Stop hook is fire-and-forget)
+  if (config.agentRuntime === 'agentcore' && s3Prefix) {
+    const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+    const s3Client = new S3Client({ region: config.agentcore.region });
+    const s3Key = `${s3Prefix}scope-config.json`;
+
+    // Retry up to 6 times with 5s intervals (total ~30s wait for container sync)
+    const MAX_RETRIES = 6;
+    const RETRY_INTERVAL_MS = 5_000;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // Check local first (sync-back may have completed)
+      if (existsSync(localPath)) {
+        return readFile(localPath, 'utf-8');
+      }
+
+      try {
+        console.log(`[scope-generator] Reading scope-config.json from S3 (attempt ${attempt + 1}/${MAX_RETRIES}): s3://${config.agentcore.workspaceS3Bucket}/${s3Key}`);
+        const response = await s3Client.send(new GetObjectCommand({
+          Bucket: config.agentcore.workspaceS3Bucket,
+          Key: s3Key,
+        }));
+        if (response.Body) {
+          const content = await response.Body.transformToString('utf-8');
+          console.log(`[scope-generator] Successfully read scope-config.json from S3 (${content.length} bytes)`);
+          return content;
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        // NoSuchKey means file not yet synced — retry
+        if (errMsg.includes('NoSuchKey') || errMsg.includes('The specified key does not exist')) {
+          console.log(`[scope-generator] scope-config.json not yet in S3, waiting ${RETRY_INTERVAL_MS / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, RETRY_INTERVAL_MS));
+          continue;
+        }
+        // Other errors — log and stop retrying
+        console.warn('[scope-generator] Failed to read scope-config.json from S3:', errMsg);
+        break;
+      }
+    }
+  }
+
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Service
@@ -109,17 +348,21 @@ export class ScopeGeneratorService {
    * Generate a scope configuration by streaming Claude's response.
    * Yields ConversationEvents that can be forwarded as SSE.
    *
+   * After the initial generation, the service validates the produced JSON.
+   * If it is malformed or structurally invalid, the agent is asked to repair
+   * it (up to {@link MAX_REPAIR_ATTEMPTS} times) before giving up.
+   *
    * @param businessDescription - The text prompt for the agent.
    * @param sopDocument - Optional SOP document buffer + filename to place in the workspace.
    *                      The agent will be instructed to read and parse it using its tools.
    */
-  async *generate(businessDescription: string, sopDocument?: { buffer: Buffer; fileName: string }): AsyncGenerator<ConversationEvent> {
+  async *generate(businessDescription: string, sopDocument?: { buffer: Buffer; fileName: string }, language?: string): AsyncGenerator<ConversationEvent> {
       const agentConfig: AgentConfig = {
         id: 'scope-generator',
         name: 'scope-generator',
         displayName: 'Scope Generator',
         organizationId: 'system',
-        systemPrompt: SCOPE_GENERATOR_SYSTEM_PROMPT,
+        systemPrompt: buildSystemPrompt(language),
         skillIds: [],
         mcpServerIds: [],
       };
@@ -152,35 +395,207 @@ export class ScopeGeneratorService {
         message = `Analyze this business and generate a scope configuration with specialized AI agents. Write the final JSON result to "scope-config.json" in the current directory.\n\n${businessDescription}`;
       }
 
+      // Use a stable session ID so repair turns share the same conversation context
+      const sessionId = `scope-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      // Compute S3 prefix for AgentCore mode (must match what AgentCoreAgentRuntime builds)
+      const s3Prefix = config.agentRuntime === 'agentcore'
+        ? `system/system/${sessionId}/`
+        : undefined;
+
       try {
-        yield* generatorRuntime.runConversation(
+        // ---- Initial generation ----
+        // Collect text output for fallback JSON extraction (in case file-based
+        // retrieval fails — e.g. AgentCore container doesn't sync to S3 in time)
+        const allTextBlocks: string[] = [];
+
+        for await (const event of agentRuntime.runConversation(
           {
             agentId: 'scope-generator',
-            sessionId: `scope-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            sessionId,
             message,
             organizationId: 'system',
             userId: 'system',
             workspacePath: tempWorkspace,
+            scopeId: 'system',
           },
           agentConfig,
           [], // no skills needed for generation
-        );
+        )) {
+          // Collect text and tool_use content for fallback extraction
+          if ((event.type === 'assistant' || event.type === 'result') && event.content) {
+            for (const block of event.content) {
+              if (block.type === 'text' && 'text' in block) {
+                allTextBlocks.push((block as { type: 'text'; text: string }).text);
+              }
+              // Also capture tool_use input.content — Agent writes JSON via Write tool
+              if (block.type === 'tool_use' && 'input' in block) {
+                const input = (block as { type: 'tool_use'; input: Record<string, unknown> }).input;
+                if (typeof input.content === 'string') {
+                  allTextBlocks.push(input.content);
+                }
+              }
+            }
+          }
+          yield event;
+        }
 
-        // After conversation ends, read the generated JSON file from workspace
-        if (existsSync(configFilePath)) {
-          const fileContent = await readFile(configFilePath, 'utf-8');
+        console.log(`[scope-generator] Collected ${allTextBlocks.length} text blocks, total ${allTextBlocks.reduce((s, b) => s + b.length, 0)} chars`);
+
+        // ---- Validate: file first, then text extraction fallback ----
+        let validConfig: GeneratedScopeConfig | null = null;
+
+        // Strategy 1: Read from file (local or S3)
+        const fileContent = await readConfigFile(configFilePath, s3Prefix);
+        if (fileContent) {
+          const result = validateScopeConfigJson(fileContent);
+          if (result.ok) {
+            validConfig = result.config;
+            console.log('[scope-generator] scope-config.json validated successfully (from file)');
+          } else {
+            console.warn(`[scope-generator] scope-config.json invalid: ${result.error}`);
+          }
+        } else {
+          console.warn('[scope-generator] scope-config.json not found in file or S3');
+        }
+
+        // Strategy 2: Extract JSON from conversation text output
+        if (!validConfig) {
+          console.log('[scope-generator] Attempting to extract config from conversation text...');
+          const fullText = allTextBlocks.join('');
+          const extracted = this.extractConfigFromText(fullText);
+          if (extracted) {
+            const result = validateScopeConfigJson(extracted);
+            if (result.ok) {
+              validConfig = result.config;
+              console.log('[scope-generator] scope-config.json validated successfully (from text extraction)');
+            } else {
+              console.warn(`[scope-generator] Extracted JSON invalid: ${result.error}`);
+            }
+          } else {
+            console.warn('[scope-generator] Could not extract JSON from conversation text');
+          }
+        }
+
+        // Emit the validated config to the frontend
+        if (validConfig) {
           yield {
             type: 'scope_config' as ConversationEvent['type'],
-            content: fileContent,
+            content: JSON.stringify(validConfig),
           } as unknown as ConversationEvent;
-        } else {
-          console.warn('[scope-generator] scope-config.json not found in workspace');
         }
       } finally {
         // Clean up temp workspace
         rm(tempWorkspace, { recursive: true, force: true }).catch(() => {});
       }
     }
+
+  /**
+   * Extract scope config JSON from conversation text output.
+   * The agent often outputs the JSON as a tool_use content block with
+   * file_path and content fields, or inside a json code fence.
+   */
+  private extractConfigFromText(text: string): string | null {
+    if (!text || text.length === 0) return null;
+
+    // Strategy 1: Find JSON with "scope" and "agents" keys directly
+    // Look for the largest valid JSON object containing both keys
+    const candidates: string[] = [];
+
+    // Try json code fences first
+    const fenceRegex = /```(?:json)?\s*([\s\S]*?)```/g;
+    let fenceMatch;
+    while ((fenceMatch = fenceRegex.exec(text)) !== null) {
+      const content = fenceMatch[1]!.trim();
+      if (content.includes('"scope"') && content.includes('"agents"')) {
+        candidates.push(content);
+      }
+    }
+
+    // Strategy 2: Look for "content" field in tool_use blocks that contains
+    // escaped JSON with scope/agents (Agent writes file via Write tool)
+    const contentRegex = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+    let contentMatch;
+    while ((contentMatch = contentRegex.exec(text)) !== null) {
+      try {
+        const unescaped = JSON.parse(`"${contentMatch[1]}"`);
+        if (typeof unescaped === 'string' && unescaped.includes('"scope"') && unescaped.includes('"agents"')) {
+          candidates.push(unescaped);
+        }
+      } catch { /* not valid escaped string */ }
+    }
+
+    // Strategy 3: Find any JSON object with scope+agents by scanning for { ... }
+    // Use a simple brace-matching approach
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] !== '{') continue;
+      // Quick check: does the text from here contain both keys?
+      const remaining = text.slice(i, i + 50000);
+      if (!remaining.includes('"scope"') || !remaining.includes('"agents"')) continue;
+
+      let depth = 0;
+      let end = -1;
+      for (let j = i; j < text.length; j++) {
+        if (text[j] === '{') depth++;
+        else if (text[j] === '}') {
+          depth--;
+          if (depth === 0) { end = j; break; }
+        }
+      }
+      if (end > i) {
+        const candidate = text.slice(i, end + 1);
+        if (candidate.length > 100) { // skip tiny fragments
+          candidates.push(candidate);
+        }
+      }
+    }
+
+    // Try to parse each candidate, return the first valid one
+    for (const candidate of candidates) {
+      try {
+        const parsed = robustJsonParse(candidate);
+        if (parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).scope && Array.isArray((parsed as Record<string, unknown>).agents)) {
+          console.log(`[scope-generator] Extracted valid config from text (${candidate.length} chars)`);
+          // Return the re-serialized JSON to ensure it's clean
+          return JSON.stringify(parsed);
+        }
+      } catch { /* not valid JSON */ }
+    }
+
+    return null;
+  }
+
+  /**
+   * Ask the agent to repair the scope-config.json file within the same
+   * conversation session. Yields all conversation events so the frontend
+   * can display progress.
+   */
+  private async *requestRepair(
+    sessionId: string,
+    workspacePath: string,
+    agentConfig: AgentConfig,
+    repairMessage: string,
+  ): AsyncGenerator<ConversationEvent> {
+    // Notify the frontend that a repair is in progress
+    yield {
+      type: 'assistant' as ConversationEvent['type'],
+      content: [{ type: 'text', text: '\n\n🔄 Validating and repairing scope configuration...\n' }],
+    } as unknown as ConversationEvent;
+
+    yield* agentRuntime.runConversation(
+      {
+        agentId: 'scope-generator',
+        sessionId,
+        message: repairMessage,
+        organizationId: 'system',
+        userId: 'system',
+        workspacePath,
+        scopeId: 'system',
+      },
+      agentConfig,
+      [],
+    );
+  }
 
   /**
    * Generate a Digital Twin configuration by streaming Claude's response.
@@ -276,8 +691,8 @@ QUALITY CHECK — before outputting, verify:
       // Use a unique session ID per generation to avoid AgentCore session reuse
       const uniqueSessionId = `twin-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-      for await (const event of generatorRuntime.runConversation(
-        { agentId: 'twin-generator', sessionId: uniqueSessionId, message, organizationId: 'system', userId: 'system', workspacePath: tempWorkspace },
+      for await (const event of agentRuntime.runConversation(
+        { agentId: 'twin-generator', sessionId: uniqueSessionId, message, organizationId: 'system', userId: 'system', workspacePath: tempWorkspace, scopeId: 'system' },
         agentConfig,
         [],
       )) {
@@ -296,7 +711,14 @@ QUALITY CHECK — before outputting, verify:
       if (existsSync(configFilePath)) {
         const fileContent = await readFile(configFilePath, 'utf-8');
         console.log(`[twin-generator] scope-config.json found (${fileContent.length} bytes)`);
-        yield { type: 'scope_config' as ConversationEvent['type'], content: fileContent } as unknown as ConversationEvent;
+        // Re-serialize through robustJsonParse to fix any unescaped quotes in Chinese text
+        try {
+          const parsed = robustJsonParse(fileContent);
+          yield { type: 'scope_config' as ConversationEvent['type'], content: JSON.stringify(parsed) } as unknown as ConversationEvent;
+        } catch (e) {
+          console.warn(`[twin-generator] scope-config.json parse failed: ${e instanceof Error ? e.message : String(e)}, sending raw`);
+          yield { type: 'scope_config' as ConversationEvent['type'], content: fileContent } as unknown as ConversationEvent;
+        }
       } else {
         // Strategy 2: Extract JSON from the conversation text
         console.log('[twin-generator] scope-config.json not found, extracting from conversation text...');
@@ -328,8 +750,8 @@ QUALITY CHECK — before outputting, verify:
     const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fenceMatch) {
       try {
-        const parsed = JSON.parse(fenceMatch[1]!.trim());
-        if (parsed.systemPrompt || parsed.skills) return JSON.stringify(parsed);
+        const parsed = robustJsonParse(fenceMatch[1]!.trim());
+        if ((parsed as Record<string, unknown>).systemPrompt || (parsed as Record<string, unknown>).skills) return JSON.stringify(parsed);
       } catch { /* not valid JSON */ }
     }
 
@@ -354,9 +776,9 @@ QUALITY CHECK — before outputting, verify:
     candidates.sort((a, b) => b.length - a.length);
     for (const candidate of candidates) {
       try {
-        const parsed = JSON.parse(candidate);
-        if (parsed.systemPrompt || parsed.skills || (parsed.scope && parsed.systemPrompt !== undefined)) {
-          return candidate;
+        const parsed = robustJsonParse(candidate);
+        if ((parsed as Record<string, unknown>).systemPrompt || (parsed as Record<string, unknown>).skills || ((parsed as Record<string, unknown>).scope && (parsed as Record<string, unknown>).systemPrompt !== undefined)) {
+          return JSON.stringify(parsed);
         }
       } catch { continue; }
     }
@@ -390,7 +812,7 @@ QUALITY CHECK — before outputting, verify:
       jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
     }
 
-    const parsed = JSON.parse(jsonStr);
+    const parsed = robustJsonParse(jsonStr);
 
     // Validate structure
     if (!parsed.scope || !parsed.agents || !Array.isArray(parsed.agents)) {

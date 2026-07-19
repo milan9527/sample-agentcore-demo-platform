@@ -11,6 +11,7 @@ import { skillRepository } from '../repositories/skill.repository.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { businessScopeService } from './businessScope.service.js';
 import { agentStatusService } from './agent-status.service.js';
+import { getAgentTokenUsage } from './token-usage.service.js';
 import { prisma } from '../config/database.js';
 import type { CreateAgentInput, UpdateAgentInput, AgentFilter } from '../schemas/agent.schema.js';
 
@@ -132,6 +133,15 @@ export class AgentService {
       agent.tools = toolsWithContent;
     }
 
+    // Enrich with token usage metrics (non-blocking)
+    try {
+      const tokenUsage = await getAgentTokenUsage(organizationId, id);
+      (agent as any).tokenUsage = tokenUsage.totalTokens;
+      (agent as any).estimatedCostUsd = tokenUsage.estimatedCostUsd;
+    } catch {
+      // Non-critical — don't fail the request
+    }
+
     return agent;
   }
 
@@ -144,7 +154,7 @@ export class AgentService {
    * @returns The created agent
    * @throws AppError.validation if name is empty or invalid
    */
-  async createAgent(data: CreateAgentInput, organizationId: string): Promise<AgentEntity> {
+  async createAgent(data: CreateAgentInput, organizationId: string, userId?: string): Promise<AgentEntity> {
     // Validate required fields
     if (!data.name || data.name.trim() === '') {
       throw AppError.validation('Agent name is required');
@@ -154,10 +164,11 @@ export class AgentService {
       throw AppError.validation('Display name is required');
     }
 
-    // Check for duplicate name within organization
-    const existingAgent = await agentRepository.findByName(organizationId, data.name);
+    // Check for duplicate name within the same business scope
+    const scopeId = data.business_scope_id ?? null;
+    const existingAgent = await agentRepository.findByName(organizationId, data.name, scopeId);
     if (existingAgent) {
-      throw AppError.conflict(`Agent with name "${data.name}" already exists`);
+      throw AppError.conflict(`Agent with name "${data.name}" already exists in this scope`);
     }
 
     // Create the agent
@@ -176,9 +187,27 @@ export class AgentService {
         model_config: data.model_config ?? {},
         origin: data.origin ?? 'scope_generation',
         is_shared: data.is_shared ?? false,
-      },
+        created_by: userId ?? null,
+      } as any,
       organizationId
     );
+
+    // Create owner permission record for the creator
+    if (userId) {
+      try {
+        await (prisma as any).agent_permissions.create({
+          data: {
+            organization_id: organizationId,
+            agent_id: agent.id,
+            user_id: userId,
+            permission: 'owner',
+            granted_by: userId,
+          },
+        });
+      } catch (err) {
+        console.error(`Failed to create owner permission for agent ${agent.id}:`, err);
+      }
+    }
 
     // Create scope assignment if agent belongs to a scope
     if (agent.business_scope_id) {
@@ -226,10 +255,11 @@ export class AgentService {
         throw AppError.validation('Agent name cannot be empty');
       }
 
-      // Check for duplicate name (excluding current agent)
-      const agentWithName = await agentRepository.findByName(organizationId, data.name);
+      // Check for duplicate name within the same scope (excluding current agent)
+      const scopeId = data.business_scope_id !== undefined ? data.business_scope_id : existingAgent.business_scope_id;
+      const agentWithName = await agentRepository.findByName(organizationId, data.name, scopeId);
       if (agentWithName && agentWithName.id !== id) {
-        throw AppError.conflict(`Agent with name "${data.name}" already exists`);
+        throw AppError.conflict(`Agent with name "${data.name}" already exists in this scope`);
       }
     }
 
@@ -256,6 +286,11 @@ export class AgentService {
     if (data.system_prompt !== undefined) updateData.system_prompt = data.system_prompt;
     if (data.model_config !== undefined) updateData.model_config = data.model_config;
 
+    // A2A fields
+    if (data.a2a_enabled !== undefined) updateData.a2a_enabled = data.a2a_enabled;
+    if (data.a2a_capabilities !== undefined) updateData.a2a_capabilities = data.a2a_capabilities;
+    if (data.a2a_exposed_skills !== undefined) updateData.a2a_exposed_skills = data.a2a_exposed_skills;
+
     const updatedAgent = await agentRepository.update(id, organizationId, updateData);
 
     if (!updatedAgent) {
@@ -267,6 +302,13 @@ export class AgentService {
     if (scopeId) {
       await businessScopeService.bumpConfigVersion(scopeId, organizationId).catch((err) => {
         console.error(`Failed to bump config_version for scope ${scopeId}:`, err);
+      });
+    }
+
+    // A2A Registry sync (fire-and-forget)
+    if (data.a2a_enabled !== undefined) {
+      this.syncA2ARegistry(updatedAgent, existingAgent).catch(err => {
+        console.warn('[agent] A2A registry sync failed:', err);
       });
     }
 
@@ -465,6 +507,88 @@ export class AgentService {
     } catch (err) {
       // Non-critical — log and return agents with their existing metrics
       console.error('[agent-service] Failed to enrich metrics:', err);
+    }
+  }
+
+  /**
+   * Sync A2A registration to AgentCore Registry.
+   * Called fire-and-forget after agent update when a2a_enabled changes.
+   */
+  private async syncA2ARegistry(
+    updatedAgent: AgentEntity,
+    previousAgent: AgentEntity,
+  ): Promise<void> {
+    const { agentCoreRegistryService } = await import('./agentcore-registry.service.js');
+
+    const wasEnabled = (previousAgent as any).a2a_enabled === true;
+    const isEnabled = (updatedAgent as any).a2a_enabled === true;
+
+    if (isEnabled && !wasEnabled) {
+      // Turning ON — register to Registry
+      const skills = await skillRepository.findByAgentId(updatedAgent.organization_id, updatedAgent.id);
+      const exposedSkillIds: string[] = (updatedAgent as any).a2a_exposed_skills ?? [];
+      const exposedSkills = exposedSkillIds.length > 0
+        ? skills.filter(s => exposedSkillIds.includes(s.id))
+        : skills;
+
+      const result = await agentCoreRegistryService.syncAgentA2A({
+        id: updatedAgent.id,
+        name: updatedAgent.name,
+        display_name: updatedAgent.display_name,
+        role: updatedAgent.role ?? undefined,
+        organization_id: updatedAgent.organization_id,
+        business_scope_id: updatedAgent.business_scope_id ?? undefined,
+        a2a_capabilities: (updatedAgent as any).a2a_capabilities ?? undefined,
+        skills: exposedSkills.map(s => ({ id: s.id, name: s.name, description: s.description ?? undefined })),
+      });
+
+      if (result) {
+        // Save registry record ID back to agent
+        await agentRepository.update(updatedAgent.id, updatedAgent.organization_id, {
+          registry_record_id: result.recordId,
+          registry_record_arn: result.recordArn,
+        } as any);
+        console.log(`[agent] A2A registered: ${updatedAgent.name} → ${result.recordId}`);
+      }
+    } else if (!isEnabled && wasEnabled) {
+      // Turning OFF — remove from Registry
+      const recordId = (previousAgent as any).registry_record_id;
+      if (recordId) {
+        await agentCoreRegistryService.removeAgentA2A(recordId);
+        await agentRepository.update(updatedAgent.id, updatedAgent.organization_id, {
+          registry_record_id: null,
+          registry_record_arn: null,
+        } as any);
+        console.log(`[agent] A2A unregistered: ${updatedAgent.name}`);
+      }
+    } else if (isEnabled && wasEnabled) {
+      // Still ON but config changed — update Registry record
+      const recordId = (previousAgent as any).registry_record_id;
+      if (recordId && agentCoreRegistryService.registryId) {
+        const skills = await skillRepository.findByAgentId(updatedAgent.organization_id, updatedAgent.id);
+        const exposedSkillIds: string[] = (updatedAgent as any).a2a_exposed_skills ?? [];
+        const exposedSkills = exposedSkillIds.length > 0
+          ? skills.filter(s => exposedSkillIds.includes(s.id))
+          : skills;
+
+        const descriptors = agentCoreRegistryService.buildA2ADescriptors({
+          id: updatedAgent.id,
+          name: updatedAgent.name,
+          display_name: updatedAgent.display_name,
+          role: updatedAgent.role ?? undefined,
+          organization_id: updatedAgent.organization_id,
+          business_scope_id: updatedAgent.business_scope_id ?? undefined,
+          a2a_capabilities: (updatedAgent as any).a2a_capabilities ?? undefined,
+          skills: exposedSkills.map(s => ({ id: s.id, name: s.name, description: s.description ?? undefined })),
+        });
+
+        await agentCoreRegistryService.updateRecord(
+          agentCoreRegistryService.registryId,
+          recordId,
+          { descriptors, description: (updatedAgent as any).a2a_capabilities || updatedAgent.role },
+        );
+        console.log(`[agent] A2A updated: ${updatedAgent.name}`);
+      }
     }
   }
 }

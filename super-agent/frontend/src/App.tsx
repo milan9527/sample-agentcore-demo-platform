@@ -1,8 +1,10 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { TranslationProvider } from '@/i18n'
 import { AppShell, ErrorBoundary, ToastProvider, ProtectedRoute, SkillMarketplaceBrowser, AIScopeGenerator, SkillWorkshop } from '@/components'
 import { Dashboard, Chat, WorkflowEditor, Agents, Tools, AgentConfigurator, TaskAuditLog, TaskExecutionCenter, MCPConfigurator, KnowledgeManager, InfrastructureConfigurator, Login, CreateBusinessScope, Marketplace, AppRunner } from '@/pages'
+import { KnowledgeBaseDrive } from '@/pages/KnowledgeBaseDrive'
 import { StarredSessions } from '@/pages/StarredSessions'
+import { ShowcasePage } from '@/pages/ShowcasePage'
 import { Settings } from '@/pages/Settings'
 import { AuthCallback } from '@/pages/AuthCallback'
 import { InviteAccept } from '@/pages/InviteAccept'
@@ -10,10 +12,19 @@ import { ChatRoomPage } from '@/pages/ChatRoomPage'
 import { DigitalTwinWizard } from '@/pages/DigitalTwinWizard'
 import { Projects } from '@/pages/Projects'
 import { ProjectBoard } from '@/pages/ProjectBoard'
+import { SupportWorkspace } from '@/pages/SupportWorkspace'
+import { SupportSettings } from '@/pages/SupportSettings'
+import { SupportAnalytics } from '@/pages/SupportAnalytics'
+import { SupportKnowledge } from '@/pages/SupportKnowledge'
+import { SupportLive } from '@/pages/SupportLive'
+import { Approvals } from '@/pages/Approvals'
 import { AuthProvider } from '@/services/AuthContext'
 import { ThemeProvider } from '@/services/ThemeContext'
+import { FeatureTogglesProvider } from '@/services/FeatureTogglesContext'
+import { useTranslation } from '@/i18n'
 
 function AppContent() {
+  const { t } = useTranslation()
   return (
     <Routes>
       {/* Full-page routes without AppShell */}
@@ -26,10 +37,12 @@ function AppContent() {
       <Route path="/*" element={
         <AppShell>
           <Routes>
-            <Route path="/" element={<Dashboard />} />
+            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+            <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/chat" element={<Chat />} />
             <Route path="/chat/room/:roomId" element={<ChatRoomPage />} />
             <Route path="/workflow" element={<WorkflowEditor />} />
+            <Route path="/approvals" element={<Approvals />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/agents/config/:agentId" element={<AgentConfigurator />} />
             <Route path="/projects" element={<Projects />} />
@@ -40,12 +53,19 @@ function AppContent() {
             {/* Config routes - placeholder for admin menu navigation */}
             <Route path="/config/mcp" element={<MCPConfigurator />} />
             <Route path="/config/skills" element={<SkillMarketplaceBrowser />} />
-            <Route path="/config/rest-api" element={<div className="p-6 text-white">REST API Configuration</div>} />
+            <Route path="/config/rest-api" element={<div className="p-6 text-white">{t('config.restApi')}</div>} />
             <Route path="/config/knowledge" element={<KnowledgeManager />} />
+            <Route path="/knowledge" element={<KnowledgeBaseDrive />} />
             <Route path="/config/framework" element={<InfrastructureConfigurator />} />
             <Route path="/apps" element={<Marketplace />} />
             <Route path="/apps/:id" element={<AppRunner />} />
+            <Route path="/support" element={<SupportWorkspace />} />
+            <Route path="/support/live" element={<SupportLive />} />
+            <Route path="/support/settings" element={<SupportSettings />} />
+            <Route path="/support/analytics" element={<SupportAnalytics />} />
+            <Route path="/support/knowledge" element={<SupportKnowledge />} />
             <Route path="/starred" element={<StarredSessions />} />
+            <Route path="/showcase" element={<ShowcasePage />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </AppShell>
@@ -62,16 +82,18 @@ function App() {
           <TranslationProvider>
             <ToastProvider>
               <AuthProvider>
-                <Routes>
-                  <Route path="/login" element={<Login />} />
-                  <Route path="/auth/callback" element={<AuthCallback />} />
-                  <Route path="/invite/:token" element={<InviteAccept />} />
-                  <Route path="/*" element={
-                    <ProtectedRoute>
-                      <AppContent />
-                    </ProtectedRoute>
-                  } />
-                </Routes>
+                <FeatureTogglesProvider>
+                  <Routes>
+                    <Route path="/login" element={<Login />} />
+                    <Route path="/auth/callback" element={<AuthCallback />} />
+                    <Route path="/invite/:token" element={<InviteAccept />} />
+                    <Route path="/*" element={
+                      <ProtectedRoute>
+                        <AppContent />
+                      </ProtectedRoute>
+                    } />
+                  </Routes>
+                </FeatureTogglesProvider>
               </AuthProvider>
             </ToastProvider>
           </TranslationProvider>

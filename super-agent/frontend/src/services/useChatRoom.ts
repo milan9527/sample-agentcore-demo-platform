@@ -36,7 +36,7 @@ interface UseChatRoomReturn {
   removeMember: (agentId: string) => Promise<void>;
 
   // Messaging
-  sendMessage: (content: string, mentionAgentId?: string) => Promise<RouteDecision | null>;
+  sendMessage: (content: string, mentionAgentId?: string, swarm?: boolean) => Promise<RouteDecision | null>;
   isSending: boolean;
   loadMoreMessages: () => Promise<void>;
 
@@ -124,7 +124,7 @@ export function useChatRoom(options: UseChatRoomOptions = {}): UseChatRoomReturn
     setMembers(updated);
   }, [room]);
 
-  const sendMessage = useCallback(async (content: string, mentionAgentId?: string): Promise<RouteDecision | null> => {
+  const sendMessage = useCallback(async (content: string, mentionAgentId?: string, swarm?: boolean): Promise<RouteDecision | null> => {
     if (!room) return null;
 
     // Optimistically add user message to UI
@@ -166,7 +166,7 @@ export function useChatRoom(options: UseChatRoomOptions = {}): UseChatRoomReturn
       const response = await fetch(`${baseUrl}/api/chat/rooms/${room.id}/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ content, mention_agent_id: mentionAgentId }),
+        body: JSON.stringify({ content, mention_agent_id: mentionAgentId, swarm: swarm || undefined }),
       });
 
       if (!response.ok) {
@@ -205,6 +205,32 @@ export function useChatRoom(options: UseChatRoomOptions = {}): UseChatRoomReturn
               setMessages(prev => prev.map(m =>
                 m.id === aiMsgId ? { ...m, agent_id: parsed.targetAgentId } : m
               ));
+            } else if (parsed.type === 'leader_evaluating') {
+              // Leader is evaluating the message
+              setMessages(prev => prev.map(m =>
+                m.id === aiMsgId ? { ...m, content: `👑 ${parsed.leaderName} 正在评估...`, agent_id: parsed.leaderId } : m
+              ));
+            } else if (parsed.type === 'leader_decision') {
+              // Leader made a decision
+              const actionLabel = parsed.action === 'self' ? '自己回答'
+                : parsed.action === 'delegate' ? '委派给其他 Agent'
+                : parsed.action === 'collaborate' ? '多 Agent 协作'
+                : '无需回应';
+              setMessages(prev => prev.map(m =>
+                m.id === aiMsgId ? { ...m, content: `👑 Leader 决策: ${actionLabel}\n${parsed.reasoning}` } : m
+              ));
+            } else if (parsed.type === 'agent_finding') {
+              // An agent completed its sub-task (async progress)
+              setMessages(prev => prev.map(m =>
+                m.id === aiMsgId ? { ...m, content: (m.content ? m.content + '\n' : '') + `✅ ${parsed.agentName} 完成 (${parsed.durationMs}ms)` } : m
+              ));
+            } else if (parsed.type === 'swarm_started') {
+              // Multi-agent collaboration started — update placeholder
+              setMessages(prev => prev.map(m =>
+                m.id === aiMsgId ? { ...m, content: `🤖 Multi-agent collaboration started (${parsed.agents?.length ?? 0} agents)...` } : m
+              ));
+            } else if (parsed.type === 'swarm_completed') {
+              // Collaboration finished — info will be in the final assistant message
             } else if (parsed.type === 'assistant' && Array.isArray(parsed.content)) {
               allBlocks.push(...parsed.content);
               // Extract text from accumulated blocks

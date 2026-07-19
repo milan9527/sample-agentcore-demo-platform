@@ -20,6 +20,7 @@ export interface MemoryEntry {
   category: string;
   tags: string[];
   is_pinned: boolean;
+  visibility?: 'scope' | 'user' | 'session';
   created_at: Date;
 }
 
@@ -44,7 +45,7 @@ export interface MemoryProvider {
   search(query: string, context: MemoryContext, limit?: number): Promise<MemoryEntry[]>;
 
   /** Load memories for CLAUDE.md injection (bulk, non-semantic). */
-  loadForContext(scopeId: string): Promise<MemoryEntry[]>;
+  loadForContext(scopeId: string, userId?: string): Promise<MemoryEntry[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ export class PostgresMemoryProvider implements MemoryProvider {
       category: entry.category,
       tags: entry.tags,
       is_pinned: entry.is_pinned,
+      visibility: entry.visibility ?? 'scope',
       created_by: context.userId ?? null,
     });
     return created.id;
@@ -80,9 +82,9 @@ export class PostgresMemoryProvider implements MemoryProvider {
     return results.map(toMemoryEntry);
   }
 
-  async loadForContext(scopeId: string): Promise<MemoryEntry[]> {
+  async loadForContext(scopeId: string, userId?: string): Promise<MemoryEntry[]> {
     const { scopeMemoryRepository } = await import('../repositories/scope-memory.repository.js');
-    const results = await scopeMemoryRepository.findForContext(scopeId);
+    const results = await scopeMemoryRepository.findForContext(scopeId, userId);
     return results.map(toMemoryEntry);
   }
 }
@@ -121,8 +123,9 @@ export class VectorMemoryProvider implements MemoryProvider {
     }));
   }
 
-  async loadForContext(scopeId: string): Promise<MemoryEntry[]> {
+  async loadForContext(scopeId: string, _userId?: string): Promise<MemoryEntry[]> {
     // For bulk loading, use a broad semantic query
+    // TODO: Add visibility filtering to vector search when pgvector supports metadata filters
     const { vectorMemoryService } = await import('./vector-memory.service.js');
     const results = await vectorMemoryService.search(
       'important knowledge lessons patterns and gaps',

@@ -1,8 +1,10 @@
-import { Users, Monitor, Megaphone, DollarSign, Headphones, Briefcase, Settings, TrendingUp } from 'lucide-react'
+import { Users, Monitor, Megaphone, DollarSign, Headphones, Briefcase, Settings, TrendingUp, Search, User, LayoutGrid, List } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
 import type { Agent, AgentStatus } from '@/types'
 import { useTranslation } from '@/i18n'
 import { useBusinessScopes } from '@/services/useBusinessScopes'
 import { getAvatarDisplayUrl, getAvatarFallback, shouldShowAvatarImage } from '@/utils/avatarUtils'
+import { AgentCard } from './AgentCard'
 
 interface AgentListProps {
   agents: Agent[]
@@ -45,9 +47,30 @@ const statusColors: Record<AgentStatus, { dot: string }> = {
 export function AgentList({ agents, selectedAgentId, selectedScopeId, onSelectAgent, onSelectScope }: AgentListProps) {
   const { t } = useTranslation()
   const { businessScopes } = useBusinessScopes()
+  const [search, setSearch] = useState('')
+  const [viewMode, setViewMode] = useState<'list' | 'card'>('list')
+  const selectedRef = useRef<HTMLElement>(null)
+
+  // Scroll selected item into view on mount or selection change
+  useEffect(() => {
+    if (selectedRef.current) {
+      selectedRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }
+  }, [selectedAgentId, selectedScopeId])
+
+  const query = search.trim().toLowerCase()
+
+  // Filter agents by search query (name, role, displayName)
+  const filteredAgents = query
+    ? agents.filter(a =>
+        a.displayName.toLowerCase().includes(query) ||
+        (a.role ?? '').toLowerCase().includes(query) ||
+        a.name.toLowerCase().includes(query)
+      )
+    : agents
 
   // Group agents by their department (which is actually business_scope_id from Supabase)
-  const agentsByScope = agents.reduce<Record<string, Agent[]>>((acc, agent) => {
+  const agentsByScope = filteredAgents.reduce<Record<string, Agent[]>>((acc, agent) => {
     const scopeId = agent.department // department field holds business_scope_id
     if (!acc[scopeId]) {
       acc[scopeId] = []
@@ -92,152 +115,255 @@ export function AgentList({ agents, selectedAgentId, selectedScopeId, onSelectAg
     // Independent agents last
     ...(agentsByScope['__independent__'] ? ['__independent__'] : []),
   ]
-  const scopeIds = allScopeIds
+  // When searching, also include scopes whose name matches (even if no agent matches)
+  const filteredScopeIds = query
+    ? allScopeIds.filter(id => {
+        // Keep if scope has matching agents
+        if ((agentsByScope[id] || []).length > 0) return true
+        // Keep if scope name matches
+        const scope = businessScopes.find(s => s.id === id)
+        if (scope && scope.name.toLowerCase().includes(query)) return true
+        return false
+      })
+    : allScopeIds
+  const scopeIds = filteredScopeIds
+
+  // Separate scope IDs into categories for structured rendering
+  const businessScopeIds = scopeIds.filter(id => {
+    if (id === '__independent__') return false
+    const s = businessScopes.find(bs => bs.id === id)
+    return s ? s.scopeType !== 'digital_twin' : true // legacy departments go here too
+  })
+  const digitalTwinScopeIds = scopeIds.filter(id => {
+    const s = businessScopes.find(bs => bs.id === id)
+    return s?.scopeType === 'digital_twin'
+  })
+  const hasIndependent = scopeIds.includes('__independent__')
+
+  // Shared renderer for a single agent card
+  const renderAgentCard = (agent: Agent) => {
+    const isSelected = agent.id === selectedAgentId
+    const statusStyle = statusColors[agent.status] || statusColors.active
+
+    return (
+      <button
+        key={agent.id}
+        ref={isSelected ? selectedRef as React.RefObject<HTMLButtonElement> : undefined}
+        onClick={() => onSelectAgent(agent.id)}
+        className={`
+          w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-all
+          ${isSelected
+            ? 'bg-blue-600/20 border border-blue-500/50'
+            : 'hover:bg-gray-800 border border-transparent'
+          }
+        `}
+      >
+        <div className="relative flex-shrink-0">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-sm font-medium overflow-hidden">
+            {(() => {
+              const avatarUrl = getAvatarDisplayUrl(agent.avatar)
+              const avatarFallback = getAvatarFallback(agent.displayName, agent.avatar)
+              const showImage = shouldShowAvatarImage(agent.avatar)
+              if (showImage && avatarUrl) {
+                return (
+                  <img
+                    src={avatarUrl}
+                    alt={agent.displayName}
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none'
+                      e.currentTarget.parentElement!.textContent = avatarFallback
+                    }}
+                  />
+                )
+              }
+              return avatarFallback
+            })()}
+          </div>
+          <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full ${statusStyle.dot} border-2 border-gray-900`} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className={`text-sm font-medium truncate ${isSelected ? 'text-blue-400' : 'text-white'}`}>
+            {agent.displayName}
+          </p>
+          <p className="text-xs text-gray-400 truncate">{agent.role}</p>
+        </div>
+      </button>
+    )
+  }
+
+  // Shared renderer for a digital twin card (scope-level, clickable to scope detail)
+  const renderDigitalTwinCard = (scopeId: string) => {
+    const scope = businessScopes.find(s => s.id === scopeId)
+    if (!scope) return null
+    const isSelected = selectedScopeId === scopeId && !selectedAgentId
+    const avatarUrl = getAvatarDisplayUrl(scope.avatar ?? null)
+    const avatarFallback = getAvatarFallback(scope.name, scope.avatar)
+    const showImage = shouldShowAvatarImage(scope.avatar ?? null)
+
+    return (
+      <div key={scopeId} className="px-2 mb-1" ref={isSelected ? selectedRef as React.RefObject<HTMLDivElement> : undefined}>
+        <button
+          onClick={() => onSelectScope(scopeId)}
+          className={`
+            w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-all
+            ${isSelected
+              ? 'bg-blue-600/20 border border-blue-500/50'
+              : 'hover:bg-gray-800 border border-transparent'
+            }
+          `}
+        >
+          <div className="relative flex-shrink-0">
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-sm font-medium overflow-hidden">
+              {showImage && avatarUrl ? (
+                <img
+                  src={avatarUrl}
+                  alt={scope.name}
+                  className="w-full h-full object-cover"
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none'
+                    e.currentTarget.parentElement!.textContent = avatarFallback
+                  }}
+                />
+              ) : avatarFallback}
+            </div>
+            <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-green-500 border-2 border-gray-900" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className={`text-sm font-medium truncate ${isSelected ? 'text-blue-400' : 'text-white'}`}>
+              {scope.name}
+            </p>
+            <p className="text-xs text-gray-400 truncate">{scope.role || t('agentList.digitalTwin')}</p>
+          </div>
+        </button>
+      </div>
+    )
+  }
 
   return (
-    <div className="h-full overflow-y-auto">
-      {scopeIds.map((scopeId) => {
-        const scopeAgents = agentsByScope[scopeId] || []
-        const scope = businessScopes.find(s => s.id === scopeId)
-        // Skip empty scopes unless they are real business scopes (e.g. digital twins)
-        const isRealScope = !!scope
-        if (scopeAgents.length === 0 && !isRealScope) return null
+    <div className="h-full flex flex-col">
+      {/* Search + View Toggle */}
+      <div className="px-2 py-2 border-b border-gray-800">
+        <div className="flex items-center gap-1.5 mb-1.5">
+          <div className="relative flex-1">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
+            <input
+              type="text"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder={t('agentList.searchPlaceholder')}
+              className="w-full pl-8 pr-3 py-1.5 text-sm bg-gray-800 border border-gray-700 rounded-md text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors"
+            />
+          </div>
+          <div className="flex items-center bg-gray-800 rounded-md border border-gray-700 p-0.5">
+            <button
+              onClick={() => setViewMode('list')}
+              className={`p-1 rounded transition-colors ${viewMode === 'list' ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+              title="List view"
+            >
+              <List size={14} />
+            </button>
+            <button
+              onClick={() => setViewMode('card')}
+              className={`p-1 rounded transition-colors ${viewMode === 'card' ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+              title="Card view"
+            >
+              <LayoutGrid size={14} />
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {/* ── Business Scopes ── */}
+        {businessScopeIds.map((scopeId) => {
+          const scopeAgents = agentsByScope[scopeId] || []
+          const scope = businessScopes.find(s => s.id === scopeId)
+          const isRealScope = !!scope
+          if (scopeAgents.length === 0 && !isRealScope) return null
 
-        const isIndependent = scopeId === '__independent__'
-        const isDigitalTwin = scope?.scopeType === 'digital_twin'
-        const scopeInfo = isIndependent
-          ? { name: 'Independent Agents', icon: <Briefcase className="w-4 h-4 text-white" />, color: 'bg-gray-600' }
-          : getScopeInfo(scopeId)
-
-        // Digital twin scopes render as an agent-style card (no sub-agents)
-        if (isDigitalTwin) {
-          const isSelected = selectedScopeId === scopeId && !selectedAgentId
-          const avatarUrl = getAvatarDisplayUrl(scope.avatar ?? null)
-          const avatarFallback = getAvatarFallback(scope.name, scope.avatar)
-          const showImage = shouldShowAvatarImage(scope.avatar ?? null)
+          const scopeInfo = getScopeInfo(scopeId)
 
           return (
-            <div key={scopeId} className="px-2 mb-1">
-              <button
+            <div key={scopeId} className="mb-4">
+              {/* Scope Header — clickable with "View" badge */}
+              <div
+                ref={selectedScopeId === scopeId && !selectedAgentId ? selectedRef as React.RefObject<HTMLDivElement> : undefined}
                 onClick={() => onSelectScope(scopeId)}
-                className={`
-                  w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-all
-                  ${isSelected
+                className={`flex items-center gap-2 px-3 py-2 sticky top-0 z-10 w-full text-left transition-colors rounded cursor-pointer ${
+                  selectedScopeId === scopeId && !selectedAgentId
                     ? 'bg-blue-600/20 border border-blue-500/50'
-                    : 'hover:bg-gray-800 border border-transparent'
-                  }
-                `}
+                    : 'bg-gray-900 hover:bg-gray-800 border border-transparent'
+                }`}
               >
-                {/* Avatar */}
-                <div className="relative flex-shrink-0">
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-sm font-medium overflow-hidden">
-                    {showImage && avatarUrl ? (
-                      <img
-                        src={avatarUrl}
-                        alt={scope.name}
-                        className="w-full h-full object-cover"
-                        onError={(e) => {
-                          e.currentTarget.style.display = 'none'
-                          e.currentTarget.parentElement!.textContent = avatarFallback
-                        }}
-                      />
-                    ) : avatarFallback}
-                  </div>
-                  <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-green-500 border-2 border-gray-900" />
+                <div className={`w-6 h-6 rounded ${scopeInfo.color} flex items-center justify-center flex-shrink-0`}>
+                  {scopeInfo.icon}
                 </div>
+                <span className="text-gray-300 text-sm font-medium truncate">
+                  {scopeInfo.name}
+                </span>
+                <span className="text-gray-500 text-xs flex-shrink-0">({scopeAgents.length})</span>
+                <span className="ml-auto flex-shrink-0 text-[10px] px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors">
+                  {t('agentList.viewScope')}
+                </span>
+              </div>
 
-                {/* Info */}
-                <div className="flex-1 min-w-0">
-                  <p className={`text-sm font-medium truncate ${isSelected ? 'text-blue-400' : 'text-white'}`}>
-                    {scope.name}
-                  </p>
-                  <p className="text-xs text-gray-400 truncate">{scope.role || 'Digital Twin'}</p>
-                </div>
-              </button>
+              {/* Agent Items */}
+              <div className="space-y-1 px-2">
+                {viewMode === 'card' ? (
+                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                    {scopeAgents.map(agent => (
+                      <AgentCard
+                        key={agent.id}
+                        agent={agent}
+                        scopeName={scopeInfo.name}
+                        isSelected={agent.id === selectedAgentId}
+                        onClick={() => onSelectAgent(agent.id)}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  scopeAgents.map(renderAgentCard)
+                )}
+              </div>
             </div>
           )
-        }
+        })}
 
-        return (
-          <div key={scopeId} className="mb-4">
-            {/* Scope Header */}
-            <button
-              onClick={() => onSelectScope(scopeId)}
-              className={`flex items-center gap-2 px-3 py-2 sticky top-0 z-10 w-full text-left transition-colors rounded ${
-                selectedScopeId === scopeId && !selectedAgentId
-                  ? 'bg-blue-600/20 border border-blue-500/50'
-                  : 'bg-gray-900 hover:bg-gray-800'
-              }`}
-            >
-              <div className={`w-6 h-6 rounded ${scopeInfo.color} flex items-center justify-center`}>
-                {scopeInfo.icon}
+        {/* ── Digital Twins ── */}
+        {digitalTwinScopeIds.length > 0 && (
+          <div className="mb-4">
+            {/* Section header — label only, no "View" button */}
+            <div className="flex items-center gap-2 px-3 py-2 sticky top-0 z-10 bg-gray-900">
+              <div className="w-6 h-6 rounded bg-indigo-600 flex items-center justify-center flex-shrink-0">
+                <User className="w-4 h-4 text-white" />
               </div>
               <span className="text-gray-300 text-sm font-medium">
-                {scopeInfo.name}
+                {t('agentList.digitalTwins')}
               </span>
-              <span className="text-gray-500 text-xs">({scopeAgents.length})</span>
-            </button>
+              <span className="text-gray-500 text-xs">({digitalTwinScopeIds.length})</span>
+            </div>
+            {digitalTwinScopeIds.map(renderDigitalTwinCard)}
+          </div>
+        )}
 
-            {/* Agent Items */}
+        {/* ── Independent Agents ── */}
+        {hasIndependent && (
+          <div className="mb-4">
+            <div className="flex items-center gap-2 px-3 py-2 sticky top-0 z-10 bg-gray-900">
+              <div className="w-6 h-6 rounded bg-gray-600 flex items-center justify-center flex-shrink-0">
+                <Briefcase className="w-4 h-4 text-white" />
+              </div>
+              <span className="text-gray-300 text-sm font-medium">
+                {t('agentList.independent')}
+              </span>
+              <span className="text-gray-500 text-xs">({(agentsByScope['__independent__'] || []).length})</span>
+            </div>
             <div className="space-y-1 px-2">
-              {scopeAgents.map((agent) => {
-                const isSelected = agent.id === selectedAgentId
-                const statusStyle = statusColors[agent.status] || statusColors.active
-
-                return (
-                  <button
-                    key={agent.id}
-                    onClick={() => onSelectAgent(agent.id)}
-                    className={`
-                      w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-all
-                      ${isSelected 
-                        ? 'bg-blue-600/20 border border-blue-500/50' 
-                        : 'hover:bg-gray-800 border border-transparent'
-                      }
-                    `}
-                  >
-                    {/* Avatar */}
-                    <div className="relative flex-shrink-0">
-                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-sm font-medium overflow-hidden">
-                        {(() => {
-                          const avatarUrl = getAvatarDisplayUrl(agent.avatar)
-                          const avatarFallback = getAvatarFallback(agent.displayName, agent.avatar)
-                          const showImage = shouldShowAvatarImage(agent.avatar)
-                          
-                          if (showImage && avatarUrl) {
-                            return (
-                              <img 
-                                src={avatarUrl} 
-                                alt={agent.displayName}
-                                className="w-full h-full object-cover"
-                                onError={(e) => {
-                                  e.currentTarget.style.display = 'none'
-                                  e.currentTarget.parentElement!.textContent = avatarFallback
-                                }}
-                              />
-                            )
-                          }
-                          return avatarFallback
-                        })()}
-                      </div>
-                      {/* Status Indicator */}
-                      <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full ${statusStyle.dot} border-2 border-gray-900`} />
-                    </div>
-
-                    {/* Agent Info */}
-                    <div className="flex-1 min-w-0">
-                      <p className={`text-sm font-medium truncate ${isSelected ? 'text-blue-400' : 'text-white'}`}>
-                        {agent.displayName}
-                      </p>
-                      <p className="text-xs text-gray-400 truncate">{agent.role}</p>
-                    </div>
-                  </button>
-                )
-              })}
+              {(agentsByScope['__independent__'] || []).map(renderAgentCard)}
             </div>
           </div>
-        )
-      })}
+        )}
+      </div>
     </div>
   )
 }

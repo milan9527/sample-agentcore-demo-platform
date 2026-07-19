@@ -20,10 +20,10 @@ import { fileURLToPath } from 'url';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { config } from '../config/index.js';
 
-// Built-in skills directory: super-agent-backend/skills/
+// Built-in skills directory: backend/skills/
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const BUILTIN_SKILLS_DIR = join(__dirname, '..', '..', 'skills');
@@ -80,6 +80,8 @@ export interface AgentForWorkspace {
   role: string | null;
   systemPrompt: string | null;
   skillNames: string[];
+  /** Avatar S3 key or URL (used for speaker annotation in SSE). */
+  avatar?: string | null;
   generatedSkills?: Array<{ name: string; description: string; body: string }>;
 }
 
@@ -89,6 +91,7 @@ export interface ScopeForWorkspace {
   name: string;
   description: string | null;
   systemPrompt: string | null;
+  settings?: Record<string, unknown> | null;
   configVersion: number;
   agents: AgentForWorkspace[];
   skills: SkillForWorkspace[];
@@ -146,6 +149,99 @@ export class WorkspaceManager {
   }
 
   // =========================================================================
+  // RAG skill helpers
+  // =========================================================================
+
+  /**
+   * Resolve the backend URL that the agent can use to call back to the API.
+   * - In local (claude) mode: localhost
+   * - In agentcore/openclaw mode: the configured external backend URL
+   */
+  private resolveBackendUrl(): string {
+    if (config.agentRuntime === 'agentcore' || config.agentRuntime === 'openclaw') {
+      // AgentCore containers cannot reach localhost — use the external backend URL
+      const externalUrl = config.agentcore.backendApiUrl
+        || process.env.PUBLIC_API_URL
+        || process.env.API_BASE_URL;
+      if (externalUrl) return externalUrl;
+      console.warn('[workspace-manager] AgentCore mode but no AGENTCORE_BACKEND_API_URL configured — RAG skill will use localhost (likely broken in container)');
+    }
+    return `http://localhost:${process.env.PORT || 3001}`;
+  }
+
+  /**
+   * Build the knowledge-search skill markdown content.
+   * Includes auth instructions so the agent can authenticate API calls.
+   * Supports both knowledge_base_ids (new) and scope_id (legacy fallback).
+   */
+  private buildRagSkillContent(backendUrl: string, opts: { knowledgeBaseIds?: string[]; scopeId?: string }): string {
+    const isRemote = config.agentRuntime === 'agentcore' || config.agentRuntime === 'openclaw';
+
+    // Determine query parameter
+    let queryParam: string;
+    if (opts.knowledgeBaseIds && opts.knowledgeBaseIds.length > 0) {
+      queryParam = `knowledge_base_ids=${opts.knowledgeBaseIds.join(',')}`;
+    } else if (opts.scopeId) {
+      queryParam = `scope_id=${opts.scopeId}`;
+    } else {
+      return ''; // No knowledge source configured
+    }
+
+    const lines = [
+      '# Knowledge Search',
+      '',
+      'Use this skill to search the knowledge base for relevant document passages.',
+      'This performs semantic similarity search — much more accurate than grep for finding relevant information.',
+      '',
+      '## When to Use',
+      '- User asks about specific policies, procedures, or regulations',
+      '- User needs information that might be in uploaded documents',
+      '- You need to cite or reference specific document content',
+      '- Grep/ripgrep returns too many or irrelevant results',
+      '',
+      '## How to Use',
+      '',
+    ];
+
+    if (isRemote) {
+      // In AgentCore mode, the agent needs to use curl/fetch with auth header
+      lines.push(
+        'Run a shell command to call the RAG API:',
+        '',
+        '```bash',
+        `curl -s -H "Authorization: Bearer $AUTH_TOKEN" "${backendUrl}/api/rag/search?${queryParam}&q={URL_ENCODED_QUERY}&top_k=5"`,
+        '```',
+        '',
+        'The `AUTH_TOKEN` environment variable is pre-configured with a valid authentication token.',
+        '',
+      );
+    } else {
+      // Local mode — use WebFetch (no auth needed as it goes through localhost)
+      lines.push(
+        `Use the WebFetch tool to call: ${backendUrl}/api/rag/search?${queryParam}&q={URL_ENCODED_QUERY}&top_k=5`,
+        '',
+      );
+    }
+
+    lines.push(
+      '## Response Format',
+      'JSON with a `data` array. Each result contains:',
+      '- `filename`: source document name',
+      '- `content`: relevant text passage (~500 tokens)',
+      '- `similarity`: relevance score (0-1, higher is better)',
+      '- `chunkIndex`: position within the document',
+      '',
+      '## Tips',
+      '- Use natural language queries, not keywords',
+      '- If the first search is not specific enough, refine your query',
+      '- Always cite the source filename when using retrieved information',
+      '',
+    );
+
+    return lines.join('\n');
+  }
+
+  // =========================================================================
   // Session workspace provisioning
   // =========================================================================
 
@@ -158,27 +254,26 @@ export class WorkspaceManager {
     sessionId: string,
     scope: ScopeForWorkspace,
     selectedAgentId: string | null,
+    userId?: string,
   ): Promise<{ workspacePath: string; pluginPaths: string[] }> {
     const workspacePath = this.getSessionWorkspacePath(orgId, scope.id, sessionId);
 
-    // Create directory structure
-    await mkdir(join(workspacePath, '.claude', 'skills'), { recursive: true });
-    await mkdir(join(workspacePath, '.claude', 'agents'), { recursive: true });
-
-    // Generate all workspace files
-    await this.generateScopeClaudeMd(workspacePath, scope, selectedAgentId);
-    await this.generateAgentSubagentFiles(join(workspacePath, '.claude', 'agents'), scope.agents, join(workspacePath, '.claude', 'skills'));
-    await this.generateSettings(workspacePath, scope.mcpServers);
-
-    // Download S3 skills, then layer in built-in skills (won't overwrite S3 ones)
+    // Create directory structure (must complete before parallel writes)
     const skillsDir = join(workspacePath, '.claude', 'skills');
+    const agentsDir = join(workspacePath, '.claude', 'agents');
+    await Promise.all([
+      mkdir(skillsDir, { recursive: true }),
+      mkdir(agentsDir, { recursive: true }),
+    ]);
 
-    // Create document group symlinks
+    // --- Phase 1: Run all independent file generation + downloads in parallel ---
     const docGroups = scope.documentGroups ?? [];
-    if (docGroups.length > 0) {
+
+    const createDocGroupSymlinks = async () => {
+      if (docGroups.length === 0) return;
       const docsDir = join(workspacePath, 'documents');
       await mkdir(docsDir, { recursive: true });
-      for (const group of docGroups) {
+      await Promise.all(docGroups.map(async (group) => {
         const linkName = group.name.replace(/[/\\:*?"<>|]/g, '-');
         const linkPath = join(docsDir, linkName);
         try {
@@ -188,59 +283,67 @@ export class WorkspaceManager {
             console.error(`Failed to symlink doc group "${group.name}":`, err.message);
           }
         }
-      }
-    }
+      }));
+    };
 
-    for (const skill of scope.skills) {
-      try {
-        await this.downloadSkill(skill, skillsDir);
-      } catch (error) {
-        console.error(`Failed to download skill "${skill.name}" for session ${sessionId}:`, error instanceof Error ? error.message : error);
-      }
-    }
+    const downloadAllSkills = async () => {
+      await Promise.all(scope.skills.map(async (skill) => {
+        try {
+          await this.downloadSkill(skill, skillsDir);
+        } catch (error) {
+          console.error(`Failed to download skill "${skill.name}" for session ${sessionId}:`, error instanceof Error ? error.message : error);
+        }
+      }));
+    };
+
+    await Promise.all([
+      this.generateScopeClaudeMd(workspacePath, scope, selectedAgentId, userId),
+      this.writeScopeSystemPromptFile(workspacePath, scope),
+      this.generateAgentSubagentFiles(agentsDir, scope.agents, skillsDir),
+      this.generateSettings(workspacePath, scope.mcpServers, scope.settings),
+      this.writeMemoryFiles(workspacePath, scope.id, userId),
+      createDocGroupSymlinks(),
+      downloadAllSkills(),
+    ]);
+
+    // --- Phase 2: Things that depend on phase 1 ---
+    // Built-in skills must run after S3 downloads (won't overwrite existing)
     const builtinCopied = await this.copyBuiltinSkills(skillsDir);
     if (builtinCopied.length > 0) {
       console.log(`Loaded built-in skills for session ${sessionId}: ${builtinCopied.join(', ')}`);
     }
 
-    // Generate RAG knowledge-search skill if enabled and scope has document groups
+    // Generate RAG knowledge-search skill if enabled and scope has knowledge bases or document groups
     const { isRagEnabled } = await import('./rag/document-indexer.service.js');
-    if (isRagEnabled() && docGroups.length > 0) {
+    const { knowledgeBaseService } = await import('./knowledge-base.service.js');
+    const kbIds = await knowledgeBaseService.getKnowledgeBaseIdsForScope(scope.id);
+    const hasKnowledgeSources = docGroups.length > 0 || kbIds.length > 0;
+
+    if (isRagEnabled() && hasKnowledgeSources) {
       const ragSkillPath = join(skillsDir, 'knowledge-search.md');
-      const backendUrl = `http://localhost:${process.env.PORT || 3001}`;
-      const ragSkillContent = [
-        '# Knowledge Search',
-        '',
-        'Use this skill to search the knowledge base for relevant document passages.',
-        'This performs semantic similarity search — much more accurate than grep for finding relevant information.',
-        '',
-        '## When to Use',
-        '- User asks about specific policies, procedures, or regulations',
-        '- User needs information that might be in uploaded documents',
-        '- You need to cite or reference specific document content',
-        '- Grep/ripgrep returns too many or irrelevant results',
-        '',
-        '## How to Use',
-        `Use the WebFetch tool to call: ${backendUrl}/api/rag/search?scope_id=${scope.id}&q={URL_ENCODED_QUERY}&top_k=5`,
-        '',
-        '## Response Format',
-        'JSON with a `data` array. Each result contains:',
-        '- `filename`: source document name',
-        '- `content`: relevant text passage (~500 tokens)',
-        '- `similarity`: relevance score (0-1, higher is better)',
-        '- `chunkIndex`: position within the document',
-        '',
-        '## Tips',
-        '- Use natural language queries, not keywords',
-        '- If the first search is not specific enough, refine your query',
-        '- Always cite the source filename when using retrieved information',
-        '',
-      ].join('\n');
-      await writeFile(ragSkillPath, ragSkillContent, 'utf-8');
+      const backendUrl = this.resolveBackendUrl();
+      const ragSkillContent = this.buildRagSkillContent(backendUrl, {
+        knowledgeBaseIds: kbIds.length > 0 ? kbIds : undefined,
+        scopeId: kbIds.length === 0 ? scope.id : undefined,
+      });
+      if (ragSkillContent) {
+        await writeFile(ragSkillPath, ragSkillContent, 'utf-8');
+      }
     }
 
-    // Install plugins (git clone)
+    // Install plugins (git clone) — also parallelized internally
     const pluginPaths = await this.installPlugins(workspacePath, scope.plugins ?? []);
+
+    // Inject InsForge app backend MCP configs (if any apps in this scope have backends)
+    try {
+      const { agentAppDataResolver } = await import('./agent-app-data-resolver.js');
+      const injected = await agentAppDataResolver.injectIntoWorkspace(workspacePath, orgId, scope.id);
+      if (injected > 0) {
+        console.log(`[workspace] Injected ${injected} InsForge app backend MCP config(s) for scope ${scope.id}`);
+      }
+    } catch (err) {
+      console.warn('[workspace] Failed to inject InsForge MCP configs:', err instanceof Error ? err.message : err);
+    }
 
     // Write manifest
     const now = new Date().toISOString();
@@ -271,13 +374,14 @@ export class WorkspaceManager {
     sessionId: string,
     scope: ScopeForWorkspace,
     selectedAgentId: string | null,
+    userId?: string,
   ): Promise<{ refreshed: boolean; pluginPaths: string[] }> {
     const workspacePath = this.getSessionWorkspacePath(orgId, scope.id, sessionId);
     const manifest = await this.readManifest(workspacePath);
 
     if (!manifest) {
       // No manifest — full provision
-      const result = await this.ensureSessionWorkspace(orgId, sessionId, scope, selectedAgentId);
+      const result = await this.ensureSessionWorkspace(orgId, sessionId, scope, selectedAgentId, userId);
       return { refreshed: true, pluginPaths: result.pluginPaths };
     }
 
@@ -288,7 +392,7 @@ export class WorkspaceManager {
     }
 
     // Refresh
-    await this.refreshSessionWorkspace(workspacePath, scope, selectedAgentId, manifest);
+    await this.refreshSessionWorkspace(workspacePath, scope, selectedAgentId, manifest, userId);
     const pluginPaths = await this.installPlugins(workspacePath, scope.plugins ?? []);
     return { refreshed: true, pluginPaths };
   }
@@ -301,9 +405,16 @@ export class WorkspaceManager {
     scope: ScopeForWorkspace,
     selectedAgentId: string | null,
     manifest: WorkspaceManifest,
+    userId?: string,
   ): Promise<void> {
     // 1. Regenerate CLAUDE.md
-    await this.generateScopeClaudeMd(workspacePath, scope, selectedAgentId);
+    await this.generateScopeClaudeMd(workspacePath, scope, selectedAgentId, userId);
+
+    // 1a. Refresh scope system prompt file
+    await this.writeScopeSystemPromptFile(workspacePath, scope);
+
+    // 1b. Refresh memory files
+    await this.writeMemoryFiles(workspacePath, scope.id, userId);
 
     // 2. Regenerate agent subagent files
     const agentsDir = join(workspacePath, '.claude', 'agents');
@@ -315,7 +426,7 @@ export class WorkspaceManager {
     await this.syncSkills(workspacePath, manifest.skills, scope.skills);
 
     // 4. Regenerate settings
-    await this.generateSettings(workspacePath, scope.mcpServers);
+    await this.generateSettings(workspacePath, scope.mcpServers, scope.settings);
 
     // 5. Sync document group symlinks
     const docGroups = scope.documentGroups ?? [];
@@ -355,37 +466,19 @@ export class WorkspaceManager {
     const skillsDir = join(workspacePath, '.claude', 'skills');
     const ragSkillPath = join(skillsDir, 'knowledge-search.md');
     const { isRagEnabled } = await import('./rag/document-indexer.service.js');
-    if (isRagEnabled() && docGroups.length > 0) {
-      const backendUrl = `http://localhost:${process.env.PORT || 3001}`;
-      const ragSkillContent = [
-        '# Knowledge Search',
-        '',
-        'Use this skill to search the knowledge base for relevant document passages.',
-        'This performs semantic similarity search — much more accurate than grep for finding relevant information.',
-        '',
-        '## When to Use',
-        '- User asks about specific policies, procedures, or regulations',
-        '- User needs information that might be in uploaded documents',
-        '- You need to cite or reference specific document content',
-        '- Grep/ripgrep returns too many or irrelevant results',
-        '',
-        '## How to Use',
-        `Use the WebFetch tool to call: ${backendUrl}/api/rag/search?scope_id=${scope.id}&q={URL_ENCODED_QUERY}&top_k=5`,
-        '',
-        '## Response Format',
-        'JSON with a `data` array. Each result contains:',
-        '- `filename`: source document name',
-        '- `content`: relevant text passage (~500 tokens)',
-        '- `similarity`: relevance score (0-1, higher is better)',
-        '- `chunkIndex`: position within the document',
-        '',
-        '## Tips',
-        '- Use natural language queries, not keywords',
-        '- If the first search is not specific enough, refine your query',
-        '- Always cite the source filename when using retrieved information',
-        '',
-      ].join('\n');
-      await writeFile(ragSkillPath, ragSkillContent, 'utf-8');
+    const { knowledgeBaseService } = await import('./knowledge-base.service.js');
+    const kbIds = await knowledgeBaseService.getKnowledgeBaseIdsForScope(scope.id);
+    const hasKnowledgeSources = docGroups.length > 0 || kbIds.length > 0;
+
+    if (isRagEnabled() && hasKnowledgeSources) {
+      const backendUrl = this.resolveBackendUrl();
+      const ragSkillContent = this.buildRagSkillContent(backendUrl, {
+        knowledgeBaseIds: kbIds.length > 0 ? kbIds : undefined,
+        scopeId: kbIds.length === 0 ? scope.id : undefined,
+      });
+      if (ragSkillContent) {
+        await writeFile(ragSkillPath, ragSkillContent, 'utf-8');
+      }
     } else {
       // Remove stale RAG skill if no longer applicable
       await rm(ragSkillPath, { force: true }).catch(() => {});
@@ -405,11 +498,35 @@ export class WorkspaceManager {
   // File generators
   // =========================================================================
 
+  /**
+   * Write (or overwrite) the scope system prompt file into the workspace.
+   *
+   * The agent can edit this file during a session; carry-forward will pick up
+   * the change and persist it to `business_scopes.system_prompt`.
+   */
+  async writeScopeSystemPromptFile(workspacePath: string, scope: ScopeForWorkspace): Promise<void> {
+    const dir = join(workspacePath, '.claude');
+    await mkdir(dir, { recursive: true });
+    const body = (scope.systemPrompt ?? '').trim();
+    const lines = [
+      '---',
+      `scopeId: ${scope.id}`,
+      `scopeName: ${scope.name}`,
+      'title: Scope System Prompt',
+      '---',
+      '',
+      body,
+      '',
+    ];
+    await writeFile(join(dir, 'scope-system-prompt.md'), lines.join('\n'), 'utf-8');
+  }
+
   /** Generate CLAUDE.md at workspace root with scope context. */
   async generateScopeClaudeMd(
     workspacePath: string,
     scope: ScopeForWorkspace,
     selectedAgentId: string | null,
+    userId?: string,
   ): Promise<void> {
     const lines: string[] = [`# ${scope.name}`, ''];
     if (scope.description) {
@@ -422,21 +539,29 @@ export class WorkspaceManager {
       lines.push(scope.systemPrompt, '');
     }
 
+    // Tell the agent how to evolve the scope system prompt
+    lines.push('## Evolving the System Prompt', '');
+    lines.push('The scope-level system prompt is mirrored to `.claude/scope-system-prompt.md` for easy editing.');
+    lines.push('To refine the way this scope operates (role, behavior, defaults), edit that file directly.');
+    lines.push('Changes to `.claude/scope-system-prompt.md` will be carried forward to the scope persistent config after this session.');
+    lines.push('');
+
     if (scope.agents.length > 0) {
       lines.push('## Available Agents', '');
       lines.push('You have access to specialized subagents for this business scope.');
-      lines.push('When the user\'s request matches a specific agent\'s expertise, delegate to that subagent.', '');
+      lines.push('When the user\'s request matches a specific agent\'s expertise, delegate to that subagent.');
+      lines.push('**IMPORTANT**: When calling a subagent via the Task tool, you MUST use the agent\'s `name` (the identifier shown in parentheses), NOT the display name.', '');
 
       if (selectedAgentId) {
         const selected = scope.agents.find(a => a.id === selectedAgentId);
         if (selected) {
-          lines.push(`The user has selected the "${selected.displayName}" agent. Use this agent's expertise`);
+          lines.push(`The user has selected the "${selected.displayName}" agent (name: \`${selected.name}\`). Use this agent's expertise`);
           lines.push('as your primary mode of operation. You may still delegate to other agents if needed.', '');
         }
       }
 
       for (const agent of scope.agents) {
-        lines.push(`- **${agent.displayName}**: ${agent.role ?? 'General assistant'}`);
+        lines.push(`- **${agent.displayName}** (name: \`${agent.name}\`): ${agent.role ?? 'General assistant'}`);
       }
       lines.push('');
     }
@@ -452,27 +577,12 @@ export class WorkspaceManager {
     lines.push(`- The workspace root is: ${workspacePath}`);
     lines.push('- If a user asks to access files outside this workspace, politely decline and explain the restriction.');
 
-    // AgentCore tools configuration
-    if (config.agentRuntime === 'agentcore') {
-      const agentcoreRegion = config.agentcore.runtimeArn?.split(':')[3] || config.aws.region;
-      const browserId = process.env.AGENTCORE_BROWSER_ID || '';
-      const codeInterpreterId = process.env.AGENTCORE_CODE_INTERPRETER_ID || '';
-      lines.push('');
-      lines.push('## AgentCore Tools Configuration', '');
-      lines.push(`- When calling any browser tool (start_browser_session, get_browser_session, list_browser_sessions, stop_browser_session, browser_navigate, browser_click, browser_type, browser_snapshot, browser_take_screenshot, etc.), you MUST always pass \`region="${agentcoreRegion}"\`.`);
-      if (browserId) {
-        lines.push(`- For start_browser_session, you MUST pass \`browser_id="${browserId}"\` to use the custom browser with Web Bot Auth enabled.`);
-      }
-      lines.push(`- When calling any code interpreter tool (start_code_interpreter_session, invoke_code_interpreter, stop_code_interpreter_session, etc.), you MUST always pass \`region="${agentcoreRegion}"\`.`);
-      if (codeInterpreterId) {
-        lines.push(`- For start_code_interpreter_session, you MUST pass \`code_interpreter_id="${codeInterpreterId}"\` to use the custom code interpreter with public internet access.`);
-      }
-      lines.push(`- NEVER omit the region parameter. NEVER use us-east-1. Always use region="${agentcoreRegion}".`);
-    }
-
-    // Inject scope memories
-    const { scopeMemoryRepository } = await import('../repositories/scope-memory.repository.js');
-    const memories = await scopeMemoryRepository.findForContext(scope.id);
+    lines.push('');
+    lines.push('## Application Code Directory', '');
+    lines.push('- All application source code MUST be placed inside the `app/` directory.');
+    lines.push('- The workspace root is reserved for system files (.claude/, documents/, memories/).');
+    lines.push('- When creating new projects or features, always use `app/` as the base directory.');
+    lines.push('- Example structure: `app/src/`, `app/public/`, `app/package.json`, etc.');
 
     // Inject document groups (Knowledge Base)
     const docGroups = scope.documentGroups ?? [];
@@ -497,42 +607,131 @@ export class WorkspaceManager {
       lines.push('');
     }
 
-    if (memories.length > 0) {
+    // Memory — pinned memories inlined for instant recall, others on-demand
+    const { scopeMemoryRepository: memRepo } = await import('../repositories/scope-memory.repository.js');
+    const pinnedMemories = await memRepo.findForContext(scope.id, userId).then(
+      (all) => all.filter((m) => m.is_pinned),
+    );
+
+    lines.push('');
+    lines.push('## Memory');
+    lines.push('');
+
+    // Inline pinned memories so the agent "just knows" critical info
+    if (pinnedMemories.length > 0) {
+      lines.push('### What you already know (pinned by user)');
       lines.push('');
-      lines.push('## Scope Memory', '');
-      lines.push('The following knowledge has been accumulated for this scope:', '');
-      for (const m of memories) {
-        const pinLabel = m.is_pinned ? '[Pinned] ' : '';
-        const autoLabel = m.tags.includes('auto-distilled') ? '[Auto] ' : '';
-        lines.push(`### ${pinLabel}${autoLabel}${m.title}`);
-        lines.push(`*Category: ${m.category}*`);
-        lines.push(m.content, '');
+      for (const m of pinnedMemories) {
+        lines.push(`- **${m.title}**: ${m.content}`);
       }
+      lines.push('');
+      lines.push('The above is ground truth — if it conflicts with other context, trust this.');
+      lines.push('');
     }
 
-    // Optionally append vector-search semantic memories (if configured)
-    const { isVectorMemoryEnabled, getVectorProvider } = await import('./memory-provider.js');
-    if (isVectorMemoryEnabled()) {
-      const vectorProvider = getVectorProvider();
-      if (vectorProvider) {
-        try {
-          const semanticMemories = await vectorProvider.loadForContext(scope.id);
-          if (semanticMemories.length > 0) {
-            lines.push('');
-            lines.push('## Semantic Memory', '');
-            lines.push('Additional knowledge retrieved via semantic similarity:', '');
-            for (const m of semanticMemories) {
-              lines.push(`- **${m.title}** *(${m.category})*: ${m.content}`);
-            }
-            lines.push('');
-          }
-        } catch (err) {
-          console.error('[workspace-manager] Vector memory loadForContext failed:', err instanceof Error ? err.message : err);
-        }
-      }
+    lines.push('### Past knowledge (read on demand)');
+    lines.push('');
+    lines.push('Additional memories from past conversations are in `memories/`:');
+    lines.push('');
+    lines.push('- `memories/lessons.md` — Mistakes, corrections, and improvements');
+    lines.push('- `memories/patterns.md` — Recurring user needs and effective solution paths');
+    lines.push('- `memories/gaps.md` — Capability gaps and unresolved requests');
+    lines.push('');
+    lines.push('On your FIRST response, read `memories/lessons.md` to refresh context.');
+    lines.push('Also check `memories/patterns.md` when a task feels familiar, and `memories/gaps.md` when stuck.');
+    lines.push('');
+    lines.push('These files are managed by the system — do not edit them.');
+    lines.push('');
+
+    // Custom section marker — content below this line is preserved across sessions
+    // via carry-forward. Agent can add custom rules/instructions below.
+    lines.push('<!-- CUSTOM_SECTION: Agent-generated rules below -->');
+    lines.push('');
+
+    // Append any previously carried custom CLAUDE.md content from scope settings
+    const scopeSettings = scope.settings as Record<string, unknown> | null;
+    const customClaudeMd = scopeSettings?.customClaudeMd as string | undefined;
+    if (customClaudeMd) {
+      lines.push(customClaudeMd);
+      lines.push('');
     }
 
     await writeFile(join(workspacePath, 'CLAUDE.md'), lines.join('\n'), 'utf-8');
+  }
+
+  /**
+   * Write scope memories as separate files in the workspace memories/ directory.
+   * Agent reads these on-demand via Read/Grep tools instead of having them
+   * inlined in CLAUDE.md (avoids context window bloat).
+   *
+   * File layout:
+   *   memories/pinned.md   — User-pinned important knowledge (check first)
+   *   memories/lessons.md  — Mistakes, corrections, improvements
+   *   memories/patterns.md — Recurring needs and effective solutions
+   *   memories/gaps.md     — Capability gaps and unresolved requests
+   *
+   * Visibility: loads scope-level memories + user's own private memories.
+   */
+  async writeMemoryFiles(workspacePath: string, scopeId: string, userId?: string): Promise<void> {
+    const { scopeMemoryRepository } = await import('../repositories/scope-memory.repository.js');
+    const memories = await scopeMemoryRepository.findForContext(scopeId, userId);
+    if (memories.length === 0) return;
+
+    const memoriesDir = join(workspacePath, 'memories');
+    await mkdir(memoriesDir, { recursive: true });
+
+    // Group memories by file target
+    const pinned: typeof memories = [];
+    const lessons: typeof memories = [];
+    const patterns: typeof memories = [];
+    const gaps: typeof memories = [];
+
+    for (const m of memories) {
+      if (m.is_pinned) {
+        pinned.push(m);
+      } else if (m.category === 'lesson') {
+        lessons.push(m);
+      } else if (m.category === 'pattern') {
+        patterns.push(m);
+      } else if (m.category === 'gap') {
+        gaps.push(m);
+      } else {
+        // Uncategorized goes to lessons as a safe default
+        lessons.push(m);
+      }
+    }
+
+    const formatMemories = (items: typeof memories): string => {
+      if (items.length === 0) return '*No entries yet.*\n';
+      return items.map(m => {
+        const autoLabel = m.tags.includes('auto-distilled') ? ' *(auto)* ' : ' ';
+        const date = m.created_at instanceof Date
+          ? m.created_at.toISOString().split('T')[0]
+          : '';
+        return `### ${date}: ${m.title}\n${autoLabel}\n${m.content}\n`;
+      }).join('\n');
+    };
+
+    await writeFile(
+      join(memoriesDir, 'pinned.md'),
+      `# Pinned Knowledge\n\nImportant knowledge pinned by the user. Always check before complex work.\n\n${formatMemories(pinned)}`,
+      'utf-8',
+    );
+    await writeFile(
+      join(memoriesDir, 'lessons.md'),
+      `# Lessons Learned\n\nMistakes, corrections, and improvements from past conversations.\n\n${formatMemories(lessons)}`,
+      'utf-8',
+    );
+    await writeFile(
+      join(memoriesDir, 'patterns.md'),
+      `# Patterns\n\nRecurring user needs and effective solution paths.\n\n${formatMemories(patterns)}`,
+      'utf-8',
+    );
+    await writeFile(
+      join(memoriesDir, 'gaps.md'),
+      `# Capability Gaps\n\nKnown limitations and unresolved requests.\n\n${formatMemories(gaps)}`,
+      'utf-8',
+    );
   }
 
   /** Generate .claude/agents/{name}.md subagent files from DB agents. */
@@ -563,7 +762,7 @@ export class WorkspaceManager {
 
       const lines: string[] = ['---'];
       lines.push(`name: ${agent.name}`);
-      lines.push(`description: ${agent.role ?? agent.displayName}. Use when the user needs help with ${agent.role ?? 'this domain'}.`);
+      lines.push(`description: ${agent.displayName} — ${agent.role ?? 'General assistant'}. Use when the user needs help with ${agent.role ?? 'this domain'}.`);
       lines.push('model: inherit');
       lines.push('permissionMode: bypassPermissions');
       if (allSkillNames.length > 0) {
@@ -580,7 +779,7 @@ export class WorkspaceManager {
   }
 
   /** Generate .claude/settings.json with permissions and optional MCP servers. */
-  async generateSettings(workspacePath: string, mcpServers?: McpServerForWorkspace[]): Promise<void> {
+  async generateSettings(workspacePath: string, mcpServers?: McpServerForWorkspace[], scopeSettings?: Record<string, unknown> | null): Promise<void> {
     const settings: Record<string, unknown> = {
       permissions: {
         allow: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob', 'Skill', 'WebFetch'],
@@ -598,9 +797,8 @@ export class WorkspaceManager {
         args: ['awslabs.amazon-bedrock-agentcore-mcp-server@latest'],
         env: {
           AWS_REGION: agentcoreRegion,
-          AWS_DEFAULT_REGION: agentcoreRegion,
-          BEDROCK_AGENTCORE_REGION: agentcoreRegion,
           FASTMCP_LOG_LEVEL: 'ERROR',
+          BROWSER_IDENTIFIER: process.env.AGENTCORE_BROWSER_IDENTIFIER || 'public_browser_webauth-piLpCAcEYA',
         },
       };
     }
@@ -642,6 +840,11 @@ export class WorkspaceManager {
 
     if (Object.keys(mcpConfig).length > 0) {
       settings.mcpServers = mcpConfig;
+    }
+
+    // Include hooks from scope settings (carried forward from previous sessions)
+    if (scopeSettings?.hooks && typeof scopeSettings.hooks === 'object') {
+      settings.hooks = scopeSettings.hooks;
     }
 
     const settingsDir = join(workspacePath, '.claude');
@@ -728,15 +931,13 @@ export class WorkspaceManager {
     if (!plugins || plugins.length === 0) return [];
     const pluginsDir = join(workspacePath, '.claude', 'plugins');
     await mkdir(pluginsDir, { recursive: true });
-    const installed: string[] = [];
 
-    for (const plugin of plugins) {
+    const results = await Promise.all(plugins.map(async (plugin) => {
       const targetDir = join(pluginsDir, plugin.name);
       try {
         // Skip if already cloned
         await access(targetDir);
-        installed.push(targetDir);
-        continue;
+        return targetDir;
       } catch { /* not yet cloned */ }
 
       try {
@@ -747,13 +948,15 @@ export class WorkspaceManager {
           'clone', '--depth', '1', '--branch', plugin.ref,
           plugin.gitUrl, targetDir,
         ], { timeout: 60_000 });
-        installed.push(targetDir);
         console.log(`[installPlugins] Cloned plugin "${plugin.name}" from ${plugin.gitUrl}@${plugin.ref}`);
+        return targetDir;
       } catch (error) {
         console.error(`[installPlugins] Failed to clone plugin "${plugin.name}":`, error instanceof Error ? error.message : error);
+        return null;
       }
-    }
-    return installed;
+    }));
+
+    return results.filter((p): p is string => p !== null);
   }
 
   // =========================================================================
@@ -951,6 +1154,86 @@ export class WorkspaceManager {
 
   async writeManifest(workspacePath: string, manifest: WorkspaceManifest): Promise<void> {
     await writeFile(join(workspacePath, MANIFEST_FILENAME), JSON.stringify(manifest, null, 2), 'utf-8');
+  }
+
+  /**
+   * Ensure the local workspace is up-to-date with S3 (agentcore mode).
+   * Downloads all files from S3 to the local workspace directory.
+   * This is needed before operations that require local filesystem access
+   * (e.g. dev server preview, app detection) because the agentcore container
+   * writes files to S3 and the sync-back to local is fire-and-forget.
+   *
+   * Returns the number of files downloaded.
+   */
+  async ensureS3SyncedToLocal(
+    orgId: string,
+    scopeId: string,
+    sessionId: string,
+  ): Promise<number> {
+    const s3Bucket = config.agentcore.workspaceS3Bucket;
+    const prefix = `${orgId}/${scopeId}/${sessionId}/`;
+    const localDir = this.getSessionWorkspacePath(orgId, scopeId, sessionId);
+
+    let downloaded = 0;
+    let continuationToken: string | undefined;
+
+    do {
+      const result = await this.s3Client.send(new ListObjectsV2Command({
+        Bucket: s3Bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      }));
+
+      for (const obj of result.Contents ?? []) {
+        if (!obj.Key) continue;
+        const relativePath = obj.Key.slice(prefix.length);
+        if (!relativePath || relativePath.endsWith('/')) continue;
+
+        // Skip directories that should not be synced to local
+        // (node_modules, .git, etc. — same as upload skip list)
+        const firstSegment = relativePath.split('/')[0];
+        const SKIP_SEGMENTS = new Set([
+          'node_modules', '.git', '__pycache__',
+          '.venv', 'venv', 'env', '.env',
+          '.tox', '.mypy_cache', '.pytest_cache', '.ruff_cache',
+          '.next', '.nuxt', '.turbo', '.cache', '.parcel-cache',
+          'bower_components', '.gradle', 'target', '.cargo',
+        ]);
+        if (SKIP_SEGMENTS.has(firstSegment!)) continue;
+
+        const localPath = join(localDir, relativePath);
+        const localDirPath = dirname(localPath);
+
+        try {
+          await mkdir(localDirPath, { recursive: true });
+          // Skip if localPath is already a directory
+          try {
+            const s = await stat(localPath);
+            if (s.isDirectory()) continue;
+          } catch { /* doesn't exist yet, fine */ }
+          const response = await this.s3Client.send(new GetObjectCommand({
+            Bucket: s3Bucket,
+            Key: obj.Key,
+          }));
+          if (response.Body) {
+            await pipeline(
+              response.Body as NodeJS.ReadableStream,
+              createWriteStream(localPath),
+            );
+            downloaded++;
+          }
+        } catch (err) {
+          console.warn(`[workspace-manager] ensureS3SyncedToLocal failed for ${relativePath}:`, err instanceof Error ? err.message : err);
+        }
+      }
+
+      continuationToken = result.NextContinuationToken;
+    } while (continuationToken);
+
+    if (downloaded > 0) {
+      console.log(`[workspace-manager] Synced ${downloaded} files from S3 to local for session ${sessionId}`);
+    }
+    return downloaded;
   }
 
   /**
@@ -1230,6 +1513,34 @@ export class WorkspaceManager {
     }
   }
 
+  /**
+   * Read a workspace file from S3 as raw binary Buffer.
+   * Used for binary files (images, xlsx, etc.) that cannot be safely converted to UTF-8 strings.
+   */
+  async readWorkspaceFileFromS3Raw(
+    orgId: string,
+    scopeId: string,
+    sessionId: string,
+    filePath: string,
+  ): Promise<Buffer | null> {
+    const s3Bucket = config.agentcore.workspaceS3Bucket;
+    const key = `${orgId}/${scopeId}/${sessionId}/${filePath}`;
+    try {
+      const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+      const response = await this.s3Client.send(new GetObjectCommand({
+        Bucket: s3Bucket,
+        Key: key,
+      }));
+      if (response.Body && typeof (response.Body as any).transformToByteArray === 'function') {
+        const bytes = await (response.Body as any).transformToByteArray();
+        return Buffer.from(bytes);
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Resolve a workspace-relative file path to an absolute path, with traversal protection. Returns null if invalid. */
   resolveWorkspaceFilePath(
     orgId: string,
@@ -1303,6 +1614,19 @@ export class WorkspaceManager {
           Key: key,
           Body: content,
         })).catch(err => console.warn('[workspace-manager] S3 upload failed:', err));
+
+        // Notify the running container to pull the file from S3.
+        // Fire-and-forget: don't block the upload response if the container
+        // is not running or the sync fails (file is already in S3 and will
+        // be picked up on next invocation).
+        import('./agentcore-command.service.js').then(({ agentCoreCommandService }) => {
+          agentCoreCommandService.syncFileFromS3(
+            sessionId,
+            config.agentcore.workspaceS3Bucket,
+            key,
+            filePath,
+          ).catch(err => console.warn('[workspace-manager] Container sync failed (non-fatal):', err instanceof Error ? err.message : err));
+        });
       }
 
       return true;
@@ -1377,7 +1701,7 @@ export class WorkspaceManager {
    * Remove session workspace directories whose manifests are older than maxAgeMs.
    * Returns the number of directories removed.
    */
-  async pruneStaleWorkspaces(maxAgeMs: number = 2400 * 60 * 60 * 1000): Promise<number> {
+  async pruneStaleWorkspaces(maxAgeMs: number = 10 * 365 * 24 * 60 * 60 * 1000): Promise<number> {
     let removed = 0;
     const now = Date.now();
     try {

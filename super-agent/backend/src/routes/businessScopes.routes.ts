@@ -181,6 +181,7 @@ export async function businessScopeRoutes(fastify: FastifyInstance): Promise<voi
               avatar: { type: 'string', nullable: true },
               role: { type: 'string', nullable: true },
               system_prompt: { type: 'string', nullable: true },
+              settings: { type: 'object', nullable: true, additionalProperties: true },
               config_version: { type: 'integer' },
               agents: { type: 'array' },
               created_at: { type: 'string' },
@@ -256,6 +257,7 @@ export async function businessScopeRoutes(fastify: FastifyInstance): Promise<voi
               avatar: { type: 'string', nullable: true },
               role: { type: 'string', nullable: true },
               system_prompt: { type: 'string', nullable: true },
+              settings: { type: 'object', nullable: true, additionalProperties: true },
               created_at: { type: 'string' },
               updated_at: { type: 'string' },
             },
@@ -341,6 +343,7 @@ export async function businessScopeRoutes(fastify: FastifyInstance): Promise<voi
               avatar: { type: 'string', nullable: true },
               role: { type: 'string', nullable: true },
               system_prompt: { type: 'string', nullable: true },
+              settings: { type: 'object', nullable: true, additionalProperties: true },
               created_at: { type: 'string' },
               updated_at: { type: 'string' },
             },
@@ -665,6 +668,19 @@ export async function businessScopeRoutes(fastify: FastifyInstance): Promise<voi
       const { id } = validateSchema(idParamSchema, request.params);
       await scopeAccessService.requireAccess(request.user!, id, 'viewer');
       const agents = await businessScopeService.getScopeAgentsWithSkills(id, request.user!.orgId);
+
+      // Filter agents by user's agent-level permissions (org admin/owner see all)
+      const user = request.user!;
+      if (user.role !== 'owner' && user.role !== 'admin') {
+        const { agentAccessService } = await import('../services/agentAccess.service.js');
+        const filtered = [];
+        for (const agent of agents) {
+          const canView = await agentAccessService.checkAccess(user.id, user.orgId, (agent as any).id, 'view');
+          if (canView) filtered.push(agent);
+        }
+        return reply.status(200).send(filtered);
+      }
+
       return reply.status(200).send(agents);
     }
   );
@@ -719,6 +735,72 @@ export async function businessScopeRoutes(fastify: FastifyInstance): Promise<voi
       await scopeAccessService.requireAccess(request.user!, id, 'viewer');
       const skills = await businessScopeService.getScopeSkills(id, request.user!.orgId);
       return reply.status(200).send(skills);
+    }
+  );
+
+  /**
+   * POST /api/business-scopes/:id/skills/:skillId
+   * Bind an existing skill to a business scope.
+   */
+  fastify.post<{ Params: { id: string; skillId: string } }>(
+    '/:id/skills/:skillId',
+    {
+      preHandler: [authenticate, requireModifyAccess],
+      schema: {
+        description: 'Bind an existing skill to a business scope',
+        tags: ['Business Scopes'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['id', 'skillId'],
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            skillId: { type: 'string', format: 'uuid' },
+          },
+        },
+        response: {
+          204: { description: 'Skill bound to scope successfully' },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id, skillId } = request.params;
+      const { skillService } = await import('../services/skill.service.js');
+      await skillService.bindSkillToScope(request.user!.orgId, skillId, id);
+      return reply.status(204).send();
+    }
+  );
+
+  /**
+   * DELETE /api/business-scopes/:id/skills/:skillId
+   * Unbind a skill from a business scope (does not delete the skill).
+   */
+  fastify.delete<{ Params: { id: string; skillId: string } }>(
+    '/:id/skills/:skillId',
+    {
+      preHandler: [authenticate, requireModifyAccess],
+      schema: {
+        description: 'Unbind a skill from a business scope',
+        tags: ['Business Scopes'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['id', 'skillId'],
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            skillId: { type: 'string', format: 'uuid' },
+          },
+        },
+        response: {
+          204: { description: 'Skill unbound from scope successfully' },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id, skillId } = request.params;
+      const { skillService } = await import('../services/skill.service.js');
+      await skillService.unbindSkillFromScope(request.user!.orgId, skillId, id);
+      return reply.status(204).send();
     }
   );
 

@@ -14,6 +14,14 @@ export interface AgentPayload {
   org_id?: string;
   agent_id?: string;
   system_prompt?: string;
+  /** Model identifier to use for this invocation (overrides ANTHROPIC_MODEL env var). */
+  model?: string;
+  /** LLM provider for this invocation: 'bedrock' (default) or 'litellm'. */
+  provider?: 'bedrock' | 'litellm';
+  /** LiteLLM gateway base URL (provider='litellm' only). */
+  base_url?: string;
+  /** LiteLLM gateway API key (provider='litellm' only). */
+  api_key?: string;
   mcp_servers?: Record<string, unknown>;
   allowed_tools?: string[];
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -21,6 +29,10 @@ export interface AgentPayload {
   workspace_s3_bucket?: string;
   /** S3 prefix — workspace files are at s3://{bucket}/{prefix}{relativePath} */
   workspace_s3_prefix?: string;
+  /** Backend API URL for RAG and other API calls from within the container */
+  backend_api_url?: string;
+  /** Backend API key/token for authenticating API calls */
+  backend_api_key?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -38,14 +50,24 @@ export interface ContentBlock {
   is_error?: boolean;
 }
 
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_cost_usd: number;
+}
+
 export interface AgentEvent {
   type: 'session_start' | 'assistant' | 'result' | 'error';
   session_id?: string;
   content?: ContentBlock[];
+  model?: string;
   code?: string;
   message?: string;
   duration_ms?: number;
   num_turns?: number;
   is_error?: boolean;
   result?: string;
+  token_usage?: TokenUsage;
 }

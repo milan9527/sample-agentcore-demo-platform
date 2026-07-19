@@ -128,6 +128,20 @@ export class WorkflowService {
       throw AppError.validation('Workflow version is required');
     }
 
+    // Check for duplicate name within the same scope
+    if (data.business_scope_id) {
+      const existing = await workflowRepository.findByNameInScope(
+        organizationId,
+        data.business_scope_id,
+        data.name.trim(),
+      );
+      if (existing) {
+        throw AppError.conflict(
+          `Workflow with name "${data.name.trim()}" already exists in this scope`
+        );
+      }
+    }
+
     // Create the workflow
     const workflow = await workflowRepository.createWithUser(
       {

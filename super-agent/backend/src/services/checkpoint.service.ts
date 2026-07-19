@@ -218,6 +218,21 @@ class CheckpointService {
   }
 
   /**
+   * List processed (resolved/cancelled/expired) checkpoints for an organization.
+   */
+  async listProcessed(organizationId: string): Promise<CheckpointRecord[]> {
+    const checkpoints = await prisma.execution_checkpoints.findMany({
+      where: {
+        organization_id: organizationId,
+        status: { in: ['resolved', 'cancelled', 'expired'] },
+      },
+      orderBy: { resolved_at: 'desc' },
+      take: 50,
+    });
+    return checkpoints.map((c: Record<string, unknown>) => this.toRecord(c));
+  }
+
+  /**
    * Expire all overdue checkpoints. Called by a scheduled job.
    */
   async expireOverdue(): Promise<number> {

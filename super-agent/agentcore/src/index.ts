@@ -21,6 +21,7 @@ import http from 'http';
 import { S3Client } from '@aws-sdk/client-s3';
 import { runAgent } from './agent-runner.js';
 import { restoreWorkspaceFromS3 } from './workspace-sync.js';
+import { createGitBaseline } from './agent-runner.js';
 import type { AgentPayload, AgentEvent } from './types.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -65,6 +66,17 @@ async function handleInvocations(
     } catch (err) {
       console.error('[index] Workspace restore failed:', err);
     }
+
+    // Create git baseline snapshot for diff tracking
+    createGitBaseline();
+  }
+
+  // --- Set backend connectivity env vars for skills (e.g. knowledge-search) ---
+  if (payload.backend_api_url) {
+    process.env.API_BASE_URL = payload.backend_api_url;
+  }
+  if (payload.backend_api_key) {
+    process.env.AUTH_TOKEN = payload.backend_api_key;
   }
 
   // --- SSE streaming response ---

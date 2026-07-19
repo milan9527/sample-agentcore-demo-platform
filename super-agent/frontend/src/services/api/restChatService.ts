@@ -38,22 +38,43 @@ interface ApiChatMessage {
   session_id: string;
   type: string;
   content: string;
+  metadata?: Record<string, unknown>;
   created_at: string;
 }
 
 // Store current session and agent
 let currentSessionId: string | null = null;
 let currentAgentId: string | null = null;
+// Pending ensureSession promise — prevents duplicate session creation from
+// concurrent calls during app mount (e.g. eagerly creating session + showcase
+// auto-sending initial prompt both call ensureSession simultaneously).
+let ensureSessionPromise: Promise<string> | null = null;
 
 /**
  * Maps API chat message to application Message type
  */
 function mapApiMessageToMessage(apiMessage: ApiChatMessage): Message {
+  // Extract attached image paths from metadata and convert to raw-file URLs
+  // so <img src> can display them.
+  let attachedImages: string[] | undefined;
+  const metaImages = apiMessage.metadata?.attachedImages;
+  if (Array.isArray(metaImages) && metaImages.length > 0) {
+    const baseUrl = import.meta.env.VITE_API_BASE_URL ?? '';
+    const token = getAuthToken();
+    attachedImages = metaImages.map((p) => {
+      const path = typeof p === 'string' ? p : '';
+      const qs = new URLSearchParams({ path });
+      if (token) qs.set('token', token);
+      return `${baseUrl}/api/chat/sessions/${apiMessage.session_id}/workspace/file/raw?${qs}`;
+    });
+  }
+
   return {
     id: apiMessage.id,
     type: apiMessage.type as 'user' | 'ai',
     content: apiMessage.content,
     timestamp: new Date(apiMessage.created_at),
+    attachedImages,
   };
 }
 
@@ -123,6 +144,7 @@ export const RestChatService = {
     currentAgentId = agentId;
     // Reset session when agent changes
     currentSessionId = null;
+    ensureSessionPromise = null;
   },
 
   /**
@@ -133,16 +155,32 @@ export const RestChatService = {
   },
 
   /**
-   * Ensures a session exists, creates one if needed
+   * Ensures a session exists, creates one if needed.
+   * Deduplicates concurrent calls so we don't accidentally create multiple
+   * sessions from parallel code paths (e.g. eagerly creating session on mount
+   * while showcase auto-sends the initial prompt).
    */
   async ensureSession(sopContext?: string, businessScopeId?: string): Promise<string> {
     if (currentSessionId) {
       return currentSessionId;
     }
 
-    const session = await this.createSession(sopContext, businessScopeId);
-    currentSessionId = session.id;
-    return session.id;
+    // If a creation is already in flight, reuse its promise.
+    if (ensureSessionPromise) {
+      return ensureSessionPromise;
+    }
+
+    ensureSessionPromise = (async () => {
+      try {
+        const session = await this.createSession(sopContext, businessScopeId);
+        currentSessionId = session.id;
+        return session.id;
+      } finally {
+        ensureSessionPromise = null;
+      }
+    })();
+
+    return ensureSessionPromise;
   },
 
   /**
@@ -282,21 +320,28 @@ export const RestChatService = {
   },
 
   /**
-   * Clears chat history for a session
+   * Clears chat history for a session.
+   * Always uses the explicitly provided sessionId to avoid accidentally
+   * deleting the wrong session when currentSessionId points elsewhere.
    */
   async clearHistory(sessionId: string): Promise<void> {
     try {
-      const validSessionId = currentSessionId || sessionId;
-      
-      if (!validSessionId || !validSessionId.match(/^[0-9a-f-]{36}$/i)) {
+      if (!sessionId || !sessionId.match(/^[0-9a-f-]{36}$/i)) {
         return;
       }
 
-      await restClient.delete(`/api/chat/sessions/${validSessionId}`);
-      currentSessionId = null;
+      await restClient.delete(`/api/chat/sessions/${sessionId}`);
+      // If we just deleted the active session, clear the pointer
+      if (currentSessionId === sessionId) {
+        currentSessionId = null;
+        ensureSessionPromise = null;
+      }
     } catch (error) {
       if (error instanceof ServiceError && error.code === 'NOT_FOUND') {
-        currentSessionId = null;
+        if (currentSessionId === sessionId) {
+          currentSessionId = null;
+          ensureSessionPromise = null;
+        }
         return;
       }
       throw new ServiceError('Failed to clear chat history', 'UNKNOWN');
@@ -346,10 +391,15 @@ export const RestChatService = {
    */
   async createSession(sopContext?: string, businessScopeId?: string): Promise<ApiChatSession> {
     try {
-      const response = await restClient.post<ApiChatSession>('/api/chat/sessions', {
+      const body = {
         sop_context: sopContext || null,
         business_scope_id: businessScopeId || null,
-      });
+        provision_workspace: !!businessScopeId,
+      };
+      console.log('[RestChatService] createSession body:', JSON.stringify(body));
+      console.log('[RestChatService] createSession call stack:\n', new Error().stack?.split('\n').slice(1, 10).join('\n'));
+      const response = await restClient.post<ApiChatSession>('/api/chat/sessions', body);
+      console.log('[RestChatService] createSession response id:', response.id, 'scope:', response.business_scope_id);
       return response;
     } catch (error) {
       if (error instanceof ServiceError) throw error;
@@ -405,6 +455,7 @@ export const RestChatService = {
    */
   resetSession(): void {
     currentSessionId = null;
+    ensureSessionPromise = null;
   },
 
   /**

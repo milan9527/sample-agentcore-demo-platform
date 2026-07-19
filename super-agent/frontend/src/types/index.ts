@@ -2,7 +2,7 @@
 export * from './canvas'
 
 // Navigation Types
-export type NavigationPage = 'dashboard' | 'chat' | 'workflow' | 'agents' | 'projects' | 'tools' | 'apps' | 'starred'
+export type NavigationPage = 'dashboard' | 'chat' | 'workflow' | 'approvals' | 'agents' | 'projects' | 'tools' | 'knowledge' | 'apps' | 'starred' | 'support'
 
 export interface NavItem {
   id: NavigationPage
@@ -23,12 +23,37 @@ export interface AgentMetrics {
   avgResponseTime: string
   subagentInvocations?: number
   toolCalls?: number
+  tokenUsage?: number
+  estimatedCostUsd?: number
 }
 
 export interface ModelConfig {
-  provider: 'Bedrock' | 'OpenAI' | 'Azure'
+  provider: 'Bedrock' | 'OpenAI' | 'Azure' | 'LiteLLM'
   modelId: string
   agentType: 'Orchestrator' | 'Worker' | 'Supervisor'
+  /** Provider + model selection referencing a reusable ModelProvider. */
+  modelSelection?: ModelSelection
+}
+
+/** A reusable per-org LLM provider (Bedrock or LiteLLM gateway). API key never exposed. */
+export interface ModelProvider {
+  id: string
+  name: string
+  type: 'bedrock' | 'litellm'
+  baseUrl: string | null
+  defaultModelId: string | null
+  isOrgDefault: boolean
+  hasApiKey: boolean
+  status: string
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+/** Selection of a provider + model, stored on agent.model_config / scope.settings. */
+export interface ModelSelection {
+  providerId?: string
+  modelId?: string
 }
 
 export interface Tool {
@@ -51,6 +76,11 @@ export interface Agent {
   systemPrompt: string
   modelConfig: ModelConfig
   businessScopeId?: string  // Link to business scope
+  // A2A external access
+  a2aEnabled?: boolean
+  a2aCapabilities?: string
+  a2aExposedSkillIds?: string[]
+  registryRecordId?: string
 }
 
 export interface AgentSummary {
@@ -86,6 +116,18 @@ export interface Message {
   /** Sub-agent speaker identity — set when the message originates from a sub-agent */
   speakerAgentName?: string
   speakerAgentAvatar?: string | null
+  /** Model ID used for this response (e.g. claude-sonnet-4-20250514) */
+  model?: string
+  /** Attached image URLs (blob: URLs from clipboard paste, or backend URLs for persisted images) */
+  attachedImages?: string[]
+  /** Token usage stats from the result event */
+  tokenUsage?: {
+    input_tokens: number
+    output_tokens: number
+    cache_read_input_tokens?: number
+    cache_creation_input_tokens?: number
+    total_cost_usd?: number
+  }
 }
 
 export interface ContextMemory {
@@ -120,7 +162,7 @@ export interface QuickQuestion {
 
 // Workflow Types
 export type WorkflowCategory = 'hr' | 'deployment' | 'marketing' | 'support'
-export type NodeType = 'trigger' | 'agent' | 'human' | 'action' | 'condition' | 'document' | 'codeArtifact' | 'resource' | 'loop' | 'parallel' | 'start' | 'end'
+export type NodeType = 'trigger' | 'agent' | 'human' | 'humanApproval' | 'action' | 'condition' | 'document' | 'codeArtifact' | 'resource' | 'loop' | 'parallel' | 'start' | 'end'
 
 export interface Position {
   x: number

@@ -18,6 +18,8 @@ interface WorkspaceExplorerProps {
   sessionId: string | null
   businessScopeId?: string | null
   refreshKey?: number
+  /** Whether the agent is currently generating a response (enables fast polling). */
+  isGenerating?: boolean
   onFileOpen?: (path: string, name: string) => void
   width: number
   onWidthChange: (width: number) => void
@@ -60,9 +62,11 @@ function isAppFolder(node: FileNode): boolean {
   return node.children.some(c => c.type === 'file' && c.name === 'index.html')
 }
 
-/** Friendly display name: strip .md for agent files */
+/** Friendly display name: strip .md for agent files, rename .claude to .agent, CLAUDE.md to AGENT.md */
 function displayName(node: FileNode): string {
   if (isAgentFile(node)) return node.name.replace(/\.md$/, '')
+  if (node.name === '.claude') return '.agent'
+  if (node.name === 'CLAUDE.md') return 'AGENT.md'
   return node.name
 }
 
@@ -112,7 +116,7 @@ function TreeNode({ node, onFileClick, depth = 0, expandedPaths, onToggle }: {
           ) : (
             <FolderOpen className="w-4 h-4 text-yellow-500 flex-shrink-0" />
           )}
-          <span className="text-sm text-gray-300 truncate">{node.name}</span>
+          <span className="text-sm text-gray-300 truncate">{displayName(node)}</span>
         </button>
         {expanded && node.children?.map((child) => (
           <TreeNode key={child.path} node={child} onFileClick={onFileClick} depth={depth + 1} expandedPaths={expandedPaths} onToggle={onToggle} />
@@ -124,7 +128,7 @@ function TreeNode({ node, onFileClick, depth = 0, expandedPaths, onToggle }: {
   const agent = isAgentFile(node)
   return (
     <button
-      onClick={() => onFileClick(node.path, node.name)}
+      onClick={() => onFileClick(node.path, displayName(node))}
       className="flex items-center gap-1 w-full px-2 py-1 hover:bg-gray-800 rounded text-left group"
       style={{ paddingLeft: `${depth * 12 + 20}px` }}
     >
@@ -178,9 +182,22 @@ function DragHandle({ onDrag }: { onDrag: (deltaX: number) => void }) {
 }
 
 export function WorkspaceExplorer({
-  sessionId, businessScopeId, refreshKey, onFileOpen, width, onWidthChange, minWidth = 200, maxWidth = 600,
+  sessionId, businessScopeId, refreshKey, isGenerating = false, onFileOpen, width, onWidthChange, minWidth = 200, maxWidth = 600,
 }: WorkspaceExplorerProps) {
   const [collapsed, setCollapsed] = useState(false)
+  const prevWidthRef = useRef(width)
+
+  // Sync width with parent when collapsing/expanding
+  const handleCollapse = useCallback(() => {
+    prevWidthRef.current = width
+    onWidthChange(48)
+    setCollapsed(true)
+  }, [width, onWidthChange])
+
+  const handleExpand = useCallback(() => {
+    onWidthChange(prevWidthRef.current || 288)
+    setCollapsed(false)
+  }, [onWidthChange])
   const [files, setFiles] = useState<FileNode[]>([])
   const [loading, setLoading] = useState(false)
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
@@ -239,16 +256,18 @@ export function WorkspaceExplorer({
 
   useEffect(() => { void loadFiles() }, [loadFiles])
 
-  // Poll for workspace changes every 5 seconds while a session is active.
+  // Poll for workspace changes while a session is active.
+  // Fast (5s) during generation, slow (30s) when idle.
   // Stop polling after 5 consecutive errors to avoid hammering a dead backend.
   useEffect(() => {
     if (!sessionId) return
+    const interval = isGenerating ? 3000 : 5000
     const id = setInterval(() => {
       if (pollErrorCount.current >= 5) return // back off on persistent errors
       void loadFiles(true)
-    }, 5000)
+    }, interval)
     return () => clearInterval(id)
-  }, [sessionId, loadFiles])
+  }, [sessionId, loadFiles, isGenerating])
 
   useEffect(() => {
     if (refreshKey && refreshKey > 0) void loadFiles()
@@ -263,47 +282,6 @@ export function WorkspaceExplorer({
     onFileOpen?.(path, name)
   }, [onFileOpen])
 
-  // Collapsed state — thin strip with expand button
-  if (collapsed) {
-    return (
-      <div className="flex h-full">
-        <div className="flex flex-col items-center py-3 px-1 border-l border-gray-800 bg-gray-900/50 gap-1">
-          <button
-            onClick={() => setCollapsed(false)}
-            className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
-            title="Expand workspace"
-          >
-            <PanelRightOpen className="w-4 h-4" />
-          </button>
-          <button
-            onClick={() => setSkillsPanelOpen(true)}
-            className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-yellow-400 transition-colors"
-            title="Skills"
-          >
-            <Zap className="w-4 h-4" />
-          </button>
-          <button
-            onClick={() => setPluginsPanelOpen(true)}
-            className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-violet-400 transition-colors"
-            title="Plugins"
-          >
-            <Puzzle className="w-4 h-4" />
-          </button>
-          <button
-            onClick={() => setMcpPanelOpen(true)}
-            className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-cyan-400 transition-colors"
-            title="MCP Servers"
-          >
-            <Server className="w-4 h-4" />
-          </button>
-        </div>
-        <SkillsPanel open={skillsPanelOpen} onClose={() => setSkillsPanelOpen(false)} sessionId={sessionId} />
-        <PluginsPanel open={pluginsPanelOpen} onClose={() => setPluginsPanelOpen(false)} businessScopeId={businessScopeId ?? null} />
-        <MCPServersPanel open={mcpPanelOpen} onClose={() => setMcpPanelOpen(false)} sessionId={sessionId} />
-      </div>
-    )
-  }
-
   // No session — show placeholder
   if (!sessionId) {
     return (
@@ -315,13 +293,6 @@ export function WorkspaceExplorer({
               <FolderTree className="w-4 h-4 text-gray-400" />
               <span className="text-sm font-medium text-gray-300">Workspace</span>
             </div>
-            <button
-              onClick={() => setCollapsed(true)}
-              className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
-              title="Collapse panel"
-            >
-              <PanelRightClose className="w-4 h-4" />
-            </button>
           </div>
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center px-4">
@@ -374,13 +345,6 @@ export function WorkspaceExplorer({
               title="MCP Servers"
             >
               <Server className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={() => setCollapsed(true)}
-              className="p-1.5 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
-              title="Collapse panel"
-            >
-              <PanelRightClose className="w-4 h-4" />
             </button>
           </div>
         </div>

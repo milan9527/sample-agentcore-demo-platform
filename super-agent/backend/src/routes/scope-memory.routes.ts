@@ -20,6 +20,7 @@ interface CreateMemoryBody {
     category?: string;
     tags?: string[];
     is_pinned?: boolean;
+    visibility?: 'scope' | 'user' | 'session';
     session_id?: string;
   };
 }
@@ -32,6 +33,7 @@ interface UpdateMemoryBody {
     category?: string;
     tags?: string[];
     is_pinned?: boolean;
+    visibility?: 'scope' | 'user' | 'session';
   };
 }
 
@@ -42,11 +44,11 @@ interface SummarizeBody {
 
 export async function scopeMemoryRoutes(fastify: FastifyInstance): Promise<void> {
   /** GET /:scopeId/memories — List memories with optional filters */
-  fastify.get<ScopeParam & { Querystring: { category?: string; q?: string; pinned?: string } }>(
+  fastify.get<ScopeParam & { Querystring: { category?: string; q?: string; pinned?: string; visibility?: string } }>(
     '/:scopeId/memories',
     { preHandler: [authenticate] },
     async (request, reply) => {
-      const query = request.query as { category?: string; q?: string; pinned?: string };
+      const query = request.query as { category?: string; q?: string; pinned?: string; visibility?: string };
       const memories = await scopeMemoryRepository.findByScope(
         request.user!.orgId,
         request.params.scopeId,
@@ -54,6 +56,8 @@ export async function scopeMemoryRoutes(fastify: FastifyInstance): Promise<void>
           category: query.category,
           q: query.q,
           pinned: query.pinned === 'true' ? true : query.pinned === 'false' ? false : undefined,
+          visibility: query.visibility as 'scope' | 'user' | 'session' | undefined,
+          userId: request.user!.id,
         },
       );
       return reply.status(200).send({ data: memories });
@@ -65,9 +69,16 @@ export async function scopeMemoryRoutes(fastify: FastifyInstance): Promise<void>
     '/:scopeId/memories',
     { preHandler: [authenticate] },
     async (request, reply) => {
-      const { title, content, category, tags, is_pinned, session_id } = request.body;
+      const { title, content, category, tags, is_pinned, visibility, session_id } = request.body;
       if (!title || !content) {
         return reply.status(400).send({ error: 'title and content are required', code: 'VALIDATION_ERROR' });
+      }
+
+      // Validate visibility value
+      const validVisibilities = ['scope', 'user', 'session'];
+      const memoryVisibility = visibility ?? 'scope';
+      if (!validVisibilities.includes(memoryVisibility)) {
+        return reply.status(400).send({ error: 'visibility must be one of: scope, user, session', code: 'VALIDATION_ERROR' });
       }
 
       const memory = await scopeMemoryRepository.create({
@@ -79,6 +90,7 @@ export async function scopeMemoryRoutes(fastify: FastifyInstance): Promise<void>
         category: category ?? 'lesson',
         tags: tags ?? [],
         is_pinned: is_pinned ?? false,
+        visibility: memoryVisibility as 'scope' | 'user' | 'session',
         created_by: request.user!.id,
       });
 

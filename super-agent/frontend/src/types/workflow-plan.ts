@@ -53,6 +53,7 @@ export const taskTypeSchema = z.enum([
   'condition',    // Conditional branching
   'document',     // Document generation
   'codeArtifact', // Code generation
+  'humanApproval', // Human approval checkpoint
 ]);
 
 export type TaskType = z.infer<typeof taskTypeSchema>;
@@ -102,6 +103,7 @@ export const patchOperationSchema = z.enum([
   'updateVariable',
   'deleteVariable',
   'reorderTasks',
+  'relayout',
 ]);
 
 export type PatchOperation = z.infer<typeof patchOperationSchema>;

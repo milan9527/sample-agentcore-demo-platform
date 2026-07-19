@@ -1,6 +1,7 @@
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import sharp from "sharp";
 
 export interface AvatarGenerationResult {
   role: string;
@@ -80,18 +81,25 @@ export class AvatarService {
       
       // Convert base64 to buffer
       const imageBuffer = Buffer.from(base64Image, 'base64');
-      console.log('Image buffer size:', imageBuffer.length, 'bytes');
+      console.log('Image buffer size (original):', imageBuffer.length, 'bytes');
+      
+      // Compress: resize to 128x128 and convert to WebP for much smaller file size
+      const compressedBuffer = await sharp(imageBuffer)
+        .resize(128, 128, { fit: 'cover' })
+        .webp({ quality: 80 })
+        .toBuffer();
+      console.log('Image buffer size (compressed):', compressedBuffer.length, 'bytes');
       
       // Generate unique filename
-      const filename = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.png`;
+      const filename = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.webp`;
       console.log('Uploading to S3 with filename:', filename);
       
       // Upload to S3
       await this.s3Client.send(new PutObjectCommand({
         Bucket: this.bucketName,
         Key: filename,
-        Body: imageBuffer,
-        ContentType: 'image/png'
+        Body: compressedBuffer,
+        ContentType: 'image/webp'
       }));
 
       console.log('Successfully uploaded to S3:', filename);

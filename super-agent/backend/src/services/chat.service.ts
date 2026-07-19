@@ -28,6 +28,8 @@ import {
 } from './claude-agent.service.js';
 import type { AgentRuntime } from './agent-runtime.js';
 import { agentRuntime as defaultAgentRuntime } from './agent-runtime-factory.js';
+import { resolveModel, extractSelection } from './model-resolver.js';
+import type { ModelSelection } from '../schemas/model-provider.schema.js';
 import {
   workspaceManager as defaultWorkspaceManager,
   type WorkspaceManager,
@@ -62,9 +64,18 @@ export { formatSSEEvent };
 export interface ChatStreamOptions {
   agentId?: string;
   businessScopeId?: string;
+  mentionAgentId?: string;
   sessionId?: string;
   message: string;
+  /** Per-request model override (from chat UI model selector). Legacy bare model id. */
+  model?: string;
+  /** Per-request provider+model selection (from chat UI). Takes priority over scope/agent. */
+  modelSelection?: ModelSelection;
   context?: Record<string, unknown>;
+  /** File names recently uploaded by the user (injected as context for the agent). */
+  attachedFiles?: string[];
+  /** Workspace paths of images attached to this message (for display in chat history). */
+  attachedImages?: string[];
 }
 
 export interface ChatHistoryOptions {
@@ -230,10 +241,13 @@ export class ChatService {
    */
   async processMessage(options: {
     sessionId?: string;
-    businessScopeId: string;
+    businessScopeId?: string;
+    agentId?: string;
     message: string;
     organizationId: string;
     userId: string;
+    /** Override the agent's system prompt (used by Project module to inject dev-focused instructions) */
+    systemPromptOverride?: string;
   }): Promise<{ text: string; sessionId: string; contentBlocks: ContentBlock[] }> {
     const result = await this.prepareScopeSession(
       options.organizationId,
@@ -246,6 +260,11 @@ export class ChatService {
     );
 
     const { sessionId, agentConfig, skills, claudeSessionId, workspacePath, pluginPaths, mcpServers } = result;
+
+    // Apply system prompt override if provided (e.g., for Project module)
+    if (options.systemPromptOverride) {
+      agentConfig.systemPrompt = options.systemPromptOverride;
+    }
 
     // Persist user message
     await this.addMessage(options.organizationId, sessionId, 'user', options.message);
@@ -282,7 +301,8 @@ export class ChatService {
         timeoutMs,
         (event: ConversationEvent) => {
           if (event.type === 'session_start' && event.sessionId) {
-            chatSessionRepository.updateClaudeSessionId(sessionId, options.organizationId, event.sessionId).catch(() => {});
+            const sessionModel = agentConfig.resolvedModel?.modelId ?? agentConfig.model ?? null;
+            chatSessionRepository.updateClaudeSessionId(sessionId, options.organizationId, event.sessionId, sessionModel).catch(() => {});
           }
           if (event.type === 'assistant' && event.content) {
             allContentBlocks.push(...event.content);
@@ -345,6 +365,164 @@ export class ChatService {
   }
 
   /**
+   * Provision a workspace for an existing session ahead of the first message.
+   * This allows the frontend to eagerly create a session + workspace when the
+   * user selects a business scope, so the workspace is ready by the time the
+   * user sends their first message.
+   *
+   * This is a no-op if the session already has a provisioned workspace.
+   */
+  async provisionSessionWorkspace(
+    sessionId: string,
+    organizationId: string,
+  ): Promise<void> {
+    const session = await this.getSessionById(sessionId, organizationId);
+    const scopeId = session.business_scope_id;
+    if (!scopeId) {
+      console.log(`[provisionSessionWorkspace] Session ${sessionId} has no business_scope_id, skipping`);
+      return;
+    }
+
+    const selectedAgentId = session.agent_id ?? null;
+    console.log(`[provisionSessionWorkspace] Building scope workspace data for scope=${scopeId}, agent=${selectedAgentId}`);
+
+    // Build the ScopeForWorkspace data (same logic as prepareScopeSession)
+    const scopeForWorkspace = await this.buildScopeForWorkspace(
+      scopeId, organizationId, selectedAgentId,
+    );
+
+    console.log(`[provisionSessionWorkspace] Provisioning workspace for session=${sessionId}, scope=${scopeId}, skills=${scopeForWorkspace.skills.length}, agents=${scopeForWorkspace.agents.length}`);
+
+    // Provision workspace (idempotent — ensureWorkspaceUpToDate handles existing ones)
+    // Pass session's user_id for memory visibility isolation
+    const result = await this.workspaceManager.ensureSessionWorkspace(
+      organizationId, sessionId, scopeForWorkspace, selectedAgentId, session.user_id,
+    );
+
+    console.log(`[provisionSessionWorkspace] Workspace provisioned at ${result.workspacePath}, plugins=${result.pluginPaths.length}`);
+  }
+
+  /**
+   * Build the ScopeForWorkspace data structure needed by workspace-manager.
+   * Extracted from prepareScopeSession so it can be reused by provisionSessionWorkspace.
+   */
+  private async buildScopeForWorkspace(
+    scopeId: string,
+    organizationId: string,
+    selectedAgentId: string | null,
+  ): Promise<ScopeForWorkspace> {
+    const scope = await businessScopeRepository.findById(scopeId, organizationId) as BusinessScopeEntity | null;
+    if (!scope) throw AppError.notFound(`Business scope with ID ${scopeId} not found`);
+
+    // Run independent DB queries in parallel
+    const { skillService: scopeSkillService } = await import('./skill.service.js');
+    const { documentGroupRepository: docGroupRepo } = await import('../repositories/document-group.repository.js');
+
+    const [agentsWithSkills, scopeLevelSkills, scopeMcpServers, scopePlugins, rawDocGroups] = await Promise.all([
+      this.businessScopeService.getScopeAgentsWithSkills(scopeId, organizationId),
+      scopeSkillService.getScopeLevelSkills(organizationId, scopeId),
+      this.loadScopeMcpServers(scopeId),
+      this.loadScopePlugins(scopeId),
+      docGroupRepo.getGroupsForScope(scopeId),
+    ]);
+
+    // Build skills list
+    const skillMap = new Map<string, SkillForWorkspace>();
+    const agentsToCollectSkillsFrom = selectedAgentId
+      ? agentsWithSkills.filter(a => a.id === selectedAgentId)
+      : agentsWithSkills;
+
+    for (const agent of agentsToCollectSkillsFrom) {
+      for (const skill of agent.skills) {
+        if (!skillMap.has(skill.id)) {
+          skillMap.set(skill.id, {
+            id: skill.id,
+            name: skill.name,
+            hashId: skill.hash_id,
+            s3Bucket: skill.s3_bucket,
+            s3Prefix: skill.s3_prefix,
+            localPath: skill.metadata?.localPath as string | undefined,
+            description: skill.description ?? (skill.metadata?.description as string | undefined),
+            body: skill.metadata?.body as string | undefined,
+          });
+        }
+      }
+    }
+
+    // Scope-level skills
+    for (const skill of scopeLevelSkills) {
+      if (!skillMap.has(skill.id)) {
+        const meta = skill.metadata as Record<string, unknown> | null;
+        skillMap.set(skill.id, {
+          id: skill.id,
+          name: skill.name,
+          hashId: skill.hash_id,
+          s3Bucket: skill.s3_bucket,
+          s3Prefix: skill.s3_prefix,
+          localPath: meta?.localPath as string | undefined,
+          description: meta?.description as string | undefined,
+          body: meta?.body as string | undefined,
+        });
+      }
+    }
+    const skills = Array.from(skillMap.values());
+
+    const docGroups = rawDocGroups.map(g => ({
+      id: g.id,
+      name: g.name,
+      storagePath: g.storage_path,
+      fileCount: g.files?.length ?? 0,
+    }));
+
+    return {
+      id: scope.id,
+      name: scope.name,
+      description: scope.description,
+      systemPrompt: scope.system_prompt ?? null,
+      settings: (scope as any).settings as Record<string, unknown> | null ?? null,
+      configVersion: scope.config_version,
+      agents: agentsWithSkills.map(a => {
+        const mc = a.model_config as Record<string, unknown> | null;
+        const generatedFromConfig = Array.isArray(mc?.generatedSkills)
+          ? (mc!.generatedSkills as Array<{ name: string; description: string; body: string }>)
+          : [];
+
+        const toolsArray = Array.isArray(a.tools) ? a.tools as Array<{ id?: string; name: string; skillMd?: string }> : [];
+        const generatedFromTools = toolsArray
+          .filter(t => t.name && t.skillMd)
+          .map(t => ({
+            name: t.name,
+            description: t.skillMd!.split('\n').find(line => line.trim() && !line.startsWith('#'))?.trim() || t.name,
+            body: t.skillMd!,
+          }));
+
+        const seenNames = new Set(generatedFromConfig.map(s => s.name));
+        const allGenerated = [
+          ...generatedFromConfig,
+          ...generatedFromTools.filter(s => !seenNames.has(s.name)),
+        ];
+
+        const includeGeneratedSkills = !selectedAgentId || a.id === selectedAgentId;
+
+        return {
+          id: a.id,
+          name: a.name,
+          displayName: a.display_name,
+          role: a.role,
+          systemPrompt: a.system_prompt,
+          skillNames: a.skills.map(s => s.name),
+          avatar: a.avatar ?? null,
+          generatedSkills: includeGeneratedSkills && allGenerated.length > 0 ? allGenerated : undefined,
+        };
+      }),
+      skills,
+      mcpServers: scopeMcpServers,
+      plugins: scopePlugins,
+      documentGroups: docGroups,
+    };
+  }
+
+  /**
    * Stream a chat response using SSE.
    * Supports two flows:
    *   1. Business-scope-based (new): uses per-session workspace with CLAUDE.md, subagents, skills
@@ -356,6 +534,7 @@ export class ChatService {
     userId: string,
     options: ChatStreamOptions,
     skillsOverride?: SkillForWorkspace[],
+    systemPromptOverride?: string,
   ): Promise<void> {
     // Determine which flow to use
     const useScopeFlow = !!options.businessScopeId;
@@ -364,6 +543,8 @@ export class ChatService {
     let agentConfig: AgentConfig;
     let skills: SkillForWorkspace[];
     let claudeSessionId: string | undefined;
+    // Model the resumable Claude session was created with (null/undefined if none).
+    let claudeSessionModel: string | undefined;
     let workspacePath: string | undefined;
     let subAgentNames: string[] = [];
     let subAgentNameToId: Map<string, string> = new Map();
@@ -380,6 +561,7 @@ export class ChatService {
       agentConfig = result.agentConfig;
       skills = result.skills;
       claudeSessionId = result.claudeSessionId;
+      claudeSessionModel = result.claudeSessionModel;
       workspacePath = result.workspacePath;
       subAgentNames = result.subAgentNames;
       subAgentNameToId = result.subAgentNameToId;
@@ -398,11 +580,70 @@ export class ChatService {
       agentConfig = result.agentConfig;
       skills = result.skills;
       claudeSessionId = result.claudeSessionId;
+      claudeSessionModel = result.claudeSessionModel;
       workspacePath = result.workspacePath;
     }
 
-    // Persist user message
-    await this.addMessage(organizationId, sessionId, 'user', options.message);
+    // Apply system prompt override if provided (e.g., single-skill workshop testing)
+    if (systemPromptOverride) {
+      agentConfig.systemPrompt = systemPromptOverride;
+    }
+
+    // Apply per-request model override from chat UI (takes priority over scope default).
+    // Supports both the new provider+model selection and the legacy bare model id.
+    const requestSelection: ModelSelection | undefined =
+      options.modelSelection ?? (options.model ? { modelId: options.model } : undefined);
+    console.log(`[chat] requestSelection=${JSON.stringify(requestSelection)}, claudeSessionId=${claudeSessionId}`);
+    if (requestSelection) {
+      const prev = agentConfig.resolvedModel;
+      if (requestSelection.providerId) {
+        // Explicit provider switch → full re-resolve.
+        agentConfig.resolvedModel = await resolveModel(organizationId, { requestSelection });
+      } else if (prev) {
+        // Model-only change → keep the already-resolved provider (base_url/api_key),
+        // just swap the model id.
+        agentConfig.resolvedModel = { ...prev, modelId: requestSelection.modelId ?? prev.modelId };
+      } else {
+        agentConfig.resolvedModel = await resolveModel(organizationId, { requestSelection });
+      }
+      agentConfig.model = agentConfig.resolvedModel.modelId ?? agentConfig.model;
+    }
+
+    // Claude Code locks the model to a session at creation — resuming keeps the
+    // ORIGINAL model. So detect a switch against the model the resumable session
+    // was actually created with (claudeSessionModel), NOT the freshly-resolved
+    // scope/org default (which may coincide with the selection and mask a real
+    // switch). If they differ, drop the session id so the container starts fresh.
+    const effectiveModel = agentConfig.resolvedModel?.modelId ?? agentConfig.model;
+
+    // Note: non-Anthropic Bedrock models (Nova, DeepSeek, …) are NOT blocked
+    // here anymore. The AgentCore runtime transparently routes them through the
+    // backend's built-in LLM proxy (/v1/messages → Bedrock Converse), which
+    // translates the Anthropic schema the Claude Code CLI emits.
+
+    if (claudeSessionId && claudeSessionModel && effectiveModel && claudeSessionModel !== effectiveModel) {
+      console.log(
+        `[chat] Model changed (session was ${claudeSessionModel} → now ${effectiveModel}), resetting Claude session`,
+      );
+      claudeSessionId = undefined;
+      if (sessionId) {
+        chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, null, null).catch(() => {});
+      }
+    }
+    console.log(`[chat] Final provider=${agentConfig.resolvedModel?.provider}, model=${effectiveModel}, sessionModel=${claudeSessionModel ?? '(none)'}, claudeSessionId=${claudeSessionId}`);
+
+    // Persist user message + mark session as generating + agent as busy (in parallel)
+    const resolvedAgentId = agentConfig.id;
+    await Promise.all([
+      this.addMessage(organizationId, sessionId, 'user', options.message, {
+        mentionAgentId: options.mentionAgentId,
+        metadata: options.attachedImages && options.attachedImages.length > 0
+          ? { attachedImages: options.attachedImages }
+          : undefined,
+      }),
+      chatSessionRepository.updateStatus(sessionId, organizationId, 'generating'),
+      agentStatusService.setBusy(resolvedAgentId, organizationId),
+    ]);
 
     // Start Langfuse trace for this chat turn
     const langfuseTrace = startConversationTrace({
@@ -419,16 +660,13 @@ export class ChatService {
       organizationId,
       sessionId,
       agentId: agentConfig.id,
+      userId,
+      source: 'chat',
       subAgentNames: new Set(subAgentNames),
       subAgentNameToId,
       activeSubAgentCalls: new Map(),
       subAgentStartTimes: new Map(),
     };
-
-    // Mark session as generating + agent as busy
-    await chatSessionRepository.updateStatus(sessionId, organizationId, 'generating');
-    const resolvedAgentId = agentConfig.id;
-    await agentStatusService.setBusy(resolvedAgentId, organizationId);
 
     // Register in stream registry so other clients can reconnect
     streamRegistry.register(sessionId);
@@ -466,6 +704,7 @@ export class ChatService {
     }, 15_000);
 
     const allContentBlocks: ContentBlock[] = [];
+    let lastModelId: string | undefined;
 
     // Listen for external events pushed to the registry by other routes (e.g. preview_ready)
     const registrySub = streamRegistry.subscribe(sessionId);
@@ -490,6 +729,24 @@ export class ChatService {
     const activeSubAgentByToolId = new Map<string, { displayName: string; avatar: string | null }>();
     let currentSpeaker: { displayName: string; avatar: string | null } | null = null;
 
+    // Build the effective message — inject a routing hint when a specific agent is @mentioned
+    let effectiveMessage = options.message;
+    if (options.mentionAgentId && useScopeFlow) {
+      // Resolve mentionAgentId to the agent's technical name for Task tool routing
+      const mentionedName = [...subAgentNameToId.entries()].find(([, id]) => id === options.mentionAgentId)?.[0];
+      if (mentionedName) {
+        const mentionedInfo = subAgentInfoMap.get(mentionedName);
+        const displayLabel = mentionedInfo?.displayName ?? mentionedName;
+        effectiveMessage = `[System routing: The user has @mentioned agent "${displayLabel}" (name: \`${mentionedName}\`). You MUST delegate this request to the \`${mentionedName}\` subagent using the Task tool. Do NOT answer directly — always delegate.]\n\n${options.message}`;
+      }
+    }
+
+    // Inject attached files context so the agent knows which files were just uploaded
+    if (options.attachedFiles && options.attachedFiles.length > 0) {
+      const fileList = options.attachedFiles.map(f => `  - ${f}`).join('\n');
+      effectiveMessage = `[System context: The user has just uploaded the following file(s) to the workspace. You can read/access them directly by their file names:\n${fileList}]\n\n${effectiveMessage}`;
+    }
+
     try {
       // Use the configured agent runtime (claude or openclaw).
       // AgentCore container isolation is handled by the runtime provider itself
@@ -499,7 +756,7 @@ export class ChatService {
               agentId: agentConfig.id,
               sessionId: options.sessionId,
               providerSessionId: claudeSessionId,
-              message: options.message,
+              message: effectiveMessage,
               organizationId,
               userId,
               workspacePath,
@@ -519,9 +776,10 @@ export class ChatService {
         (event: ConversationEvent) => {
           if (event.type === 'session_start' && event.sessionId) {
             conversationSessionId = event.sessionId;
-            // Store the Claude SDK session ID for future resume
+            // Store the Claude SDK session ID + the model it was created with, so
+            // a later model switch is detected accurately and forces a new session.
             if (sessionId) {
-              chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, event.sessionId).catch((err) => {
+              chatSessionRepository.updateClaudeSessionId(sessionId, organizationId, event.sessionId, effectiveModel ?? null).catch((err) => {
                 console.error('Failed to store claude_session_id:', err);
               });
             }
@@ -529,6 +787,7 @@ export class ChatService {
 
           if (event.type === 'assistant' && event.content) {
             allContentBlocks.push(...event.content);
+            if (event.model) lastModelId = event.model;
 
             // Detect sub-agent speaker changes from content blocks
             for (const block of event.content) {
@@ -559,6 +818,11 @@ export class ChatService {
 
           // Record event in Langfuse trace
           recordEvent(langfuseTrace, event);
+
+          // Inject tracked model into result event so the frontend can display it
+          if (event.type === 'result' && lastModelId && !event.model) {
+            event.model = lastModelId;
+          }
 
           // Process through conversation hooks (metrics, sub-agent detection)
           processConversationEvent(hookCtx, event);
@@ -606,22 +870,30 @@ export class ChatService {
       // Flush any sub-agents still tracked as busy (handles interrupted sessions)
       flushActiveSubAgents(hookCtx);
 
-      // Mark agent as active + session as idle
-      await agentStatusService.setActive(resolvedAgentId, organizationId);
-      await chatSessionRepository.updateStatus(sessionId, organizationId, 'idle').catch((err) => {
-        console.error('Failed to set session status to idle:', err);
-      });
-
-      // Complete the stream registry entry
+      // Send [DONE] immediately so the frontend can stop the loading indicator.
+      // All remaining cleanup (DB writes, traces) happens after.
       streamRegistry.complete(sessionId);
-
-      if (allContentBlocks.length > 0) {
+      if (!clientDisconnected) {
         try {
-          await this.addMessage(organizationId, sessionId, 'ai', JSON.stringify(allContentBlocks));
-        } catch (err) {
-          console.error('Failed to persist assistant response:', err);
-        }
+          reply.raw.write(formatSSEEvent({ data: '[DONE]' }));
+          reply.raw.end();
+        } catch { /* client disconnected */ }
       }
+
+      // --- Non-blocking cleanup below (client already received [DONE]) ---
+
+      // Mark agent as active + session as idle + persist AI response (in parallel)
+      await Promise.all([
+        agentStatusService.setActive(resolvedAgentId, organizationId),
+        chatSessionRepository.updateStatus(sessionId, organizationId, 'idle').catch((err) => {
+          console.error('Failed to set session status to idle:', err);
+        }),
+        allContentBlocks.length > 0
+          ? this.addMessage(organizationId, sessionId, 'ai', JSON.stringify(allContentBlocks)).catch((err) => {
+              console.error('Failed to persist assistant response:', err);
+            })
+          : Promise.resolve(),
+      ]);
 
       // Finalize Langfuse trace
       endConversationTrace(langfuseTrace, allContentBlocks);
@@ -634,6 +906,7 @@ export class ChatService {
 
       // Auto-distill memories from the conversation (fire-and-forget)
       if (useScopeFlow && allContentBlocks.length > 0 && options.businessScopeId) {
+        console.log(`[distillation-debug] Enqueuing: scope=${options.businessScopeId}, session=${sessionId}, blocks=${allContentBlocks.length}`);
         distillationService.enqueue({
           organizationId,
           scopeId: options.businessScopeId,
@@ -642,13 +915,6 @@ export class ChatService {
           contentBlocks: allContentBlocks,
           userMessage: options.message,
         }).catch(() => {});
-      }
-
-      if (!clientDisconnected) {
-        try {
-          reply.raw.write(formatSSEEvent({ data: '[DONE]' }));
-          reply.raw.end();
-        } catch { /* client disconnected */ }
       }
     }
   }
@@ -664,129 +930,20 @@ export class ChatService {
     organizationId: string,
     userId: string,
     options: ChatStreamOptions,
-  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string; subAgentNames: string[]; subAgentNameToId: Map<string, string>; subAgentInfoMap: Map<string, { displayName: string; avatar: string | null }>; pluginPaths: string[]; mcpServers: Record<string, import('./claude-agent.service.js').MCPServerSDKConfig> }> {
+  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string; claudeSessionModel?: string; subAgentNames: string[]; subAgentNameToId: Map<string, string>; subAgentInfoMap: Map<string, { displayName: string; avatar: string | null }>; pluginPaths: string[]; mcpServers: Record<string, import('./claude-agent.service.js').MCPServerSDKConfig> }> {
     const scopeId = options.businessScopeId!;
-
-    // Load scope
-    const scope = await businessScopeRepository.findById(scopeId, organizationId) as BusinessScopeEntity | null;
-    if (!scope) throw AppError.notFound(`Business scope with ID ${scopeId} not found`);
-
-    // Load agents with skills for this scope
-    const agentsWithSkills = await this.businessScopeService.getScopeAgentsWithSkills(scopeId, organizationId);
-
-    // Build skills list based on selection:
-    // - If a specific agent is selected, only include that agent's skills
-    // - If only scope is selected (no agent), include all skills across all agents
-    const skillMap = new Map<string, SkillForWorkspace>();
+    // mentionAgentId is NOT used as selectedAgentId — it should not change the orchestrator identity.
+    // Instead, it's handled by injecting a routing hint into the message so the orchestrator
+    // delegates to the mentioned agent via the Task tool.
     const selectedAgentId = options.agentId ?? null;
-    const agentsToCollectSkillsFrom = selectedAgentId
-      ? agentsWithSkills.filter(a => a.id === selectedAgentId)
-      : agentsWithSkills;
 
-    for (const agent of agentsToCollectSkillsFrom) {
-      for (const skill of agent.skills) {
-        if (!skillMap.has(skill.id)) {
-          skillMap.set(skill.id, {
-            id: skill.id,
-            name: skill.name,
-            hashId: skill.hash_id,
-            s3Bucket: skill.s3_bucket,
-            s3Prefix: skill.s3_prefix,
-            localPath: skill.metadata?.localPath as string | undefined,
-            description: skill.description ?? (skill.metadata?.description as string | undefined),
-            body: skill.metadata?.body as string | undefined,
-          });
-        }
-      }
-    }
+    // Build scope data for workspace manager and load agents in parallel.
+    // buildScopeForWorkspace already queries scope + agentsWithSkills internally,
+    // so we reuse its result instead of querying agentsWithSkills separately.
+    const scopeForWorkspace = await this.buildScopeForWorkspace(scopeId, organizationId, selectedAgentId);
 
-    // Also load scope-level skills (API integrations, shared tools)
-    const { skillService: scopeSkillService } = await import('./skill.service.js');
-    const scopeLevelSkills = await scopeSkillService.getScopeLevelSkills(organizationId, scopeId);
-    for (const skill of scopeLevelSkills) {
-      if (!skillMap.has(skill.id)) {
-        const meta = skill.metadata as Record<string, unknown> | null;
-        skillMap.set(skill.id, {
-          id: skill.id,
-          name: skill.name,
-          hashId: skill.hash_id,
-          s3Bucket: skill.s3_bucket,
-          s3Prefix: skill.s3_prefix,
-          localPath: meta?.localPath as string | undefined,
-          description: meta?.description as string | undefined,
-          body: meta?.body as string | undefined,
-        });
-      }
-    }
-    const skills = Array.from(skillMap.values());
-
-    // Load scope-level MCP servers (community plugins attached to this scope)
-    const scopeMcpServers = await this.loadScopeMcpServers(scopeId);
-
-    // Load scope-level plugins (Claude Code plugins to clone into workspace)
-    const scopePlugins = await this.loadScopePlugins(scopeId);
-
-    // Load document groups assigned to this scope
-    const { documentGroupRepository: docGroupRepo } = await import('../repositories/document-group.repository.js');
-    const rawDocGroups = await docGroupRepo.getGroupsForScope(scopeId);
-    const docGroups = rawDocGroups.map(g => ({
-      id: g.id,
-      name: g.name,
-      storagePath: g.storage_path,
-      fileCount: g.files?.length ?? 0,
-    }));
-
-    // Build scope data for workspace manager
-    const scopeForWorkspace: ScopeForWorkspace = {
-      id: scope.id,
-      name: scope.name,
-      description: scope.description,
-      systemPrompt: scope.system_prompt ?? null,
-      configVersion: scope.config_version,
-      agents: agentsWithSkills.map(a => {
-        // Extract generated skills from model_config (created by scope-generator)
-        const mc = a.model_config as Record<string, unknown> | null;
-        const generatedFromConfig = Array.isArray(mc?.generatedSkills)
-          ? (mc!.generatedSkills as Array<{ name: string; description: string; body: string }>)
-          : [];
-
-        // Extract skills from agent.tools column (legacy storage: { id, name, skillMd })
-        const toolsArray = Array.isArray(a.tools) ? a.tools as Array<{ id?: string; name: string; skillMd?: string }> : [];
-        const generatedFromTools = toolsArray
-          .filter(t => t.name && t.skillMd)
-          .map(t => ({
-            name: t.name,
-            description: t.skillMd!.split('\n').find(line => line.trim() && !line.startsWith('#'))?.trim() || t.name,
-            body: t.skillMd!,
-          }));
-
-        // Merge both sources, dedup by name (model_config takes precedence)
-        const seenNames = new Set(generatedFromConfig.map(s => s.name));
-        const allGenerated = [
-          ...generatedFromConfig,
-          ...generatedFromTools.filter(s => !seenNames.has(s.name)),
-        ];
-
-        // When a specific agent is selected, only include generated skills
-        // for that agent (other agents still appear as subagents for delegation
-        // but their skills are not copied to the workspace)
-        const includeGeneratedSkills = !selectedAgentId || a.id === selectedAgentId;
-
-        return {
-          id: a.id,
-          name: a.name,
-          displayName: a.display_name,
-          role: a.role,
-          systemPrompt: a.system_prompt,
-          skillNames: a.skills.map(s => s.name),
-          generatedSkills: includeGeneratedSkills && allGenerated.length > 0 ? allGenerated : undefined,
-        };
-      }),
-      skills,
-      mcpServers: scopeMcpServers,
-      plugins: scopePlugins,
-      documentGroups: docGroups,
-    };
+    // Derive agentsWithSkills from scopeForWorkspace to avoid a duplicate DB query
+    const agentsWithSkills = scopeForWorkspace.agents;
 
     // Get or create session
     let sessionId = options.sessionId;
@@ -803,7 +960,7 @@ export class ChatService {
 
       // Provision new workspace
       const provisionResult = await this.workspaceManager.ensureSessionWorkspace(
-        organizationId, sessionId, scopeForWorkspace, selectedAgentId,
+        organizationId, sessionId, scopeForWorkspace, selectedAgentId, userId,
       );
       pluginPaths = provisionResult.pluginPaths;
     } else {
@@ -811,7 +968,7 @@ export class ChatService {
 
       // Lazy refresh: check if workspace is up-to-date
       const refreshResult = await this.workspaceManager.ensureWorkspaceUpToDate(
-        organizationId, sessionId, scopeForWorkspace, selectedAgentId,
+        organizationId, sessionId, scopeForWorkspace, selectedAgentId, userId,
       );
       pluginPaths = refreshResult.pluginPaths;
     }
@@ -825,25 +982,32 @@ export class ChatService {
 
     const agentConfig: AgentConfig = {
       id: selectedAgent?.id ?? scopeId,
-      name: selectedAgent?.name ?? scope.name,
-      displayName: selectedAgent?.display_name ?? scope.name,
-      systemPrompt: selectedAgent?.system_prompt ?? null,
+      name: selectedAgent?.name ?? scopeForWorkspace.name,
+      displayName: selectedAgent?.displayName ?? scopeForWorkspace.name,
+      systemPrompt: selectedAgent?.systemPrompt ?? null,
+      model: scopeForWorkspace.settings?.modelId as string | undefined
+        ?? (selectedAgent?.model_config as Record<string, unknown>)?.modelId as string | undefined,
       organizationId,
-      skillIds: skills.map(s => s.id),
+      skillIds: scopeForWorkspace.skills.map(s => s.id),
       mcpServerIds: [],
     };
+
+    // Resolve provider (bedrock/litellm) from scope default → agent config → org default.
+    agentConfig.resolvedModel = await resolveModel(organizationId, {
+      scopeSelection: extractSelection(scopeForWorkspace.settings),
+      agentSelection: extractSelection((selectedAgent as unknown as { model_config?: unknown })?.model_config),
+    });
 
     const subAgentInfoMap = new Map(agentsWithSkills.map(a => {
       // Resolve avatar S3 key to a full API URL so the frontend can load it directly
       let avatarUrl: string | null = null;
       if (a.avatar) {
-        // Strip any leading slashes and build the API path
         const key = a.avatar.replace(/^\/+/, '');
         avatarUrl = `/api/avatars/${key}`;
       }
-      return [a.name, { displayName: a.display_name || a.name, avatar: avatarUrl }];
+      return [a.name, { displayName: a.displayName || a.name, avatar: avatarUrl }];
     }));
-    return { sessionId, workspacePath, agentConfig, skills, claudeSessionId: session.claude_session_id ?? undefined, subAgentNames: agentsWithSkills.map(a => a.name), subAgentNameToId: new Map(agentsWithSkills.map(a => [a.name, a.id])), subAgentInfoMap, pluginPaths, mcpServers: await this.readSessionMcpServers(workspacePath) };
+    return { sessionId, workspacePath, agentConfig, skills: scopeForWorkspace.skills, claudeSessionId: session.claude_session_id ?? undefined, claudeSessionModel: session.claude_session_model ?? undefined, subAgentNames: agentsWithSkills.map(a => a.name), subAgentNameToId: new Map(agentsWithSkills.map(a => [a.name, a.id])), subAgentInfoMap, pluginPaths, mcpServers: await this.readSessionMcpServers(workspacePath) };
   }
 
   /**
@@ -917,7 +1081,7 @@ export class ChatService {
     userId: string,
     options: ChatStreamOptions,
     skillsOverride?: SkillForWorkspace[],
-  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string }> {
+  ): Promise<{ sessionId: string; workspacePath: string; agentConfig: AgentConfig; skills: SkillForWorkspace[]; claudeSessionId?: string; claudeSessionModel?: string }> {
     const agent = await agentRepository.findById(options.agentId!, organizationId);
     if (!agent) throw AppError.notFound(`Agent with ID ${options.agentId} not found`);
 
@@ -930,6 +1094,7 @@ export class ChatService {
 
     let sessionId = options.sessionId;
     let claudeSessionId: string | undefined;
+    let claudeSessionModel: string | undefined;
     if (!sessionId) {
       const session = await this.createSession({ context: options.context ?? {} }, organizationId, userId);
       sessionId = session.id;
@@ -942,6 +1107,7 @@ export class ChatService {
         sessionId = newSession.id;
       } else {
         claudeSessionId = session.claude_session_id ?? undefined;
+        claudeSessionModel = session.claude_session_model ?? undefined;
       }
     }
 
@@ -952,12 +1118,17 @@ export class ChatService {
       name: agent.name,
       displayName: agent.display_name || agent.name,
       systemPrompt: agent.system_prompt,
+      model: (agent.model_config as Record<string, unknown>)?.modelId as string | undefined,
       organizationId,
       skillIds: skills.map(s => s.id),
       mcpServerIds: [],
     };
 
-    return { sessionId, workspacePath, agentConfig, skills, claudeSessionId };
+    agentConfig.resolvedModel = await resolveModel(organizationId, {
+      agentSelection: extractSelection(agent.model_config),
+    });
+
+    return { sessionId, workspacePath, agentConfig, skills, claudeSessionId, claudeSessionModel };
   }
 
   private async loadAgentSkills(organizationId: string, agentId: string): Promise<SkillForWorkspace[]> {
@@ -998,7 +1169,7 @@ export class ChatService {
           break;
         case 'result':
           reply.raw.write(formatSSEEvent({
-            data: JSON.stringify({ type: 'result', session_id: safe.sessionId, duration_ms: safe.durationMs, num_turns: safe.numTurns }),
+            data: JSON.stringify({ type: 'result', session_id: safe.sessionId, duration_ms: safe.durationMs, num_turns: safe.numTurns, model: safe.model, token_usage: safe.tokenUsage ? { input_tokens: safe.tokenUsage.inputTokens, output_tokens: safe.tokenUsage.outputTokens, cache_read_input_tokens: safe.tokenUsage.cacheReadInputTokens, cache_creation_input_tokens: safe.tokenUsage.cacheCreationInputTokens, total_cost_usd: safe.tokenUsage.totalCostUsd } : undefined }),
           }));
           break;
         case 'heartbeat':

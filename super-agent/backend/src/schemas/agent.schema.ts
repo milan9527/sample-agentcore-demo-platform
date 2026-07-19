@@ -64,6 +64,10 @@ export const updateAgentSchema = z.object({
   scope: z.array(z.unknown()).optional(),
   system_prompt: z.string().optional().nullable(),
   model_config: z.record(z.string(), z.unknown()).optional(),
+  // A2A external access
+  a2a_enabled: z.boolean().optional(),
+  a2a_capabilities: z.string().max(2000).optional().nullable(),
+  a2a_exposed_skills: z.array(z.string()).optional(),
 });
 
 /**

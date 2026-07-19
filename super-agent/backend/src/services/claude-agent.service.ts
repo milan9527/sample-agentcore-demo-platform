@@ -15,6 +15,7 @@ import { createToken } from '../middleware/auth.js';
 import { dangerousCommandBlocker, binaryFileReadBlocker, createSkillAccessChecker } from './claude-hooks.js';
 import { WorkspaceManager, type SkillForWorkspace } from './workspace-manager.js';
 import { prisma } from '../config/database.js';
+import type { ResolvedModel } from './model-resolver.js';
 
 // ---------------------------------------------------------------------------
 // Re-export SDK types from @anthropic-ai/claude-agent-sdk for consumers.
@@ -165,6 +166,14 @@ export interface AgentConfig {
   name: string;
   displayName: string;
   systemPrompt: string | null;
+  /** Model identifier (e.g. LiteLLM model name). Passed to container to override ANTHROPIC_MODEL. */
+  model?: string;
+  /**
+   * Fully resolved model + provider for this invocation (bedrock or litellm,
+   * with base_url/api_key for litellm). When present, runtimes use this to
+   * choose provider env; `model` is kept for display/logging.
+   */
+  resolvedModel?: ResolvedModel;
   organizationId: string;
   skillIds: string[];
   mcpServerIds: string[];
@@ -174,6 +183,14 @@ export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; tool_use_id: string; content: string | null; is_error: boolean };
+
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  totalCostUsd: number;
+}
 
 export interface ConversationEvent {
   type: 'session_start' | 'assistant' | 'result' | 'heartbeat' | 'error' | 'preview_ready';
@@ -192,6 +209,8 @@ export interface ConversationEvent {
   /** Sub-agent speaker identity — set when the message originates from a sub-agent */
   speakerAgentName?: string;
   speakerAgentAvatar?: string | null;
+  /** Token usage from the LLM — populated on result events */
+  tokenUsage?: TokenUsage;
 }
 
 export interface MCPServerRecord {
@@ -360,8 +379,14 @@ export class ClaudeAgentService {
     mcpServers: Record<string, AnyMCPServerConfig>, resumeSessionId?: string, abortController?: AbortController, userId?: string,
     pluginPaths?: string[],
   ): ClaudeCodeOptions {
-    let model = config.claude.model;
-    if (config.claude.useBedrock) model = getBedrockModelId(model);
+    // Provider resolution: prefer the per-invocation resolvedModel; otherwise
+    // fall back to the global config (legacy behavior).
+    const resolved = agentConfig.resolvedModel;
+    const useLiteLLM = resolved?.provider === 'litellm';
+    const useBedrock = useLiteLLM ? false : (resolved ? resolved.provider === 'bedrock' : config.claude.useBedrock);
+
+    let model = resolved?.modelId ?? agentConfig.model ?? config.claude.model;
+    if (useBedrock) model = getBedrockModelId(model);
     const preToolUseHooks: SDKHookCallbackMatcher[] = [{ hooks: [dangerousCommandBlocker, binaryFileReadBlocker] }];
     if (skillNames.length > 0) preToolUseHooks.push({ hooks: [createSkillAccessChecker(skillNames)] });
 
@@ -393,7 +418,10 @@ export class ClaudeAgentService {
       allowDangerouslySkipPermissions: true,
       hooks: { PreToolUse: preToolUseHooks },
       mcpServers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
-      settingSources: config.claude.useBedrock ? ['project'] : ['user', 'project'],
+      // Only load host 'user' settings for plain Anthropic auth. Bedrock and
+      // litellm must not inherit the host's stored OAuth login (it would win
+      // over our explicit creds), so restrict them to project settings.
+      settingSources: (useBedrock || useLiteLLM) ? ['project'] : ['user', 'project'],
       plugins: pluginPaths && pluginPaths.length > 0
         ? pluginPaths.map(p => ({ type: 'local' as const, path: p }))
         : undefined,
@@ -420,8 +448,41 @@ export class ClaudeAgentService {
       ...(agentToken ? { AUTH_TOKEN: agentToken } : {}),
     };
 
-    // Pass Bedrock env vars to the SDK subprocess so it picks up AWS credentials
-    if (config.claude.useBedrock) {
+    if (useLiteLLM) {
+      // Route the SDK at a LiteLLM-compatible gateway (Anthropic-compatible API).
+      // The CLI validates model ids client-side and rewrites its built-in
+      // aliases (opus/sonnet/haiku) to canonical Anthropic ids, which a gateway
+      // may reject. So we drive the CLI with the `opus` alias but remap that
+      // alias to the gateway's actual model id via ANTHROPIC_DEFAULT_OPUS_MODEL.
+      const gatewayModel = resolved?.modelId;
+      options.env = {
+        ...process.env,
+        ...platformEnv,
+        ...(resolved?.baseUrl ? { ANTHROPIC_BASE_URL: resolved.baseUrl } : {}),
+        // Gateway auth: set BOTH so the CLI uses the token regardless of which
+        // header it prefers, and does not fall back to stored OAuth creds.
+        ...(resolved?.apiKey ? { ANTHROPIC_AUTH_TOKEN: resolved.apiKey, ANTHROPIC_API_KEY: resolved.apiKey } : {}),
+        ...(gatewayModel
+          ? {
+              ANTHROPIC_MODEL: 'opus',
+              ANTHROPIC_DEFAULT_OPUS_MODEL: gatewayModel,
+              ANTHROPIC_DEFAULT_SONNET_MODEL: gatewayModel,
+              ANTHROPIC_DEFAULT_HAIKU_MODEL: gatewayModel,
+              ANTHROPIC_SMALL_FAST_MODEL: gatewayModel,
+            }
+          : {}),
+      };
+      // The SDK options.model must also be the alias, not the raw gateway id.
+      options.model = 'opus';
+      // Ensure Bedrock mode is off so the CLI uses the gateway auth, and remove
+      // any stored OAuth session so it doesn't win over our token.
+      delete options.env.CLAUDE_CODE_USE_BEDROCK;
+      delete options.env.CLAUDE_CODE_OAUTH_TOKEN;
+      delete options.env.AWS_ACCESS_KEY_ID;
+      delete options.env.AWS_SECRET_ACCESS_KEY;
+      delete options.env.AWS_PROFILE;
+    } else if (useBedrock) {
+      // Pass Bedrock env vars to the SDK subprocess so it picks up AWS credentials
       options.env = {
         ...process.env,
         ...platformEnv,
@@ -477,7 +538,32 @@ export class ClaudeAgentService {
       }
       case 'result': {
         const r = message as SDKResultMessage;
-        return { type: 'result', sessionId: r.session_id ?? sessionId, durationMs: r.duration_ms, numTurns: r.num_turns };
+        // Extract token usage from SDK result
+        let tokenUsage: TokenUsage | undefined;
+        const usage = (r as Record<string, unknown>).usage as Record<string, number> | undefined;
+        const modelUsage = (r as Record<string, unknown>).modelUsage as Record<string, Record<string, number>> | undefined;
+
+        if (usage) {
+          tokenUsage = {
+            inputTokens: usage.input_tokens ?? 0,
+            outputTokens: usage.output_tokens ?? 0,
+            cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+            totalCostUsd: ((r as Record<string, unknown>).total_cost_usd as number) ?? 0,
+          };
+        } else if (modelUsage) {
+          let inputTokens = 0, outputTokens = 0, cacheRead = 0, cacheCreation = 0, cost = 0;
+          for (const mu of Object.values(modelUsage)) {
+            inputTokens += mu.inputTokens ?? 0;
+            outputTokens += mu.outputTokens ?? 0;
+            cacheRead += mu.cacheReadInputTokens ?? 0;
+            cacheCreation += mu.cacheCreationInputTokens ?? 0;
+            cost += mu.costUSD ?? 0;
+          }
+          tokenUsage = { inputTokens, outputTokens, cacheReadInputTokens: cacheRead, cacheCreationInputTokens: cacheCreation, totalCostUsd: cost };
+        }
+
+        return { type: 'result', sessionId: r.session_id ?? sessionId, durationMs: r.duration_ms, numTurns: r.num_turns, tokenUsage };
       }
       case 'system': return null;
       default: return null;
