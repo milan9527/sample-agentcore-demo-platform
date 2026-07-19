@@ -23,7 +23,7 @@ export AWS_PAGER=""
 #   --stack <name>          CloudFormation stack name (default: SuperAgent)
 #   --region <region>       AWS region (default: us-west-2)
 #   --domain <domain>       Custom domain for CloudFront (requires --hosted-zone-id)
-#   --hosted-zone-id <id>   Route53 hosted zone ID
+#   --hosted-zone-id <id>   Route53 hosted zone ID (requires --domain)
 #   --bedrock-ak <key>      Bedrock AWS Access Key (cross-account, optional)
 #   --bedrock-sk <secret>   Bedrock AWS Secret Key (cross-account, optional)
 #   --skip-cdk              Skip CDK deploy (reuse existing stack)
@@ -31,13 +31,17 @@ export AWS_PAGER=""
 #   --skip-frontend         Skip frontend build/sync
 #   --skip-backend          Skip backend build/deploy
 #
+# The frontend is always served via S3 + CloudFront. A custom domain is
+# OPTIONAL: omit --domain/--hosted-zone-id and CloudFront serves the app over
+# HTTPS on its default *.cloudfront.net domain (no ACM cert / Route53 needed).
+#
 # Examples:
+#   # Full deploy, no custom domain (CloudFront default domain):
+#   ./deploy-full-ecs.sh --stack SuperAgentDev1 --region us-east-1
+#
 #   # Full deploy with custom domain:
 #   ./deploy-full-ecs.sh --stack SuperAgent36 --region ap-northeast-1 \
 #     --domain app36.zhangwangshu.com --hosted-zone-id Z0941803Z9XESANM6GCQ
-#
-#   # Full deploy, IP-only (no custom domain):
-#   ./deploy-full-ecs.sh
 #
 #   # Redeploy code only (stack + AgentCore already exist):
 #   ./deploy-full-ecs.sh --skip-cdk
@@ -71,6 +75,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# A custom domain needs BOTH --domain and --hosted-zone-id (or neither, to use
+# the default CloudFront domain).
+if { [ -n "$DOMAIN_NAME" ] && [ -z "$HOSTED_ZONE_ID" ]; } || { [ -z "$DOMAIN_NAME" ] && [ -n "$HOSTED_ZONE_ID" ]; }; then
+  echo "ERROR: --domain and --hosted-zone-id must be provided together (or omit both to use the default CloudFront domain)."
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -78,11 +89,52 @@ BACKEND_ECR_REPO="super-agent-backend"
 BACKEND_ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$BACKEND_ECR_REPO"
 AGENTCORE_ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/super-agent-agentcore"
 
+# =========================================================================
+# Target image architecture — MUST be linux/arm64
+# =========================================================================
+# Both the ECS Fargate task (runtimePlatform=ARM64) and the AgentCore Runtime
+# run on ARM64, so every image we build/push has to be linux/arm64 regardless of
+# the build host. On an aarch64 host this is native; on x86_64 we build via QEMU
+# emulation and must register binfmt handlers first.
+TARGET_PLATFORM="linux/arm64"
+HOST_ARCH="$(uname -m)"
+echo "  Build host arch: $HOST_ARCH (target images: $TARGET_PLATFORM)"
+
+ensure_arm64_build() {
+  # Native aarch64 host — nothing to do.
+  case "$HOST_ARCH" in
+    aarch64|arm64) echo "  Native ARM64 host — building $TARGET_PLATFORM directly."; return 0 ;;
+  esac
+
+  # x86_64 (or other) host — need QEMU emulation + a buildx builder that can
+  # target linux/arm64.
+  echo "  Non-ARM host detected ($HOST_ARCH); enabling QEMU emulation for $TARGET_PLATFORM..."
+  if ! docker buildx ls 2>/dev/null | grep -q "linux/arm64"; then
+    echo "  Registering binfmt handlers (tonistiigi/binfmt)..."
+    docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 \
+      || echo "  WARNING: binfmt install failed (may need a newer Docker or --privileged)."
+  fi
+  # Ensure a docker-container builder exists (the default 'docker' driver cannot
+  # do cross-platform emulated builds).
+  if ! docker buildx inspect superagent-arm64 >/dev/null 2>&1; then
+    docker buildx create --name superagent-arm64 --driver docker-container --bootstrap >/dev/null 2>&1 \
+      || echo "  WARNING: could not create buildx builder 'superagent-arm64'."
+  fi
+  docker buildx use superagent-arm64 2>/dev/null || true
+  if ! docker buildx inspect --bootstrap 2>/dev/null | grep -q "linux/arm64"; then
+    echo "ERROR: this host cannot build $TARGET_PLATFORM images (no ARM64 buildx platform)."
+    echo "       Run the deploy on an ARM64 host, or install Docker buildx + QEMU (tonistiigi/binfmt)."
+    exit 1
+  fi
+  echo "  QEMU/buildx ready — cross-building $TARGET_PLATFORM on $HOST_ARCH."
+}
+
 echo "============================================="
 echo "  Super Agent Full Deploy (ECS)"
 echo "  Account:  $ACCOUNT_ID"
 echo "  Region:   $REGION"
 echo "  Stack:    $STACK_NAME"
+echo "  Arch:     $HOST_ARCH -> $TARGET_PLATFORM"
 [ -n "$DOMAIN_NAME" ] && echo "  Domain:   $DOMAIN_NAME"
 echo "============================================="
 
@@ -96,7 +148,37 @@ if [ "$SKIP_CDK" = false ]; then
 
   npm install
 
+  # --- Discover engine versions available in THIS region ---
+  # A pinned version (e.g. postgres 16.6) is not offered in every region, so we
+  # ask RDS/ElastiCache what they actually provide and pass it to CDK. We prefer
+  # the newest 16.x Postgres and newest 7.x Redis; fall back to the CDK defaults.
+  echo "  Discovering available RDS PostgreSQL 16.x versions in $REGION..."
+  DB_ENGINE_VERSION=$(aws rds describe-db-engine-versions \
+    --engine postgres --region "$REGION" \
+    --query "sort_by(DBEngineVersions[?starts_with(EngineVersion,'16.')],&EngineVersion)[-1].EngineVersion" \
+    --output text 2>/dev/null || echo "")
+  if [ -z "$DB_ENGINE_VERSION" ] || [ "$DB_ENGINE_VERSION" = "None" ]; then
+    echo "  WARNING: could not discover a Postgres 16.x version; letting CDK default apply."
+    DB_ENGINE_VERSION=""
+  else
+    echo "  Using RDS PostgreSQL version: $DB_ENGINE_VERSION"
+  fi
+
+  echo "  Discovering available ElastiCache Redis 7.x versions in $REGION..."
+  REDIS_ENGINE_VERSION=$(aws elasticache describe-cache-engine-versions \
+    --engine redis --region "$REGION" \
+    --query "sort_by(CacheEngineVersions[?starts_with(EngineVersion,'7.')],&EngineVersion)[-1].EngineVersion" \
+    --output text 2>/dev/null || echo "")
+  if [ -z "$REDIS_ENGINE_VERSION" ] || [ "$REDIS_ENGINE_VERSION" = "None" ]; then
+    echo "  WARNING: could not discover a Redis 7.x version; letting CDK default apply."
+    REDIS_ENGINE_VERSION=""
+  else
+    echo "  Using ElastiCache Redis version: $REDIS_ENGINE_VERSION"
+  fi
+
   CDK_ARGS="-c stackName=$STACK_NAME -c enableCdn=true -c deployTarget=ecs"
+  [ -n "$DB_ENGINE_VERSION" ]    && CDK_ARGS="$CDK_ARGS -c dbEngineVersion=$DB_ENGINE_VERSION"
+  [ -n "$REDIS_ENGINE_VERSION" ] && CDK_ARGS="$CDK_ARGS -c redisEngineVersion=$REDIS_ENGINE_VERSION"
 
   if [ -n "$DOMAIN_NAME" ] && [ -n "$HOSTED_ZONE_ID" ]; then
     CDK_ARGS="$CDK_ARGS -c domainName=$DOMAIN_NAME -c hostedZoneId=$HOSTED_ZONE_ID"
@@ -140,6 +222,7 @@ REDIS_ENDPOINT=$(get_output "RedisEndpoint")
 REDIS_PORT_OUTPUT=$(get_output "RedisPort")
 FRONTEND_BUCKET=$(get_output "FrontendBucketName")
 CF_DIST_ID=$(get_output "CloudFrontDistributionId")
+CF_DOMAIN=$(get_output "CloudFrontDomainName")
 COGNITO_USER_POOL_ID=$(get_output "CognitoUserPoolId")
 COGNITO_CLIENT_ID=$(get_output "CognitoClientId")
 COGNITO_DOMAIN=$(get_output "CognitoDomainUrl")
@@ -164,11 +247,22 @@ echo "  ECS Service:      $ECS_SERVICE_NAME"
 echo "  ALB DNS:          $ALB_DNS"
 [ -n "$DOMAIN_NAME" ] && echo "  DomainName:       $DOMAIN_NAME"
 [ -n "$CF_DIST_ID" ]  && echo "  CloudFrontDistId: $CF_DIST_ID"
+[ -n "$CF_DOMAIN" ]   && echo "  CloudFrontDomain: $CF_DOMAIN"
+
+# Public URL the app is reachable at: custom domain → CloudFront default domain
+# → ALB DNS (last-resort, only if the CDN somehow wasn't provisioned).
+if [ -n "$DOMAIN_NAME" ]; then
+  PUBLIC_URL="https://$DOMAIN_NAME"
+elif [ -n "$CF_DOMAIN" ]; then
+  PUBLIC_URL="https://$CF_DOMAIN"
+else
+  PUBLIC_URL="http://$ALB_DNS"
+fi
 
 # =========================================================================
 # Fix CloudFront ALB origin (replace placeholder with actual ALB DNS)
 # =========================================================================
-if [ -n "$DOMAIN_NAME" ] && [ -n "$CF_DIST_ID" ] && [ -n "$ALB_DNS" ]; then
+if [ -n "$CF_DIST_ID" ] && [ -n "$ALB_DNS" ]; then
   CURRENT_ORIGINS=$(aws cloudfront get-distribution-config --id "$CF_DIST_ID" \
     --query "DistributionConfig.Origins.Items[*].DomainName" --output text 2>/dev/null || echo "")
   if echo "$CURRENT_ORIGINS" | grep -q "ec2-placeholder\|alb-placeholder"; then
@@ -211,6 +305,9 @@ if [ "$SKIP_BACKEND" = false ]; then
   aws ecr get-login-password --region "$REGION" | \
     docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
+  # Ensure we can produce linux/arm64 images on this host (native or via QEMU).
+  ensure_arm64_build
+
   cd "$PROJECT_ROOT/backend"
 
   # Copy industry-packs into build context if available
@@ -221,12 +318,12 @@ if [ "$SKIP_BACKEND" = false ]; then
   fi
 
   IMAGE_TAG="$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD 2>/dev/null || echo 'latest')"
-  docker buildx build --platform linux/arm64 \
+  # --push builds the arm64 image and pushes it in one step (works with both the
+  # native 'docker' driver and the emulated docker-container builder on x86).
+  docker buildx build --platform "$TARGET_PLATFORM" \
     -t "$BACKEND_ECR_URI:latest" \
     -t "$BACKEND_ECR_URI:$IMAGE_TAG" \
-    --load .
-  docker push "$BACKEND_ECR_URI:latest"
-  docker push "$BACKEND_ECR_URI:$IMAGE_TAG"
+    --push .
   echo "  Image pushed: $BACKEND_ECR_URI:$IMAGE_TAG"
 
   # Cleanup build artifacts
@@ -325,10 +422,16 @@ PYEOF
     echo "  WARNING: Migration task exited with code $MIGRATE_EXIT (check logs: /super-agent/${STACK_NAME,,}/ecs-backend/migrate)"
   fi
 
-  # --- 2d-2: Seed database and set admin password ---
-  echo "  [2d-2] Seeding database..."
+  # --- 2d-2: Seed database (base data + local-auth admin) ---
+  echo "  [2d-2] Seeding database via ECS task..."
 
-  # Use python to safely build the JSON overrides (avoids shell quoting/newline issues)
+  # Runs the maintained, idempotent seed scripts inside the backend image:
+  #   prisma/seed.ts            -> org, scopes, agents, workflows, demo data
+  #   prisma/seed-local-auth.ts -> admin@example.com / admin123 (password_hash)
+  # Both are re-runnable, so a redeploy won't duplicate rows. tsx is a devDep and
+  # is NOT in the prod image, so we fetch it on demand with `npx --yes tsx`.
+  # The command exits non-zero if EITHER seed fails, so the task's exitCode
+  # reflects real failure (no silent "|| echo" masking).
   SEED_OVERRIDES_FILE="/tmp/ecs-seed-overrides.json"
   DATABASE_URL_FOR_SEED="$DATABASE_URL"
   export DATABASE_URL_FOR_SEED
@@ -337,17 +440,25 @@ import json, os
 
 db_url = os.environ.get("DATABASE_URL_FOR_SEED", "")
 
-cmd = """cat > prisma.config.ts << 'HEREDOC'
+cmd = r"""set -e
+cat > prisma.config.ts << 'HEREDOC'
 import { defineConfig } from "prisma/config";
 export default defineConfig({ schema: "prisma/schema.prisma", migrations: { path: "prisma/migrations" }, datasource: { url: process.env.DATABASE_URL } });
 HEREDOC
-npx tsx prisma/seed.ts 2>&1 || echo "(Seed skipped - may already exist)"
-echo 'const b=require("bcryptjs");const{Client}=require("pg");(async()=>{const h=await b.hash("Admin1234!",10);const c=new Client({connectionString:process.env.DATABASE_URL});await c.connect();const r=await c.query("UPDATE profiles SET password_hash=$1 WHERE username=$2",[h,"admin@example.com"]);console.log("Updated:",r.rowCount);await c.end()})()' > /app/setpw.cjs && node /app/setpw.cjs"""
+echo '--- running prisma/seed.ts (base data) ---'
+npx --yes tsx prisma/seed.ts
+echo '--- running prisma/seed-local-auth.ts (admin credentials) ---'
+npx --yes tsx prisma/seed-local-auth.ts
+echo 'SEED_OK'"""
 
+# The migrate task def's entryPoint is already ["sh","-c"], so the command
+# override must be the SINGLE script string. Passing ["sh","-c",cmd] here would
+# expand to `sh -c sh -c <cmd>` — the real command becomes an ignored positional
+# arg and the seed silently no-ops (exit 0, empty logs). Pass just [cmd].
 overrides = {
     "containerOverrides": [{
         "name": "migrate",
-        "command": ["sh", "-c", cmd],
+        "command": [cmd],
         "environment": [{"name": "DATABASE_URL", "value": db_url}]
     }]
 }
@@ -355,7 +466,7 @@ with open("/tmp/ecs-seed-overrides.json", "w") as f:
     json.dump(overrides, f)
 PYEOF
 
-  SEED_TASK_ID=$(aws ecs run-task \
+  SEED_TASK_ARN=$(aws ecs run-task \
     --cluster "$ECS_CLUSTER_NAME" \
     --task-definition "$MIGRATE_TASK_ARN" \
     --launch-type FARGATE \
@@ -364,21 +475,26 @@ PYEOF
     --region "$REGION" \
     --query "tasks[0].taskArn" --output text)
   rm -f "$SEED_OVERRIDES_FILE"
-  echo "  Seed task started: $SEED_TASK_ID"
-  aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER_NAME" --tasks "$SEED_TASK_ID" --region "$REGION" 2>/dev/null || true
-  echo "  Seed complete. Admin login: admin@example.com / Admin1234!"
+  echo "  Seed task started: $SEED_TASK_ARN"
+  aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER_NAME" --tasks "$SEED_TASK_ARN" --region "$REGION" 2>/dev/null || true
+
+  # Check the seed task's real exit code — do NOT claim success blindly.
+  SEED_EXIT=$(aws ecs describe-tasks \
+    --cluster "$ECS_CLUSTER_NAME" --tasks "$SEED_TASK_ARN" --region "$REGION" \
+    --query "tasks[0].containers[0].exitCode" --output text 2>/dev/null || echo "unknown")
+  if [ "$SEED_EXIT" = "0" ]; then
+    echo "  Seed complete. Admin login: admin@example.com / admin123"
+  else
+    echo "  WARNING: Seed task exited with code $SEED_EXIT — the app may have no admin user."
+    echo "           Check logs: aws logs tail /super-agent/${STACK_NAME,,}/ecs-backend --region $REGION (stream prefix 'migrate')"
+  fi
 
   # --- 2e: Determine environment variables for ECS task ---
   echo "  [2e] Configuring ECS task environment..."
 
-  # Determine CORS and APP_URL
-  if [ -n "$DOMAIN_NAME" ]; then
-    APP_URL="https://$DOMAIN_NAME"
-    CORS_VALUE="https://$DOMAIN_NAME"
-  else
-    APP_URL="http://$ALB_DNS"
-    CORS_VALUE="http://$ALB_DNS"
-  fi
+  # Determine CORS and APP_URL — served via CloudFront (custom or default domain).
+  APP_URL="$PUBLIC_URL"
+  CORS_VALUE="$PUBLIC_URL"
 
   JWT_SECRET=$(openssl rand -hex 32)
 
@@ -549,12 +665,8 @@ if [ "$SKIP_FRONTEND" = false ]; then
   echo ""
   echo "=== Phase 3: Build & Deploy Frontend ==="
 
-  # Determine APP_URL for frontend build
-  if [ -n "$DOMAIN_NAME" ]; then
-    APP_URL="https://$DOMAIN_NAME"
-  else
-    APP_URL="http://$ALB_DNS"
-  fi
+  # APP_URL for frontend build — the CloudFront (custom or default) URL.
+  APP_URL="$PUBLIC_URL"
 
   cd "$PROJECT_ROOT/frontend"
 
@@ -705,17 +817,51 @@ if [ "$SKIP_AGENTCORE" = false ]; then
     }"
 
   # --- 4c: Build + Push AgentCore Docker Image ---
+  # The AgentCore Runtime requires linux/arm64 — build accordingly on any host.
   echo "  [4c] Building and pushing AgentCore container..."
   aws ecr get-login-password --region "$REGION" | \
     docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
+  ensure_arm64_build
+
   cd "$PROJECT_ROOT/agentcore"
-  docker buildx build --platform linux/arm64 \
-    -t "super-agent-agentcore:latest" \
+  docker buildx build --platform "$TARGET_PLATFORM" \
     -t "$AGENTCORE_ECR_URI:latest" \
-    --load .
-  docker push "$AGENTCORE_ECR_URI:latest"
-  echo "  Image pushed: $AGENTCORE_ECR_URI:latest"
+    --push .
+  echo "  Image pushed: $AGENTCORE_ECR_URI:latest ($TARGET_PLATFORM)"
+
+  # Verify the pushed image is actually arm64 — AgentCore Runtime only accepts
+  # ARM64 images, so a wrong-arch push would fail at runtime create/invoke.
+  # A `buildx --platform linux/arm64 --push` yields a single manifest, so read
+  # the image config blob's `architecture` (the authoritative value).
+  AC_MANIFEST=$(aws ecr batch-get-image --repository-name super-agent-agentcore \
+    --image-ids imageTag=latest --region "$REGION" \
+    --query 'images[0].imageManifest' --output text 2>/dev/null || echo "")
+  PUSHED_ARCH="unknown"
+  if [ -n "$AC_MANIFEST" ]; then
+    AC_MULTI=$(echo "$AC_MANIFEST" | python3 -c "import sys,json;
+m=json.load(sys.stdin)
+print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('manifests',[])]))" 2>/dev/null || echo "")
+    if echo "$AC_MULTI" | grep -q "arm64"; then
+      PUSHED_ARCH="arm64"
+    else
+      # Single manifest → fetch the config blob and read its architecture.
+      AC_CFG_DIGEST=$(echo "$AC_MANIFEST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('config',{}).get('digest',''))" 2>/dev/null || echo "")
+      if [ -n "$AC_CFG_DIGEST" ]; then
+        AC_CFG_URL=$(aws ecr get-download-url-for-layer --repository-name super-agent-agentcore \
+          --layer-digest "$AC_CFG_DIGEST" --region "$REGION" --query 'downloadUrl' --output text 2>/dev/null || echo "")
+        [ -n "$AC_CFG_URL" ] && PUSHED_ARCH=$(curl -s "$AC_CFG_URL" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('architecture','unknown'))" 2>/dev/null || echo "unknown")
+      fi
+    fi
+  fi
+  if [ "$PUSHED_ARCH" = "arm64" ]; then
+    echo "  Verified AgentCore image architecture: arm64"
+  elif [ "$PUSHED_ARCH" = "unknown" ]; then
+    echo "  NOTE: could not read image architecture; built with --platform $TARGET_PLATFORM so it should be arm64."
+  else
+    echo "  WARNING: pushed AgentCore image architecture is '$PUSHED_ARCH', expected arm64. AgentCore Runtime may reject it."
+    exit 1
+  fi
 
   # --- 4c-2: Create AgentCore Browser with web bot auth ---
   echo "  [4c-2] Ensuring AgentCore Browser (web bot auth enabled)..."
@@ -727,19 +873,29 @@ if [ "$SKIP_AGENTCORE" = false ]; then
 
   if [ -z "$BROWSER_ID" ] || [ "$BROWSER_ID" = "None" ]; then
     echo "  Creating new browser: $BROWSER_NAME"
-    BROWSER_OUTPUT=$(aws bedrock-agentcore-control create-browser \
-      --name "$BROWSER_NAME" \
-      --execution-role-arn "$ROLE_ARN" \
-      --network-configuration '{"networkMode":"PUBLIC"}' \
-      --browser-signing '{"enabled":true}' \
-      --description "Browser with web bot auth for $STACK_NAME" \
-      --region "$REGION" --output json 2>&1)
-    BROWSER_ID=$(echo "$BROWSER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['browserId'])" 2>/dev/null || echo "")
-    if [ -n "$BROWSER_ID" ] && [ "$BROWSER_ID" != "None" ]; then
-      echo "  Browser created: $BROWSER_ID"
-    else
-      echo "  WARNING: Failed to create browser. Output: $BROWSER_OUTPUT"
+    # Retry: the execution role was just created in step 4b and IAM is eventually
+    # consistent — create-browser can transiently fail to assume it. The `|| true`
+    # keeps `set -e` from aborting the whole deploy on a retryable failure.
+    for attempt in 1 2 3 4 5; do
+      BROWSER_OUTPUT=$(aws bedrock-agentcore-control create-browser \
+        --name "$BROWSER_NAME" \
+        --execution-role-arn "$ROLE_ARN" \
+        --network-configuration '{"networkMode":"PUBLIC"}' \
+        --browser-signing '{"enabled":true}' \
+        --description "Browser with web bot auth for $STACK_NAME" \
+        --region "$REGION" --output json 2>&1) || true
+      BROWSER_ID=$(echo "$BROWSER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['browserId'])" 2>/dev/null || echo "")
+      if [ -n "$BROWSER_ID" ] && [ "$BROWSER_ID" != "None" ]; then
+        echo "  Browser created: $BROWSER_ID"
+        break
+      fi
+      echo "  Attempt $attempt/5 to create browser failed (IAM may still be propagating), retrying in 10s..."
+      echo "    detail: $(echo "$BROWSER_OUTPUT" | head -c 200)"
       BROWSER_ID=""
+      sleep 10
+    done
+    if [ -z "$BROWSER_ID" ]; then
+      echo "  WARNING: Could not create browser after retries; continuing without it. Last output: $BROWSER_OUTPUT"
     fi
   else
     echo "  Browser already exists: $BROWSER_ID"
@@ -883,13 +1039,11 @@ echo ""
 echo "============================================="
 echo "  Full Deployment Complete! (ECS)"
 echo "============================================="
-if [ -n "$DOMAIN_NAME" ]; then
-  echo "  App URL:    https://$DOMAIN_NAME"
-else
-  echo "  App URL:    http://$ALB_DNS"
-fi
+echo "  App URL:    $PUBLIC_URL"
+[ -z "$DOMAIN_NAME" ] && [ -n "$CF_DOMAIN" ] && echo "              (CloudFront default domain — no custom domain configured)"
 echo "  ALB:        $ALB_DNS"
 echo "  ECS:        $ECS_CLUSTER_NAME / $ECS_SERVICE_NAME"
 [ "$SKIP_AGENTCORE" = false ] && echo "  AgentCore:  $RUNTIME_ARN"
+[ "$SKIP_BACKEND" = false ] && [ "${AUTH_MODE:-local}" = "local" ] && echo "  Login:      admin@example.com / admin123"
 echo "  Logs:       aws logs tail /super-agent/${STACK_NAME,,}/ecs-backend --region $REGION --follow"
 echo "============================================="

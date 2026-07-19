@@ -49,40 +49,35 @@ aws sts get-caller-identity
 ## ECS 一键部署（推荐）
 
 ECS 模式使用 Fargate 运行后端容器，无需管理 EC2 实例、SSH Key 或 Nginx。
+前端始终通过 S3 + CloudFront 提供服务，**无需自定义域名**——CloudFront 会分配一个默认的 `https://xxxx.cloudfront.net` 域名（自动 HTTPS，无需 ACM 证书或 Route53）。
 
-### 带自定义域名（CloudFront CDN）
-
-需要 Route53 托管的域名。查找 hosted zone ID：
+### 用法
 
 ```bash
-aws route53 list-hosted-zones --query "HostedZones[].{Name:Name,Id:Id}" --output table
+./infra/scripts/deploy-full-ecs.sh --stack <名称> --region <区域>
 ```
 
-执行部署：
+只需指定 stack 名称和区域即可，其余全部自动完成（引擎版本、镜像架构、数据库迁移与 seed 都由脚本处理）。
+
+### 示例
 
 ```bash
 cd /path/to/super-agent
 
-./infra/scripts/deploy-full-ecs.sh \
-  --stack SuperAgentProd \
-  --region ap-northeast-1 \
-  --domain app.example.com \
-  --hosted-zone-id Z01234567890ABC
+# 基础用法：全新部署到 us-east-1
+./infra/scripts/deploy-full-ecs.sh --stack SuperAgentDev1 --region us-east-1
+
+# 换个区域 / 用另一个 stack 名（不同 stack 资源完全隔离）
+./infra/scripts/deploy-full-ecs.sh --stack SuperAgentProd --region us-west-2
 ```
 
-### 无域名部署（ALB 直连）
-
-```bash
-./infra/scripts/deploy-full-ecs.sh --stack SuperAgentDev --region us-west-2
-```
+部署完成后，脚本会打印访问地址（CloudFront 默认域名），用 `admin@example.com` / `admin123` 登录。
 
 ### 可选参数
 
 ```bash
 --stack <name>          # Stack 名称（默认 SuperAgent），不同 stack 完全隔离
 --region <region>       # AWS Region（默认 us-west-2）
---domain <domain>       # 自定义域名（需配合 --hosted-zone-id）
---hosted-zone-id <id>   # Route53 Hosted Zone ID
 --bedrock-ak <key>      # 跨账号 Bedrock 凭证（可选）
 --bedrock-sk <secret>   # 跨账号 Bedrock 凭证（可选）
 --skip-cdk              # 跳过基础设施（已有 stack 时用）
@@ -94,38 +89,43 @@ cd /path/to/super-agent
 ### ECS 部署流程（4 个阶段）
 
 **Phase 1: CDK Deploy**
+- 脚本自动探测当前区域可用的引擎版本（RDS PostgreSQL 16.x、ElastiCache Redis 7.x），避免硬编码版本在某些区域不可用
 - 创建 VPC Security Groups、ECS Cluster、ALB
-- RDS PostgreSQL 16.6、ElastiCache Redis 7.1
+- RDS PostgreSQL、ElastiCache Redis
 - S3 桶（Avatar、Skills、Workspace、Frontend）
-- CloudFront + ACM 证书 + Route53 ALIAS
-- IAM Roles（ECS Task Execution + Task Role）
+- CloudFront（默认 `*.cloudfront.net` 域名，无需 ACM/Route53）
+- IAM Roles（ECS Task Execution + Task Role，含 Bedrock 调用与模型列举权限）
 - ECS Service（初始 desiredCount=0，等待真实镜像）
 
 **Phase 2: Backend Deploy**
 - 构建后端 Docker 镜像（ARM64）→ 推送到 ECR
 - 从 SecretsManager 获取 RDS 凭证
-- 通过 ECS run-task 执行 Prisma 迁移 + 数据库 seed
+- 通过 ECS run-task 执行 Prisma 迁移 + 数据库 seed（幂等，可重复执行）
 - 注册 ECS Task Definition（含所有环境变量）
 - 更新 ECS Service → 等待服务稳定
-- 首次部署自动创建 admin 用户：`admin@example.com` / `Admin1234!`
+- 首次部署自动创建 admin 用户：`admin@example.com` / `admin123`
 
 **Phase 3: Frontend Deploy**
 - 构建前端（Vite）→ S3 sync + CloudFront 失效
 
 **Phase 4: AgentCore Setup**
-- 创建 ECR 仓库，构建推送 AgentCore ARM64 Docker 镜像
+- 创建 ECR 仓库，构建推送 AgentCore ARM64 Docker 镜像（脚本会校验推送镜像确为 arm64，AgentCore Runtime 仅支持 ARM64）
 - 创建 IAM Execution Role（Bedrock、S3、ECR、Browser、Code Interpreter 权限）
 - 创建 Bedrock AgentCore Runtime（使用 global inference profile）
 - 更新 ECS Task Definition 启用 AgentCore 模式
 
+> 在 x86 主机上部署时，脚本会自动配置 QEMU（`tonistiigi/binfmt`）以交叉构建 ARM64 镜像；在 ARM 主机（如 Apple Silicon、Graviton）上则原生构建。
+
 ### ECS 部署完成后
 
-访问 `https://app.example.com`（或 ALB DNS），使用 `admin@example.com` / `Admin1234!` 登录。
+部署结束时脚本会打印 App URL（形如 `https://xxxx.cloudfront.net`），使用 `admin@example.com` / `admin123` 登录。
 
-查看后端日志：
+> CloudFront 首次分发全球生效约需 5-15 分钟。
+
+查看后端日志（日志组名含 stack 名，小写）：
 
 ```bash
-aws logs tail /super-agent/ecs-backend --region <region> --follow
+aws logs tail /super-agent/<stack名小写>/ecs-backend --region <region> --follow
 ```
 
 > **重要**：首次登录后请立即修改 admin 密码。
@@ -284,8 +284,8 @@ sudo bash /path/to/infra/scripts/setup-litellm.sh
 **ECS 模式：**
 
 ```bash
-# CloudWatch Logs（推荐）
-aws logs tail /super-agent/ecs-backend --region <region> --follow
+# CloudWatch Logs（推荐；日志组名含 stack 名，小写）
+aws logs tail /super-agent/<stack名小写>/ecs-backend --region <region> --follow
 
 # 或通过 ECS Exec 进入容器
 TASK_ARN=$(aws ecs list-tasks --cluster <cluster-name> --service-name <service-name> --region <region> --query "taskArns[0]" --output text)
@@ -408,8 +408,10 @@ aws iam delete-role --role-name super-agent-agentcore-role-<StackName>
 
 ## 已知注意事项
 
-- **Bedrock 模型 ID**：必须使用 `global.anthropic.*` inference profile（如 `global.anthropic.claude-sonnet-4-6`），不要使用 `us.anthropic.*`（仅 US 区域）或裸 Anthropic API 名称
-- **ECS 模式 — Prisma 迁移**：由于 RDS 不可公网访问，迁移通过 ECS run-task 在 VPC 内执行；`prisma.config.ts` 中的 `dotenv/config` 在生产镜像中不可用，部署脚本会自动重写配置
+- **Bedrock 模型 ID**：必须使用 `global.anthropic.*` inference profile（如 `global.anthropic.claude-opus-4-8`），不要使用 `us.anthropic.*`（仅 US 区域）或裸 Anthropic API 名称。ECS 默认模型来源为 Amazon Bedrock + `global.anthropic.claude-opus-4-8`
+- **引擎版本自动探测**：RDS PostgreSQL / ElastiCache Redis 版本不硬编码，脚本部署前查询当前区域实际可用的版本再传给 CDK（避免"某版本在该区域不可用"导致创建失败）
+- **无自定义域名**：默认使用 CloudFront 分配的 `*.cloudfront.net` 域名，无需 ACM 证书或 Route53；CloudFront 首次全球生效约 5-15 分钟
+- **ECS 模式 — Prisma 迁移 + seed**：由于 RDS 不可公网访问，迁移与 seed 通过 ECS run-task 在 VPC 内执行；seed 幂等，重复部署不会重复插入；`prisma.config.ts` 中的 `dotenv/config` 在生产镜像中不可用，部署脚本会自动重写配置
 - **ECS 模式 — 初始 desiredCount=0**：CDK 创建 ECS Service 时使用占位镜像，desiredCount 设为 0 避免健康检查失败；部署脚本推送真实镜像后设为 1
 - **EC2 UserData 耗时**：首次创建 EC2 约需 3-5 分钟完成 bootstrap，`deploy-full.sh` 会自动等待
 - **CloudFront Origin**：ECS 模式直接使用 ALB DNS 作为 origin（无占位符）；EC2 模式使用占位符，`deploy-full.sh` 会自动替换

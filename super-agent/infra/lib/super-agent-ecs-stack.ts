@@ -44,8 +44,12 @@ export class SuperAgentEcsStack extends cdk.Stack {
     const hostedZoneId = this.node.tryGetContext('hostedZoneId') as string | undefined;
     const authMode = (this.node.tryGetContext('authMode') as string) || 'local';
 
-    if (enableCdn && (!domainName || !hostedZoneId)) {
-      throw new Error('enableCdn=true requires domainName and hostedZoneId context values');
+    // A custom domain requires both a domainName and a Route53 hostedZoneId.
+    // Without them, CloudFront still deploys and serves on its default
+    // *.cloudfront.net domain (no ACM certificate / Route53 record needed).
+    const useCustomDomain = !!domainName && !!hostedZoneId;
+    if ((domainName && !hostedZoneId) || (!domainName && hostedZoneId)) {
+      throw new Error('A custom domain requires BOTH domainName and hostedZoneId (or neither, to use the default CloudFront domain)');
     }
 
     // =========================================================================
@@ -116,9 +120,16 @@ export class SuperAgentEcsStack extends cdk.Stack {
     // =========================================================================
     // RDS PostgreSQL
     // =========================================================================
+    // Engine versions are resolved at deploy time from what RDS/ElastiCache
+    // actually offer in the target region (the deploy script discovers them and
+    // passes them via context). A specific version isn't available in every
+    // region, so we never hardcode one. Fallbacks are used for bare `cdk deploy`.
+    const dbEngineVersion = (this.node.tryGetContext('dbEngineVersion') as string) || '16.9';
+    const redisEngineVersion = (this.node.tryGetContext('redisEngineVersion') as string) || '7.1';
+
     const dbInstance = new rds.DatabaseInstance(this, 'SuperAgentDB', {
       engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_6,
+        version: rds.PostgresEngineVersion.of(dbEngineVersion, dbEngineVersion.split('.')[0]!),
       }),
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
       vpc,
@@ -154,7 +165,7 @@ export class SuperAgentEcsStack extends cdk.Stack {
       clusterName: `${id}-redis`.toLowerCase(),
       vpcSecurityGroupIds: [redisSg.securityGroupId],
       cacheSubnetGroupName: redisSubnetGroup.cacheSubnetGroupName,
-      engineVersion: '7.1',
+      engineVersion: redisEngineVersion,
       port: 6379,
     });
     redisCluster.addDependency(redisSubnetGroup);
@@ -209,9 +220,16 @@ export class SuperAgentEcsStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
 
-    // Bedrock model invocation
+    // Bedrock model invocation + discovery. ListInferenceProfiles/
+    // ListFoundationModels back the Settings → Models "add Bedrock provider"
+    // picker; without them the model list silently comes back empty.
     taskRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+      actions: [
+        'bedrock:InvokeModel',
+        'bedrock:InvokeModelWithResponseStream',
+        'bedrock:ListInferenceProfiles',
+        'bedrock:ListFoundationModels',
+      ],
       resources: ['*'],
     }));
 
@@ -420,17 +438,23 @@ export class SuperAgentEcsStack extends cdk.Stack {
       });
       frontendBucket.grantReadWrite(taskRole);
 
-      // ACM certificate (must be us-east-1 for CloudFront)
-      const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
-        hostedZoneId: hostedZoneId!,
-        zoneName: domainName!.split('.').slice(1).join('.'),
-      });
+      // Custom domain (optional): ACM certificate + Route53 hosted zone.
+      // When no custom domain is provided, CloudFront serves on its default
+      // *.cloudfront.net domain and neither ACM nor Route53 is used.
+      let hostedZone: route53.IHostedZone | undefined;
+      let certificate: acm.ICertificate | undefined;
+      if (useCustomDomain) {
+        hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
+          hostedZoneId: hostedZoneId!,
+          zoneName: domainName!.split('.').slice(1).join('.'),
+        });
 
-      const certificate = new acm.DnsValidatedCertificate(this, 'Certificate', {
-        domainName: domainName!,
-        hostedZone,
-        region: 'us-east-1', // CloudFront requires us-east-1
-      });
+        certificate = new acm.DnsValidatedCertificate(this, 'Certificate', {
+          domainName: domainName!,
+          hostedZone,
+          region: 'us-east-1', // CloudFront requires us-east-1
+        });
+      }
 
       // OAC for S3
       new cloudfront.CfnOriginAccessControl(this, 'OAC', {
@@ -455,8 +479,9 @@ export class SuperAgentEcsStack extends cdk.Stack {
           viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
           cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         },
-        domainNames: [domainName!],
-        certificate,
+        // Only bind a custom domain + ACM cert when one was provided; otherwise
+        // CloudFront uses its default *.cloudfront.net domain and cert.
+        ...(useCustomDomain ? { domainNames: [domainName!], certificate } : {}),
         defaultRootObject: 'index.html',
         errorResponses: [
           { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html', ttl: cdk.Duration.seconds(0) },
@@ -480,12 +505,14 @@ export class SuperAgentEcsStack extends cdk.Stack {
         allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
       });
 
-      // Route53 ALIAS → CloudFront
-      new route53.ARecord(this, 'DnsAlias', {
-        zone: hostedZone,
-        recordName: domainName!,
-        target: route53.RecordTarget.fromAlias(new route53targets.CloudFrontTarget(distribution)),
-      });
+      // Route53 ALIAS → CloudFront (only for a custom domain)
+      if (useCustomDomain) {
+        new route53.ARecord(this, 'DnsAlias', {
+          zone: hostedZone!,
+          recordName: domainName!,
+          target: route53.RecordTarget.fromAlias(new route53targets.CloudFrontTarget(distribution)),
+        });
+      }
     }
 
     // =========================================================================

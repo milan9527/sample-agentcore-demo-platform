@@ -71,6 +71,25 @@ async function main() {
   const userId = profile.id;
   console.log(`Using user: ${profile.full_name} (${userId})`);
 
+  // Default model provider — Amazon Bedrock (Claude Opus 4.8). Every org needs
+  // an org-default provider so model resolution, the chat picker, and
+  // Settings → Models work out of the box. Idempotent on (org, name).
+  console.log('Creating default model provider...');
+  await prisma.model_providers.upsert({
+    where: { unique_provider_name_per_org: { organization_id: orgId, name: 'Amazon Bedrock' } },
+    update: { default_model_id: 'global.anthropic.claude-opus-4-8', is_org_default: true, status: 'active' },
+    create: {
+      organization_id: orgId,
+      name: 'Amazon Bedrock',
+      type: 'bedrock',
+      default_model_id: 'global.anthropic.claude-opus-4-8',
+      is_org_default: true,
+      status: 'active',
+      created_by: userId,
+    },
+  });
+  console.log('Default model provider ready: Amazon Bedrock -> global.anthropic.claude-opus-4-8');
+
   // Create Business Scopes
   console.log('Creating business scopes...');
   const scopes = await Promise.all([
@@ -139,147 +158,143 @@ async function main() {
   const [hrScope, itScope, marketingScope, salesScope, supportScope] = scopes;
   console.log(`Created ${scopes.length} business scopes`);
 
-  // Create Agents
+  // Create Agents — idempotent via upsert on (org, scope, name).
   console.log('Creating agents...');
-  const agents = await Promise.all([
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: hrScope.id,
-        name: 'hr-assistant',
-        display_name: 'HR Assistant',
-        role: 'Recruitment Specialist',
-        avatar: 'H',
-        status: 'active',
-        metrics: { taskCount: 156, responseRate: 98, avgResponseTime: '1.2s' },
-        tools: [
-          { id: 'tool-1', name: 'Resume Parser', description: 'Extracts information from resumes' },
-          { id: 'tool-2', name: 'Calendar Integration', description: 'Schedules interviews' },
-        ],
-        scope: ['Recruitment', 'Onboarding', 'Employee Records'],
-        system_prompt: 'You are an HR assistant specialized in recruitment and onboarding processes.',
-        model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
-      },
-    }),
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: hrScope.id,
-        name: 'onboarding-bot',
-        display_name: 'Onboarding Bot',
-        role: 'Employee Onboarding',
-        avatar: 'O',
-        status: 'busy',
-        metrics: { taskCount: 89, responseRate: 95, avgResponseTime: '2.1s' },
-        tools: [
-          { id: 'tool-3', name: 'Document Generator', description: 'Creates onboarding documents' },
-        ],
-        scope: ['Onboarding', 'Training', 'Policy Distribution'],
-        system_prompt: 'You are an onboarding specialist helping new employees get started.',
-        model_config: { provider: 'OpenAI', modelId: 'gpt-4', agentType: 'Worker' },
-      },
-    }),
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: itScope.id,
-        name: 'it-support',
-        display_name: 'IT Support Agent',
-        role: 'Technical Support',
-        avatar: 'I',
-        status: 'active',
-        metrics: { taskCount: 234, responseRate: 99, avgResponseTime: '0.8s' },
-        tools: [
-          { id: 'tool-4', name: 'Ticket System', description: 'Manages support tickets' },
-          { id: 'tool-5', name: 'Remote Access', description: 'Provides remote assistance' },
-        ],
-        scope: ['Troubleshooting', 'System Access', 'Password Reset'],
-        system_prompt: 'You are an IT support agent helping users with technical issues.',
-        model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
-      },
-    }),
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: itScope.id,
-        name: 'devops-bot',
-        display_name: 'DevOps Bot',
-        role: 'Deployment Automation',
-        avatar: 'D',
-        status: 'idle',
-        metrics: { taskCount: 78, responseRate: 100, avgResponseTime: '1.5s' },
-        tools: [
-          { id: 'tool-6', name: 'CI/CD Pipeline', description: 'Manages deployment pipelines' },
-          { id: 'tool-7', name: 'Infrastructure Manager', description: 'Provisions cloud resources' },
-        ],
-        scope: ['CI/CD', 'Infrastructure', 'Monitoring'],
-        system_prompt: 'You are a DevOps automation bot managing deployments and infrastructure.',
-        model_config: { provider: 'Azure', modelId: 'gpt-4', agentType: 'Orchestrator' },
-      },
-    }),
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: marketingScope.id,
-        name: 'marketing-assistant',
-        display_name: 'Marketing Assistant',
-        role: 'Content Creator',
-        avatar: 'M',
-        status: 'active',
-        metrics: { taskCount: 112, responseRate: 96, avgResponseTime: '2.3s' },
-        tools: [
-          { id: 'tool-8', name: 'Content Generator', description: 'Creates marketing content' },
-          { id: 'tool-9', name: 'Social Media Manager', description: 'Schedules social posts' },
-        ],
-        scope: ['Content', 'Social Media', 'Campaign Management'],
-        system_prompt: 'You are a marketing assistant helping create and manage content.',
-        model_config: { provider: 'OpenAI', modelId: 'gpt-4', agentType: 'Worker' },
-      },
-    }),
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: salesScope.id,
-        name: 'sales-bot',
-        display_name: 'Sales Bot',
-        role: 'Lead Qualification',
-        avatar: 'S',
-        status: 'offline',
-        metrics: { taskCount: 45, responseRate: 92, avgResponseTime: '1.8s' },
-        tools: [
-          { id: 'tool-10', name: 'CRM Integration', description: 'Manages customer data' },
-          { id: 'tool-11', name: 'Lead Scorer', description: 'Qualifies leads automatically' },
-        ],
-        scope: ['Lead Gen', 'CRM', 'Sales Pipeline'],
-        system_prompt: 'You are a sales bot helping qualify leads and manage the sales pipeline.',
-        model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
-      },
-    }),
-    prisma.agents.create({
-      data: {
-        organization_id: orgId,
-        business_scope_id: supportScope.id,
-        name: 'support-agent',
-        display_name: 'Support Agent',
-        role: 'Customer Support',
-        avatar: 'C',
-        status: 'active',
-        metrics: { taskCount: 567, responseRate: 97, avgResponseTime: '0.9s' },
-        tools: [
-          { id: 'tool-12', name: 'Knowledge Base', description: 'Searches support articles' },
-          { id: 'tool-13', name: 'Ticket Manager', description: 'Handles support tickets' },
-        ],
-        scope: ['Tickets', 'FAQ', 'Customer Communication'],
-        system_prompt: 'You are a customer support agent helping resolve customer issues.',
-        model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
-      },
-    }),
-  ]);
+  const agentSeeds = [
+    {
+      business_scope_id: hrScope.id,
+      name: 'hr-assistant',
+      display_name: 'HR Assistant',
+      role: 'Recruitment Specialist',
+      avatar: 'H',
+      status: 'active',
+      metrics: { taskCount: 156, responseRate: 98, avgResponseTime: '1.2s' },
+      tools: [
+        { id: 'tool-1', name: 'Resume Parser', description: 'Extracts information from resumes' },
+        { id: 'tool-2', name: 'Calendar Integration', description: 'Schedules interviews' },
+      ],
+      scope: ['Recruitment', 'Onboarding', 'Employee Records'],
+      system_prompt: 'You are an HR assistant specialized in recruitment and onboarding processes.',
+      model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
+    },
+    {
+      business_scope_id: hrScope.id,
+      name: 'onboarding-bot',
+      display_name: 'Onboarding Bot',
+      role: 'Employee Onboarding',
+      avatar: 'O',
+      status: 'busy',
+      metrics: { taskCount: 89, responseRate: 95, avgResponseTime: '2.1s' },
+      tools: [
+        { id: 'tool-3', name: 'Document Generator', description: 'Creates onboarding documents' },
+      ],
+      scope: ['Onboarding', 'Training', 'Policy Distribution'],
+      system_prompt: 'You are an onboarding specialist helping new employees get started.',
+      model_config: { provider: 'OpenAI', modelId: 'gpt-4', agentType: 'Worker' },
+    },
+    {
+      business_scope_id: itScope.id,
+      name: 'it-support',
+      display_name: 'IT Support Agent',
+      role: 'Technical Support',
+      avatar: 'I',
+      status: 'active',
+      metrics: { taskCount: 234, responseRate: 99, avgResponseTime: '0.8s' },
+      tools: [
+        { id: 'tool-4', name: 'Ticket System', description: 'Manages support tickets' },
+        { id: 'tool-5', name: 'Remote Access', description: 'Provides remote assistance' },
+      ],
+      scope: ['Troubleshooting', 'System Access', 'Password Reset'],
+      system_prompt: 'You are an IT support agent helping users with technical issues.',
+      model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
+    },
+    {
+      business_scope_id: itScope.id,
+      name: 'devops-bot',
+      display_name: 'DevOps Bot',
+      role: 'Deployment Automation',
+      avatar: 'D',
+      status: 'idle',
+      metrics: { taskCount: 78, responseRate: 100, avgResponseTime: '1.5s' },
+      tools: [
+        { id: 'tool-6', name: 'CI/CD Pipeline', description: 'Manages deployment pipelines' },
+        { id: 'tool-7', name: 'Infrastructure Manager', description: 'Provisions cloud resources' },
+      ],
+      scope: ['CI/CD', 'Infrastructure', 'Monitoring'],
+      system_prompt: 'You are a DevOps automation bot managing deployments and infrastructure.',
+      model_config: { provider: 'Azure', modelId: 'gpt-4', agentType: 'Orchestrator' },
+    },
+    {
+      business_scope_id: marketingScope.id,
+      name: 'marketing-assistant',
+      display_name: 'Marketing Assistant',
+      role: 'Content Creator',
+      avatar: 'M',
+      status: 'active',
+      metrics: { taskCount: 112, responseRate: 96, avgResponseTime: '2.3s' },
+      tools: [
+        { id: 'tool-8', name: 'Content Generator', description: 'Creates marketing content' },
+        { id: 'tool-9', name: 'Social Media Manager', description: 'Schedules social posts' },
+      ],
+      scope: ['Content', 'Social Media', 'Campaign Management'],
+      system_prompt: 'You are a marketing assistant helping create and manage content.',
+      model_config: { provider: 'OpenAI', modelId: 'gpt-4', agentType: 'Worker' },
+    },
+    {
+      business_scope_id: salesScope.id,
+      name: 'sales-bot',
+      display_name: 'Sales Bot',
+      role: 'Lead Qualification',
+      avatar: 'S',
+      status: 'offline',
+      metrics: { taskCount: 45, responseRate: 92, avgResponseTime: '1.8s' },
+      tools: [
+        { id: 'tool-10', name: 'CRM Integration', description: 'Manages customer data' },
+        { id: 'tool-11', name: 'Lead Scorer', description: 'Qualifies leads automatically' },
+      ],
+      scope: ['Lead Gen', 'CRM', 'Sales Pipeline'],
+      system_prompt: 'You are a sales bot helping qualify leads and manage the sales pipeline.',
+      model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
+    },
+    {
+      business_scope_id: supportScope.id,
+      name: 'support-agent',
+      display_name: 'Support Agent',
+      role: 'Customer Support',
+      avatar: 'C',
+      status: 'active',
+      metrics: { taskCount: 567, responseRate: 97, avgResponseTime: '0.9s' },
+      tools: [
+        { id: 'tool-12', name: 'Knowledge Base', description: 'Searches support articles' },
+        { id: 'tool-13', name: 'Ticket Manager', description: 'Handles support tickets' },
+      ],
+      scope: ['Tickets', 'FAQ', 'Customer Communication'],
+      system_prompt: 'You are a customer support agent helping resolve customer issues.',
+      model_config: { provider: 'Bedrock', modelId: 'claude-3-sonnet', agentType: 'Worker' },
+    },
+  ];
+  const agents = await Promise.all(
+    agentSeeds.map((a) =>
+      prisma.agents.upsert({
+        where: {
+          unique_agent_name_per_scope: {
+            organization_id: orgId,
+            business_scope_id: a.business_scope_id,
+            name: a.name,
+          },
+        },
+        update: {},
+        create: { organization_id: orgId, ...a },
+      })
+    )
+  );
   console.log(`Created ${agents.length} agents`);
 
-  // Create Workflows
+  // Create Workflows — workflows have no natural unique key, so seed only when
+  // the org has none yet (re-runs reuse the existing rows for downstream refs).
   console.log('Creating workflows...');
-  const workflows = await Promise.all([
+  const existingWorkflows = await prisma.workflows.findMany({ where: { organization_id: orgId } });
+  const workflows = existingWorkflows.length > 0 ? existingWorkflows : await Promise.all([
     prisma.workflows.create({
       data: {
         organization_id: orgId,
@@ -359,9 +374,10 @@ async function main() {
   ]);
   console.log(`Created ${workflows.length} workflows`);
 
-  // Create Tasks
+  // Create Tasks — no natural unique key; seed only when the org has none.
   console.log('Creating tasks...');
-  const tasks = await Promise.all([
+  const existingTasks = await prisma.tasks.findMany({ where: { organization_id: orgId } });
+  const tasks = existingTasks.length > 0 ? existingTasks : await Promise.all([
     prisma.tasks.create({
       data: {
         organization_id: orgId,
@@ -418,9 +434,10 @@ async function main() {
   ]);
   console.log(`Created ${tasks.length} tasks`);
 
-  // Create MCP Servers
+  // Create MCP Servers — no natural unique key; seed only when the org has none.
   console.log('Creating MCP servers...');
-  const mcpServers = await Promise.all([
+  const existingMcp = await prisma.mcp_servers.findMany({ where: { organization_id: orgId } });
+  const mcpServers = existingMcp.length > 0 ? existingMcp : await Promise.all([
     prisma.mcp_servers.create({
       data: {
         organization_id: orgId,
@@ -444,9 +461,10 @@ async function main() {
   ]);
   console.log(`Created ${mcpServers.length} MCP servers`);
 
-  // Create Documents
+  // Create Documents — no natural unique key; seed only when the org has none.
   console.log('Creating documents...');
-  const documents = await Promise.all([
+  const existingDocs = await prisma.documents.findMany({ where: { organization_id: orgId } });
+  const documents = existingDocs.length > 0 ? existingDocs : await Promise.all([
     prisma.documents.create({
       data: {
         organization_id: orgId,
