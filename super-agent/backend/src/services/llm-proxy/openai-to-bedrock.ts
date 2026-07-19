@@ -207,11 +207,8 @@ export class OpenAIToBedrockConverter {
     const config: Record<string, unknown> = {};
     let maxTok = request.max_completion_tokens ?? request.max_tokens;
     // Clamp to the model's output-token ceiling. Clients tuned for Claude send
-    // large values that other Bedrock models (Nova, DeepSeek) reject outright.
-    const limit =
-      MODEL_MAX_OUTPUT_TOKENS[request.model] ??
-      MODEL_MAX_OUTPUT_TOKENS[this.resolvedModelId ?? ''] ??
-      MODEL_MAX_OUTPUT_TOKENS[this.modelMapping[request.model] ?? ''];
+    // large values (~32k) that other Bedrock models reject outright.
+    const limit = this.maxOutputTokensFor(request.model);
     if (maxTok && limit && maxTok > limit) maxTok = limit;
     if (maxTok) config.maxTokens = maxTok;
     if (request.temperature != null) {
@@ -303,6 +300,32 @@ export class OpenAIToBedrockConverter {
   private isAnthropicModel(openaiModel: string, bedrockModel: string): boolean {
     const ids = `${openaiModel} ${bedrockModel}`.toLowerCase();
     return ids.includes('anthropic') || ids.includes('claude');
+  }
+
+  /**
+   * Max output tokens allowed for the request's model. Matches by exact key
+   * first, then by substring/family (so `amazon.nova-pro-v1:0`,
+   * `us.amazon.nova-pro-v1:0`, `nova-pro`, etc. all resolve), and finally
+   * applies a conservative default cap to ANY non-Anthropic model — clients
+   * tuned for Claude send ~32k which most other Bedrock models reject.
+   * Returns undefined for Anthropic models (leave their high limits alone).
+   */
+  private maxOutputTokensFor(requestModel: string): number | undefined {
+    const candidates = [requestModel, this.resolvedModelId ?? '', this.modelMapping[requestModel] ?? ''];
+    // Exact-key match (explicit per-model overrides).
+    for (const c of candidates) {
+      if (c && MODEL_MAX_OUTPUT_TOKENS[c] != null) return MODEL_MAX_OUTPUT_TOKENS[c];
+    }
+    const ids = candidates.join(' ').toLowerCase();
+    // Family match by substring — robust to id/prefix variants.
+    if (ids.includes('nova')) return 8192;
+    if (ids.includes('deepseek')) return 8192;
+    if (ids.includes('llama') || ids.includes('meta.')) return 8192;
+    if (ids.includes('mistral') || ids.includes('qwen')) return 8192;
+    // Anthropic/Claude → no clamp (they accept large max_tokens).
+    if (ids.includes('anthropic') || ids.includes('claude')) return undefined;
+    // Unknown non-Anthropic Bedrock model → conservative safety cap.
+    return 8192;
   }
 
   private modelSupportsCaching(openaiModel: string, bedrockModel: string): boolean {
