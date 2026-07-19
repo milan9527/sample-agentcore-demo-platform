@@ -28,7 +28,7 @@ import {
 } from './claude-agent.service.js';
 import type { AgentRuntime } from './agent-runtime.js';
 import { agentRuntime as defaultAgentRuntime } from './agent-runtime-factory.js';
-import { resolveModel, extractSelection, isAnthropicBedrockModel } from './model-resolver.js';
+import { resolveModel, extractSelection } from './model-resolver.js';
 import type { ModelSelection } from '../schemas/model-provider.schema.js';
 import {
   workspaceManager as defaultWorkspaceManager,
@@ -616,22 +616,10 @@ export class ChatService {
     // switch). If they differ, drop the session id so the container starts fresh.
     const effectiveModel = agentConfig.resolvedModel?.modelId ?? agentConfig.model;
 
-    // Guard: the direct Bedrock path drives Claude Code, which only speaks the
-    // Anthropic Messages schema. Non-Anthropic Bedrock models (Nova, Titan,
-    // Llama, …) reject it ("extraneous key [metadata]"). Fail fast with an
-    // actionable message instead of surfacing the cryptic Bedrock 400. Such
-    // models must be served via a LiteLLM gateway provider, which translates
-    // the schema.
-    if (
-      agentConfig.resolvedModel?.provider === 'bedrock' &&
-      !isAnthropicBedrockModel(effectiveModel)
-    ) {
-      throw AppError.validation(
-        `Model "${effectiveModel}" is not an Anthropic model and cannot run on the direct Amazon Bedrock provider ` +
-          `(the agent runtime only supports Anthropic/Claude models there). ` +
-          `To use non-Anthropic models (e.g. Amazon Nova), add them through a LiteLLM gateway provider in Settings → Models.`,
-      );
-    }
+    // Note: non-Anthropic Bedrock models (Nova, DeepSeek, …) are NOT blocked
+    // here anymore. The AgentCore runtime transparently routes them through the
+    // backend's built-in LLM proxy (/v1/messages → Bedrock Converse), which
+    // translates the Anthropic schema the Claude Code CLI emits.
 
     if (claudeSessionId && claudeSessionModel && effectiveModel && claudeSessionModel !== effectiveModel) {
       console.log(

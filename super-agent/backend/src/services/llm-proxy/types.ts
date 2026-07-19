@@ -323,6 +323,24 @@ export const REASONING_EFFORT_MAP: Record<string, number> = {
   high: 32000,
 };
 
+/**
+ * Per-model maximum OUTPUT tokens. Clients (e.g. the Claude Code CLI) often send
+ * a large max_tokens tuned for Claude (~32k); other Bedrock models reject values
+ * above their own limit ("maximum tokens ... exceeds the model limit"). We clamp
+ * the request's max_tokens to this ceiling. Keyed by friendly id AND bedrock id.
+ * Anything not listed is left unclamped (Claude models accept high values).
+ */
+export const MODEL_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  // Nova rejects values that are NOT strictly below its 10000 limit, so cap
+  // under it (not at it).
+  'nova-pro': 8192,
+  'us.amazon.nova-pro-v1:0': 8192,
+  'nova-lite': 8192,
+  'us.amazon.nova-lite-v1:0': 8192,
+  'deepseek-v3.2': 8192,
+  'deepseek.deepseek-v3-0324-v1:0': 8192,
+};
+
 export const CACHING_UNSUPPORTED_MODELS = new Set([
   'claude-3-5-haiku',
   'us.anthropic.claude-3-5-haiku-20241022-v1:0',

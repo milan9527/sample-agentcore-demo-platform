@@ -505,6 +505,15 @@ export class SuperAgentEcsStack extends cdk.Stack {
         allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
       });
 
+      // /v1/* → ALB (OpenAI/Anthropic-compatible LLM proxy; the AgentCore
+      // container calls /v1/messages here to run non-Anthropic Bedrock models).
+      distribution.addBehavior('/v1/*', albOrigin, {
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+        originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+      });
+
       // Route53 ALIAS → CloudFront (only for a custom domain)
       if (useCustomDomain) {
         new route53.ARecord(this, 'DnsAlias', {

@@ -12,6 +12,7 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import crypto from 'crypto';
 import { apiKeyService } from '../services/apiKey.service.js';
+import { verifyInternalToken } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { LLMProxyService, recordLLMProxyUsage } from '../services/llm-proxy/index.js';
 import type { ChatCompletionRequest } from '../services/llm-proxy/types.js';
@@ -20,7 +21,7 @@ import type { ChatCompletionRequest } from '../services/llm-proxy/types.js';
 // API Key Auth (reuses platform API key system)
 // ============================================================================
 
-async function apiKeyAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+async function apiKeyAuth(request: FastifyRequest, _reply: FastifyReply): Promise<void> {
   const authHeader = request.headers.authorization;
   const xApiKey = request.headers['x-api-key'] as string | undefined;
 
@@ -35,6 +36,26 @@ async function apiKeyAuth(request: FastifyRequest, reply: FastifyReply): Promise
 
   if (!apiKey) {
     throw AppError.unauthorized('Missing or invalid API key');
+  }
+
+  // Internal service token (issued by the backend for the AgentCore container,
+  // format "internal.<data>.<sig>"). This lets the agent runtime call the proxy
+  // to run non-Anthropic Bedrock models (Nova, etc.) via Converse without a
+  // separately-provisioned API key. Grants model:invoke for the token's org.
+  if (apiKey.startsWith('internal.')) {
+    const internal = verifyInternalToken(apiKey);
+    if (!internal) {
+      throw AppError.unauthorized('Invalid or expired internal token');
+    }
+    (request as any).apiKeyData = {
+      id: 'internal',
+      organizationId: internal.orgId,
+      userId: internal.sub,
+      name: 'internal-service-token',
+      scopes: ['model:invoke'],
+      rateLimitPerMinute: 1000,
+    };
+    return;
   }
 
   const keyData = await apiKeyService.validateApiKey(apiKey);
@@ -388,11 +409,22 @@ export async function llmProxyRoutes(fastify: FastifyInstance): Promise<void> {
       } catch (error: any) {
         request.log.error({ err: error, model: body.model }, 'LLM proxy messages error');
         const statusCode = error.httpStatusCode ?? error.$metadata?.httpStatusCode ?? 500;
+        const message = error.message ?? 'Internal server error';
+        // If we already started streaming (SSE headers sent), we can't send a
+        // normal error response — emit an Anthropic-style error SSE event and
+        // close the stream, so the client sees the failure instead of hanging.
+        if (reply.raw.headersSent) {
+          try {
+            reply.raw.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}\n\n`);
+          } catch { /* stream already torn down */ }
+          reply.raw.end();
+          return;
+        }
         return reply.status(statusCode).send({
           type: 'error',
           error: {
             type: statusCode === 429 ? 'rate_limit_error' : 'api_error',
-            message: error.message ?? 'Internal server error',
+            message,
           },
         });
       }

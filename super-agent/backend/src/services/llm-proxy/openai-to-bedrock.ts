@@ -14,6 +14,7 @@ import {
   REASONING_EFFORT_MAP,
   CACHING_UNSUPPORTED_MODELS,
   MODEL_CACHE_MIN_TOKENS,
+  MODEL_MAX_OUTPUT_TOKENS,
 } from './types.js';
 
 const DEFAULT_CACHE_MIN_TOKENS = 1024;
@@ -66,14 +67,15 @@ export class OpenAIToBedrockConverter {
       }
     }
 
-    // Extended thinking
+    // Extended thinking — Anthropic-only. Skip entirely for other models so we
+    // never attach `additionalModelRequestFields.thinking` they'd reject.
     let thinkingConfig = request.thinking;
     if (!thinkingConfig && request.reasoning_effort) {
       const budget = REASONING_EFFORT_MAP[request.reasoning_effort] ?? 10000;
       thinkingConfig = { type: 'enabled', budget_tokens: budget };
     }
 
-    if (thinkingConfig && thinkingConfig.type === 'enabled') {
+    if (this.isAnthropicModel(request.model, this.resolvedModelId ?? '') && thinkingConfig && thinkingConfig.type === 'enabled') {
       const additional = (bedrockRequest.additionalModelRequestFields as Record<string, unknown>) || {};
       additional.thinking = thinkingConfig;
       bedrockRequest.additionalModelRequestFields = additional;
@@ -203,7 +205,14 @@ export class OpenAIToBedrockConverter {
 
   private buildInferenceConfig(request: ChatCompletionRequest): Record<string, unknown> {
     const config: Record<string, unknown> = {};
-    const maxTok = request.max_completion_tokens ?? request.max_tokens;
+    let maxTok = request.max_completion_tokens ?? request.max_tokens;
+    // Clamp to the model's output-token ceiling. Clients tuned for Claude send
+    // large values that other Bedrock models (Nova, DeepSeek) reject outright.
+    const limit =
+      MODEL_MAX_OUTPUT_TOKENS[request.model] ??
+      MODEL_MAX_OUTPUT_TOKENS[this.resolvedModelId ?? ''] ??
+      MODEL_MAX_OUTPUT_TOKENS[this.modelMapping[request.model] ?? ''];
+    if (maxTok && limit && maxTok > limit) maxTok = limit;
     if (maxTok) config.maxTokens = maxTok;
     if (request.temperature != null) {
       config.temperature = Math.min(request.temperature, 1.0);
@@ -285,7 +294,20 @@ export class OpenAIToBedrockConverter {
     return false;
   }
 
+  /**
+   * Whether the resolved model is an Anthropic/Claude model. Only these support
+   * Claude-specific Bedrock features — prompt caching (cachePoint blocks) and
+   * extended thinking. Non-Anthropic models (Nova, DeepSeek, Llama, …) reject
+   * those with "Malformed input request", so we must NOT emit them.
+   */
+  private isAnthropicModel(openaiModel: string, bedrockModel: string): boolean {
+    const ids = `${openaiModel} ${bedrockModel}`.toLowerCase();
+    return ids.includes('anthropic') || ids.includes('claude');
+  }
+
   private modelSupportsCaching(openaiModel: string, bedrockModel: string): boolean {
+    // Prompt caching (cachePoint) is Anthropic-only on Bedrock.
+    if (!this.isAnthropicModel(openaiModel, bedrockModel)) return false;
     return !CACHING_UNSUPPORTED_MODELS.has(openaiModel) && !CACHING_UNSUPPORTED_MODELS.has(bedrockModel);
   }
 

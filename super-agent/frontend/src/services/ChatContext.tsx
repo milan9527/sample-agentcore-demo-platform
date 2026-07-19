@@ -361,7 +361,10 @@ export function ChatProvider({ children, initialSessionId, initialSop, initialAg
       setError(message)
       return null
     }
-  }, [sessionId, activeSop, selectedAgentId, selectedBusinessScopeId, backendSessionId])
+    // selectedModel/selectedProviderId MUST be deps: without them this callback
+    // captures their initial (null) values, so a model picked in the UI is never
+    // sent (requestSelection=undefined) and the org default is always used.
+  }, [sessionId, activeSop, selectedAgentId, selectedBusinessScopeId, backendSessionId, selectedModel, selectedProviderId])
 
   const setActiveSop = useCallback((sopId: string) => {
     setActiveSopState(sopId)

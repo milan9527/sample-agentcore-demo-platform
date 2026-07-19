@@ -19,6 +19,7 @@ import type {
   MCPServerSDKConfig,
 } from './claude-agent.service.js';
 import { createToken } from '../middleware/auth.js';
+import { isAnthropicBedrockModel } from './model-resolver.js';
 import type { SkillForWorkspace } from './workspace-manager.js';
 import {
   S3Client,
@@ -136,6 +137,35 @@ export class AgentCoreAgentRuntime implements AgentRuntime {
       }
     }
 
+    // Internal service token — lets the container authenticate backend API calls
+    // (RAG, and the LLM proxy for non-Anthropic models).
+    const backendToken = createToken({
+      userId: options.userId,
+      email: 'agent-internal@system',
+      organizationId: options.organizationId,
+      role: 'member',
+    });
+    const backendUrl = config.agentcore.backendApiUrl || process.env.PUBLIC_API_URL || undefined;
+
+    // Provider routing. The Claude Code CLI only speaks the Anthropic schema, so
+    // it can drive Anthropic models on Bedrock directly, but NOT non-Anthropic
+    // Bedrock models (Nova, DeepSeek, …) — those reject the Anthropic request.
+    // For those, transparently route through the backend's built-in LLM proxy
+    // (/v1/messages → Bedrock Converse), which speaks Anthropic in and Converse
+    // out. To the container this looks like a "litellm" gateway.
+    let effProvider = agentConfig.resolvedModel?.provider;
+    let effBaseUrl = agentConfig.resolvedModel?.baseUrl;
+    let effApiKey = agentConfig.resolvedModel?.apiKey;
+    const effModel = agentConfig.resolvedModel?.modelId ?? agentConfig.model ?? undefined;
+    if (effProvider === 'bedrock' && !isAnthropicBedrockModel(effModel) && backendUrl) {
+      effProvider = 'litellm';
+      effBaseUrl = backendUrl.replace(/\/+$/, '');
+      effApiKey = backendToken; // proxy accepts the internal token (model:invoke)
+      console.log(
+        `[agentcore-runtime] Routing non-Anthropic Bedrock model ${effModel} via built-in proxy at ${effBaseUrl}`
+      );
+    }
+
     const payload = JSON.stringify({
       prompt: options.message,
       session_id: options.providerSessionId ?? undefined,
@@ -145,23 +175,18 @@ export class AgentCoreAgentRuntime implements AgentRuntime {
       org_id: options.organizationId,
       agent_id: options.agentId,
       system_prompt: agentConfig.systemPrompt ?? undefined,
-      model: agentConfig.resolvedModel?.modelId ?? agentConfig.model ?? undefined,
+      model: effModel,
       // Provider selection for per-invocation model routing inside the container.
-      provider: agentConfig.resolvedModel?.provider,
-      base_url: agentConfig.resolvedModel?.baseUrl,
-      api_key: agentConfig.resolvedModel?.apiKey,
+      provider: effProvider,
+      base_url: effBaseUrl,
+      api_key: effApiKey,
       mcp_servers: serializableMcpServers,
       workspace_s3_bucket: this.workspaceBucket,
       workspace_s3_prefix: s3Prefix,
       // Backend connectivity for RAG and other API calls from within the container
-      backend_api_url: config.agentcore.backendApiUrl || process.env.PUBLIC_API_URL || undefined,
+      backend_api_url: backendUrl,
       // Generate a short-lived token so the container can authenticate API calls (e.g. RAG search)
-      backend_api_key: createToken({
-        userId: options.userId,
-        email: 'agent-internal@system',
-        organizationId: options.organizationId,
-        role: 'member',
-      }),
+      backend_api_key: backendToken,
     });
 
     console.log(`[agentcore-runtime] S3 workspace: s3://${this.workspaceBucket}/${s3Prefix}`);

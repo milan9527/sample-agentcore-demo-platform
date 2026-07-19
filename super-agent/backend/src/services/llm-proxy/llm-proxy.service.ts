@@ -62,6 +62,19 @@ export class LLMProxyService {
   private responseConverter = new BedrockToOpenAIConverter();
 
   /**
+   * True when Bedrock rejected the request because the model can't use tools
+   * (e.g. DeepSeek R1 reasoning models). We retry once without tools so the
+   * model at least answers instead of hard-failing the whole chat.
+   */
+  private isToolUnsupportedError(err: unknown): boolean {
+    const msg = (err as { message?: string })?.message ?? '';
+    // Covers Bedrock-direct ("This model doesn't support tool use"), the
+    // toolConfig/cachePoint malformed-input variants, and litellm's
+    // "does not support parameters: ['tools']".
+    return /tool use|toolConfig|does(n'?t| not) support tool|support parameters.*tools/i.test(msg);
+  }
+
+  /**
    * Non-streaming chat completion.
    */
   async chatCompletion(
@@ -76,8 +89,19 @@ export class LLMProxyService {
     const modelId = bedrockRequest.modelId as string;
     delete bedrockRequest.modelId;
 
-    const command = new ConverseCommand({ modelId, ...bedrockRequest } as any);
-    const bedrockResponse = await client.send(command);
+    let bedrockResponse;
+    try {
+      bedrockResponse = await client.send(new ConverseCommand({ modelId, ...bedrockRequest } as any));
+    } catch (err) {
+      // Fallback: model doesn't support tools → retry once with tools stripped.
+      if (this.isToolUnsupportedError(err) && (request.tools?.length)) {
+        const noTools = this.converter.convertRequest({ ...request, tools: undefined, tool_choice: undefined }, cacheTtl);
+        delete noTools.modelId;
+        bedrockResponse = await client.send(new ConverseCommand({ modelId, ...noTools } as any));
+      } else {
+        throw err;
+      }
+    }
 
     const cacheUsage = this.responseConverter.extractCacheUsage(bedrockResponse as any);
     const response = this.responseConverter.convertResponse(
@@ -106,8 +130,19 @@ export class LLMProxyService {
     const modelId = bedrockRequest.modelId as string;
     delete bedrockRequest.modelId;
 
-    const command = new ConverseStreamCommand({ modelId, ...bedrockRequest } as any);
-    const bedrockResponse = await client.send(command);
+    let bedrockResponse;
+    try {
+      bedrockResponse = await client.send(new ConverseStreamCommand({ modelId, ...bedrockRequest } as any));
+    } catch (err) {
+      // Fallback: model doesn't support tools → retry once with tools stripped.
+      if (this.isToolUnsupportedError(err) && (request.tools?.length)) {
+        const noTools = this.converter.convertRequest({ ...request, tools: undefined, tool_choice: undefined }, cacheTtl);
+        delete noTools.modelId;
+        bedrockResponse = await client.send(new ConverseStreamCommand({ modelId, ...noTools } as any));
+      } else {
+        throw err;
+      }
+    }
 
     let currentIndex = 0;
     let usageData: Record<string, number> | null = null;

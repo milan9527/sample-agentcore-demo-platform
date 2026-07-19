@@ -552,6 +552,10 @@ env = {
     'SKILLS_S3_BUCKET': '$SKILLS_BUCKET',
     'CORS_ORIGIN': '$CORS_VALUE',
     'APP_URL': '$APP_URL',
+    # Public URL the AgentCore container calls back on (RAG + LLM proxy for
+    # non-Anthropic Bedrock models like Nova). Must be publicly reachable — the
+    # CloudFront/custom-domain URL routes /api and /v1 to this backend.
+    'AGENTCORE_BACKEND_API_URL': '$PUBLIC_URL',
     'CLAUDE_CODE_USE_BEDROCK': '1',
     'CLAUDE_MODEL': 'global.anthropic.claude-sonnet-4-6',
     'AGENT_WORKSPACE_BASE_DIR': '/app/workspaces',
