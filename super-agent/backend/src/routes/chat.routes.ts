@@ -904,6 +904,17 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
               session.id,
             );
           }
+          // A history session with no active microVM spins up a *fresh, empty*
+          // container, so the AgentCore `find` above succeeds (no throw) but
+          // returns an empty tree — skipping the catch. Fall back to the S3
+          // snapshot so previously-generated files still show for old sessions.
+          if (!files || files.length === 0) {
+            files = await workspaceManager.listWorkspaceFilesFromS3(
+              request.user!.orgId,
+              scopeIdForPath,
+              session.id,
+            );
+          }
         } else {
           files = await workspaceManager.listWorkspaceFiles(
             request.user!.orgId,

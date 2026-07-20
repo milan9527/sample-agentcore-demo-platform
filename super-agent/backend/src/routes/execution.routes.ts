@@ -575,10 +575,12 @@ export async function executionRoutes(fastify: FastifyInstance): Promise<void> {
       const scopeId = execution.workspace_scope_id;
       const sessionId = execution.workspace_session_id;
 
-      // Local-first, S3 fallback (same pattern as chat workspace)
+      // Local-first, S3 fallback (same pattern as chat workspace). Fall back
+      // when local is missing OR empty: a history execution whose files live
+      // only in the S3 snapshot would otherwise show nothing.
       let files = await workspaceManager.listWorkspaceFiles(orgId, scopeId, sessionId);
 
-      if (!files && config.agentRuntime === 'agentcore') {
+      if ((!files || files.length === 0) && config.agentRuntime === 'agentcore') {
         files = await workspaceManager.listWorkspaceFilesFromS3(orgId, scopeId, sessionId);
       }
 
