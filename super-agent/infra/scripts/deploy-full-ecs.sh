@@ -1096,6 +1096,39 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
     --delivery-destination-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:delivery-destination:${RUNTIME_ID}-traces-dest" >/dev/null 2>&1 || true
   echo "  Tracing delivery configured (traces → X-Ray, app logs → $RT_VENDED_LG)."
 
+  # --- 4d-4: Sync OTEL_RESOURCE_ATTRIBUTES with the now-known runtime id ---
+  # ENV_VARS was built before the runtime existed, so OTEL_RESOURCE_ATTRIBUTES
+  # couldn't include aws.log.group.names (needs the runtime id). Re-apply the env
+  # with the per-runtime log group so app logs + spans associate to this agent's
+  # own group in the GenAI Observability console. Idempotent; skipped if the env
+  # already carries the correct value (avoids a redundant runtime update/READY
+  # wait on repeat deploys).
+  RT_DEFAULT_LG="/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}-DEFAULT"
+  DESIRED_RESATTR="service.name=${RUNTIME_NAME},aws.log.group.names=${RT_DEFAULT_LG}"
+  CURRENT_RESATTR=$(aws bedrock-agentcore-control get-agent-runtime \
+    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --query "environmentVariables.OTEL_RESOURCE_ATTRIBUTES" --output text 2>/dev/null || echo "")
+  if [ "$CURRENT_RESATTR" != "$DESIRED_RESATTR" ]; then
+    echo "  [4d-4] Syncing OTEL_RESOURCE_ATTRIBUTES with runtime log group..."
+    SYNCED_ENV=$(printf '%s' "$ENV_VARS" | python3 -c "
+import sys, json
+env = json.load(sys.stdin)
+env['OTEL_RESOURCE_ATTRIBUTES'] = '$DESIRED_RESATTR'
+print(json.dumps(env))
+")
+    aws bedrock-agentcore-control update-agent-runtime \
+      --agent-runtime-id "$RUNTIME_ID" \
+      --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"$AGENTCORE_ECR_URI:latest\"}}" \
+      --role-arn "$ROLE_ARN" \
+      --network-configuration '{"networkMode":"PUBLIC"}' \
+      --environment-variables "$SYNCED_ENV" \
+      --region "$REGION" >/dev/null 2>&1 \
+      && echo "  OTEL_RESOURCE_ATTRIBUTES synced." \
+      || echo "  WARNING: resource-attr sync failed (tracing still works via aws/spans)."
+  else
+    echo "  [4d-4] OTEL_RESOURCE_ATTRIBUTES already correct — skipping."
+  fi
+
   # --- 4e: Update ECS task with AgentCore env vars ---
   echo "  [4e] Enabling AgentCore mode in ECS task..."
 
