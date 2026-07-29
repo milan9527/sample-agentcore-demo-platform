@@ -788,17 +788,31 @@ export class WorkspaceManager {
 
     const mcpConfig: Record<string, unknown> = {};
 
-    // In agentcore mode, add built-in AgentCore tools (Browser + Code Interpreter)
+    // In agentcore mode, add built-in AgentCore tools (Browser + Code Interpreter).
+    //
+    // Version is PINNED to 0.1.2, not @latest. Reason: 0.1.1 hardcoded a docs
+    // index URL (https://aws.github.io/bedrock-agentcore-starter-toolkit/llms.txt)
+    // that now 404s and crashed the MCP server at startup, so no browser/code-
+    // interpreter tools ever registered. 0.1.2 (2026-07-28) fixes both the URL
+    // and makes the fetch non-fatal. `uvx @latest` can serve a stale cached
+    // 0.1.1, so we pin the exact fixed version.
+    //
+    // Identifiers are passed as env vars — 0.1.2 reads BROWSER_IDENTIFIER /
+    // CODE_INTERPRETER_IDENTIFIER (defaulting to the AWS-managed aws.browser.v1 /
+    // aws.codeinterpreter.v1 resources when unset). The deploy script injects the
+    // real resource ids into the container env; we fall back to the managed
+    // defaults so tools still work before any custom resource exists.
     if (config.agentRuntime === 'agentcore') {
       const agentcoreRegion = config.agentcore.runtimeArn?.split(':')[3] || config.aws.region;
       mcpConfig['agentcore-tools'] = {
         type: 'stdio',
         command: 'uvx',
-        args: ['awslabs.amazon-bedrock-agentcore-mcp-server@latest'],
+        args: ['awslabs.amazon-bedrock-agentcore-mcp-server@0.1.2'],
         env: {
           AWS_REGION: agentcoreRegion,
           FASTMCP_LOG_LEVEL: 'ERROR',
-          BROWSER_IDENTIFIER: process.env.AGENTCORE_BROWSER_IDENTIFIER || 'public_browser_webauth-piLpCAcEYA',
+          BROWSER_IDENTIFIER: process.env.AGENTCORE_BROWSER_IDENTIFIER || 'aws.browser.v1',
+          CODE_INTERPRETER_IDENTIFIER: process.env.AGENTCORE_CODE_INTERPRETER_IDENTIFIER || 'aws.codeinterpreter.v1',
         },
       };
     }

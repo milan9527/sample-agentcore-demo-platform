@@ -1828,6 +1828,10 @@ export const translations: TranslationData = {
     en: 'Invoke LLM Models',
     cn: '调用 LLM 模型'
   },
+  'apiKeys.scopeMcpTools': {
+    en: 'MCP Tools',
+    cn: 'MCP 工具'
+  },
   'apiKeys.rateLimit': {
     en: 'Rate limit / min',
     cn: '速率限制 / 分钟'
@@ -3281,6 +3285,14 @@ export const translations: TranslationData = {
   'apiKeys.scopeWriteDesc': {
     en: 'Create and modify workflows',
     cn: '创建和修改工作流'
+  },
+  'apiKeys.scopeModelInvokeDesc': {
+    en: 'Call the OpenAI/Anthropic-compatible LLM proxy',
+    cn: '调用 OpenAI/Anthropic 兼容的 LLM 代理'
+  },
+  'apiKeys.scopeMcpToolsDesc': {
+    en: 'Connect from MCP clients (Kiro, Amazon Q) to chat with agents',
+    cn: '供 MCP 客户端（Kiro、Amazon Q）连接以与智能体对话'
   },
   'apiKeys.rateLimitPerMin': {
     en: 'Rate Limit (per minute)',

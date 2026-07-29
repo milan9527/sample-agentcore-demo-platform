@@ -70,6 +70,7 @@ import { tokenUsageRoutes } from './token-usage.routes.js';
 import { showcaseRoutes } from './showcase.routes.js';
 import { packDeployRoutes } from './pack-deploy.routes.js';
 import { llmProxyRoutes } from './llm-proxy.routes.js';
+import { mcpServerRoutes } from './mcp-server.routes.js';
 import { connectorRoutes } from './connectors.routes.js';
 import { supportRoutes, supportSettingsRoutes, supportKnowledgeRoutes } from './support.routes.js';
 import { widgetRoutes } from './widget.routes.js';
@@ -295,6 +296,14 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
   // /v1/chat/completions and /v1/models — drop-in for OpenAI SDK base_url
   await fastify.register(llmProxyRoutes);
+
+  // ============================================================================
+  // MCP Server (Model Context Protocol, API Key Authentication)
+  // ============================================================================
+
+  // /v1/mcp — Streamable HTTP MCP endpoint for external IDE clients (Kiro,
+  // Amazon Q). Exposes Super Agent as MCP tools. See document/mcp-server-design.md
+  await fastify.register(mcpServerRoutes);
 
   // ============================================================================
   // A2A Protocol Routes (Agent-to-Agent, API Key Authentication)

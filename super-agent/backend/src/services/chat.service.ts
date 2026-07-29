@@ -279,7 +279,11 @@ export class ChatService {
       const conversationGenerator = this.agentRuntime.runConversation(
         {
           agentId: agentConfig.id,
-          sessionId: options.sessionId,
+          // Use the resolved session id (prepareScopeSession creates one for new
+          // sessions); options.sessionId is undefined on a first turn, which would
+          // make the runtime fall back to the shared 'ephemeral/' S3 workspace
+          // prefix (files collide across sessions and can't be fetched by id).
+          sessionId,
           providerSessionId: claudeSessionId,
           message: options.message,
           organizationId: options.organizationId,
