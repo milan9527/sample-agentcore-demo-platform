@@ -245,9 +245,17 @@ export class SuperAgentEcsStack extends cdk.Stack {
       resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/super-agent/*`],
     }));
 
-    // AgentCore invoke permission
+    // AgentCore invoke permission.
+    // InvokeAgentRuntime      — run the agent conversation.
+    // InvokeAgentRuntimeCommand — run shell commands (find/cat) inside the live
+    //   microVM; used by agentCoreCommandService to list/read the workspace file
+    //   tree. Without it, the workspace file panel can't read files from an
+    //   active session's container (it errors and falls back to the S3 snapshot).
     taskRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+      actions: [
+        'bedrock-agentcore:InvokeAgentRuntime',
+        'bedrock-agentcore:InvokeAgentRuntimeCommand',
+      ],
       resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:runtime/*`],
     }));
 
