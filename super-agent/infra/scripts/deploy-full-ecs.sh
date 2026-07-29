@@ -1005,11 +1005,18 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   # thinking keeps the runtime compatible across models.
   ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-8\",\"CLAUDE_CODE_DISABLE_THINKING\":\"1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
   # AgentCore Observability: the Node runtime emits OTEL spans/events (SAES/eval
-  # contract) from agent-runner via src/otel.ts. When hosted on AgentCore
-  # Runtime, the platform provides an OTLP receiver on localhost:4318 and
-  # forwards spans/logs to CloudWatch (the /aws/bedrock-agentcore/runtimes/<id>
-  # log group). We only need to switch our exporter on and point it there.
-  ENV_VARS="$ENV_VARS,\"AGENT_OBSERVABILITY_ENABLED\":\"true\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/protobuf\",\"OTEL_EXPORTER_OTLP_ENDPOINT\":\"http://localhost:4318\",\"OTEL_SERVICE_NAME\":\"${RUNTIME_NAME}\",\"OTEL_RESOURCE_ATTRIBUTES\":\"service.name=${RUNTIME_NAME}\""
+  # contract) from agent-runner via src/otel.ts, exported by the ADOT register
+  # hook preloaded in the Dockerfile CMD. ADOT (when AGENT_OBSERVABILITY_ENABLED
+  # =true) auto-configures the SigV4-signed OTLP export to the AWS endpoints
+  # (https://xray.<region>.../v1/traces, https://logs.<region>.../v1/logs) and
+  # sets OTEL_TRACES_EXPORTER + sampler itself.
+  # IMPORTANT: do NOT set OTEL_EXPORTER_OTLP_ENDPOINT — ADOT only auto-configures
+  # the AWS endpoints when that var is UNSET (register.js:110). Setting it (e.g.
+  # to localhost:4318) suppresses auto-config and spans go nowhere.
+  # OTEL_RESOURCE_ATTRIBUTES carries the per-agent log group so spans/logs land
+  # in /aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT (id filled in after
+  # the runtime exists — see the post-create env sync below).
+  ENV_VARS="$ENV_VARS,\"AGENT_OBSERVABILITY_ENABLED\":\"true\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/protobuf\",\"OTEL_SERVICE_NAME\":\"${RUNTIME_NAME}\",\"OTEL_RESOURCE_ATTRIBUTES\":\"service.name=${RUNTIME_NAME}\""
   if [ -n "$BEDROCK_AK" ] && [ -n "$BEDROCK_SK" ]; then
     ENV_VARS="$ENV_VARS,\"AWS_ACCESS_KEY_ID\":\"$BEDROCK_AK\",\"AWS_SECRET_ACCESS_KEY\":\"$BEDROCK_SK\""
   fi
