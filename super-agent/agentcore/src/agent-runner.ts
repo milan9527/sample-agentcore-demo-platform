@@ -14,7 +14,7 @@ import { syncWorkspaceToS3 } from './workspace-sync.js';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import type { AgentPayload, AgentEvent, ContentBlock } from './types.js';
-import { beginInvocation } from './otel.js';
+import { beginInvocation, type InvocationTrace } from './otel.js';
 
 const DEFAULT_TOOLS = [
   'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -276,6 +276,12 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
 // ---------------------------------------------------------------------------
 
 export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEvent> {
+  // One OTEL invocation trace per turn. Created up front so PreToolUse/PostToolUse
+  // hooks (registered below) can attach tool spans to it. Session correlation
+  // uses the AgentCore session id (chat_session_id / session_id from backend).
+  const otelSessionId = payload.chat_session_id ?? payload.session_id ?? 'unknown-session';
+  const inv = beginInvocation(otelSessionId, payload.prompt);
+
   const baseOptions: Record<string, unknown> = {
     systemPrompt: payload.system_prompt ?? undefined,
     allowedTools: payload.allowed_tools ?? DEFAULT_TOOLS,
@@ -336,37 +342,56 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
     baseOptions.mcpServers = payload.mcp_servers;
   }
 
-  // Register S3 sync hooks (replaces file-watcher)
+  // Register hooks: OTEL tool tracing (every tool) + S3 sync (Write/Edit).
+  //
+  // Tool spans are captured via PreToolUse/PostToolUse hooks rather than the
+  // assistant event stream, because the SDK does NOT surface every tool_use as
+  // an assistant-content block (multi-turn runs dropped ~1-2 tools that way).
+  // Hooks fire for EVERY tool with tool_name/tool_input/tool_use_id (Pre) and
+  // tool_response (Post) — 100% coverage, authoritative.
   const bucket = payload.workspace_s3_bucket;
   const prefix = payload.workspace_s3_prefix;
+  const preToolHooks: unknown[] = [];
+  const postToolMatchers: unknown[] = [];
+
+  if (inv) {
+    preToolHooks.push(async (input: any) => {
+      try {
+        inv.recordTool(input?.tool_name ?? 'unknown', input?.tool_input, '', input?.tool_use_id);
+      } catch { /* telemetry must not break the tool */ }
+      return {};
+    });
+    postToolMatchers.push({
+      matcher: '.*',
+      hooks: [async (input: any) => {
+        try {
+          if (input?.tool_use_id) inv.recordToolResult(input.tool_use_id, input?.tool_response ?? '');
+        } catch { /* ignore */ }
+        return {};
+      }],
+    });
+  }
   if (bucket && prefix) {
-    baseOptions.hooks = {
-      PostToolUse: [
-        {
-          matcher: 'Write|Edit',
-          hooks: [createFileChangeHook(bucket, prefix)],
-        },
-      ],
-      Stop: [
-        {
-          hooks: [createStopHook(bucket, prefix)],
-        },
-      ],
-    };
-    console.log(`[agent-runner] S3 sync hooks registered for s3://${bucket}/${prefix}`);
+    postToolMatchers.push({ matcher: 'Write|Edit', hooks: [createFileChangeHook(bucket, prefix)] });
+  }
+
+  const hooks: Record<string, unknown[]> = {};
+  if (preToolHooks.length) hooks.PreToolUse = [{ matcher: '.*', hooks: preToolHooks }];
+  if (postToolMatchers.length) hooks.PostToolUse = postToolMatchers;
+  if (bucket && prefix) hooks.Stop = [{ hooks: [createStopHook(bucket, prefix)] }];
+  if (Object.keys(hooks).length) {
+    baseOptions.hooks = hooks;
+    console.log(`[agent-runner] Hooks registered (tracing=${!!inv}, s3sync=${!!(bucket && prefix)})`);
   }
 
   // OTEL: one root span per invocation (= one trace per turn), carrying the
   // SAES/AgentCore-Evaluation contract fields. Session correlation uses the
   // AgentCore session id (chat_session_id / session_id from the backend).
-  const otelSessionId = payload.chat_session_id ?? payload.session_id ?? 'unknown-session';
-
   // Strategy: try Claude Code session resume first (fast, native history).
   // If resume fails (microVM was recycled), fallback to history-injected prompt.
   if (payload.session_id) {
     try {
-      yield* runTraced(otelSessionId, payload.prompt,
-        runWithOptions(payload.prompt, { ...baseOptions, resume: payload.session_id }));
+      yield* runTraced(inv, runWithOptions(payload.prompt, { ...baseOptions, resume: payload.session_id }));
       return;
     } catch (err) {
       console.log(`[agent-runner] Session resume failed (${err}), falling back to history injection`);
@@ -374,56 +399,27 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
   }
 
   const prompt = buildContextualPrompt(payload);
-  // Trace with the user's real prompt (not the history-augmented one) so the
-  // evaluated prompt matches what the user actually asked.
-  yield* runTraced(otelSessionId, payload.prompt, runWithOptions(prompt, baseOptions));
+  yield* runTraced(inv, runWithOptions(prompt, baseOptions));
 }
 
 /**
- * Wrap an agent event stream with an OTEL invocation trace. Observes the events
- * as they pass through — capturing tool calls from `assistant` blocks and the
- * final answer + token usage from `result` — then finalizes the contract span.
- * Pass-through: yields every event unchanged.
+ * Wrap an agent event stream with the OTEL invocation trace `inv`. Tool spans
+ * are recorded by PreToolUse/PostToolUse hooks (see runAgent) — NOT here — so
+ * every tool call is captured regardless of whether it surfaces as an assistant
+ * content block. This wrapper only observes the final answer + token usage from
+ * the `result` event and finalizes the root span. Pass-through: yields every
+ * event unchanged.
  */
 async function* runTraced(
-  sessionId: string,
-  prompt: string,
+  inv: InvocationTrace,
   stream: AsyncGenerator<AgentEvent>,
 ): AsyncGenerator<AgentEvent> {
-  const inv = beginInvocation(sessionId, prompt);
-  // Record a tool span as soon as we see the tool_use block (arguments known
-  // then). We do NOT wait to pair a tool_result: the Claude Agent SDK returns
-  // tool results in a `user`-role message that runWithOptions doesn't surface,
-  // so waiting would drop every tool span. If a tool_result block does appear
-  // (some tools echo it in assistant content), enrich the recorded call.
-  // toolUseId → {name, input} captured from the assistant's tool_use block, and
-  // whether we've already recorded a span for it. The Claude Agent SDK returns
-  // tool RESULTS come back in a `user`-role message that runWithOptions doesn't
-  // surface, so we can't reliably pair result↔call. Record the tool span
-  // IMMEDIATELY when the tool_use block is seen — at that point we're mid-stream
-  // and the invocation root span is active/recording, so the child span attaches
-  // correctly. (Deferring to an end-of-stream flush proved unreliable: the
-  // generator's finally can run after the root span's context is no longer
-  // active, yielding non-recording tool spans / empty trace ids.) If a
-  // tool_result block later appears in assistant content, update the recorded
-  // span's result; otherwise the span carries args only, which still shows the
-  // tool step + selection in the trace.
-  const seen = new Map<string, string>(); // tool_use_id → tool name (dedupe)
   let finalAnswer = '';
   let isError = false;
   let tokenUsage: Record<string, number> | undefined;
   try {
     for await (const event of stream) {
-      if (event.type === 'assistant' && Array.isArray(event.content)) {
-        for (const block of event.content) {
-          if (block.type === 'tool_use' && block.id && !seen.has(block.id)) {
-            seen.set(block.id, block.name ?? 'unknown');
-            inv.recordTool(block.name ?? 'unknown', block.input, '', block.id);
-          } else if (block.type === 'tool_result' && block.tool_use_id && seen.has(block.tool_use_id)) {
-            inv.recordToolResult(block.tool_use_id, block.content ?? '');
-          }
-        }
-      } else if (event.type === 'result') {
+      if (event.type === 'result') {
         if (typeof event.result === 'string') finalAnswer = event.result;
         if (event.is_error) isError = true;
         if (event.token_usage) {
