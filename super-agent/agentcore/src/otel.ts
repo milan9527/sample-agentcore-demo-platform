@@ -24,7 +24,11 @@
 import { trace, type Span, type Tracer, SpanStatusCode } from '@opentelemetry/api';
 import { logs, type Logger } from '@opentelemetry/api-logs';
 
-const SCOPE = 'claudesdk.agent';
+// The managed AgentCore Evaluate API only accepts spans whose instrumentation
+// scope is on its allow-list; for the Claude Agent SDK that is exactly
+// `openinference.instrumentation.claude_agent_sdk`. Using any other scope name
+// makes Evaluate reject the session ("no spans with supported scope").
+const SCOPE = 'openinference.instrumentation.claude_agent_sdk';
 const OBSERVABILITY_ENABLED = process.env.AGENT_OBSERVABILITY_ENABLED === 'true';
 
 /**
@@ -101,6 +105,14 @@ export function beginInvocation(sessionId: string, prompt: string): InvocationTr
     span = getTracer().startSpan('agent.invocation');
     span.setAttribute('session.id', sessionId);          // contract item 1
     span.setAttribute('gen_ai.prompt', prompt);          // contract item 2
+    // The managed AgentCore Evaluate API's claude_agent_sdk mapper reads
+    // OpenInference attributes, not gen_ai.* — without these it rejects the
+    // session ("no spans ... have model/tool/agent invocation details"). Emit
+    // both so the span works for Observability AND Evaluation.
+    span.setAttribute('openinference.span.kind', 'AGENT');
+    span.setAttribute('input.value', prompt);
+    span.setAttribute('llm.input_messages.0.message.role', 'user');
+    span.setAttribute('llm.input_messages.0.message.content', prompt);
     // Roled input message body — SAES role-aware recovery reads this shape.
     emitEvent('gen_ai.user.message', { message: { role: 'user', content: [{ text: prompt }] } }, span);
   } catch {
@@ -126,6 +138,10 @@ export function beginInvocation(sessionId: string, prompt: string): InvocationTr
     end(answer, opts) {
       try {
         span.setAttribute('gen_ai.completion', answer);   // contract item 3
+        // OpenInference output attributes (see beginInvocation note).
+        span.setAttribute('output.value', answer);
+        span.setAttribute('llm.output_messages.0.message.role', 'assistant');
+        span.setAttribute('llm.output_messages.0.message.content', answer);
         if (opts?.tokenUsage) {
           if (opts.tokenUsage.input_tokens != null) span.setAttribute('gen_ai.usage.input_tokens', opts.tokenUsage.input_tokens);
           if (opts.tokenUsage.output_tokens != null) span.setAttribute('gen_ai.usage.output_tokens', opts.tokenUsage.output_tokens);
