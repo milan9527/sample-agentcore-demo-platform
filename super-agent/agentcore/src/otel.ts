@@ -21,7 +21,7 @@
  * harness installs in-memory providers first.
  */
 
-import { trace, type Span, type Tracer, SpanStatusCode } from '@opentelemetry/api';
+import { trace, context, type Span, type Tracer, SpanStatusCode } from '@opentelemetry/api';
 import { logs, type Logger } from '@opentelemetry/api-logs';
 
 // The managed AgentCore Evaluate API only accepts spans whose instrumentation
@@ -101,52 +101,75 @@ export function beginInvocation(sessionId: string, prompt: string): InvocationTr
   if (!OBSERVABILITY_ENABLED) return NOOP_TRACE;
 
   let span: Span;
+  let rootCtx: ReturnType<typeof trace.setSpan>;
   try {
     span = getTracer().startSpan('agent.invocation');
+    rootCtx = trace.setSpan(context.active(), span);
+
+    // --- Agent Traces UI rendering (gen_ai.* semantic conventions) ---
+    // gen_ai.operation.name categorizes the span so the UI renders it as an
+    // agent invocation and shows input/output; without it the span is a bare
+    // skeleton. input/output.messages carry the content the UI displays.
+    span.setAttribute('gen_ai.operation.name', 'invoke_agent');
+    span.setAttribute('gen_ai.provider.name', 'anthropic');
+    span.setAttribute('gen_ai.agent.name', 'super-agent');
+    span.setAttribute('gen_ai.input.messages', JSON.stringify([{ role: 'user', content: [{ type: 'text', text: prompt }] }]));
+
     span.setAttribute('session.id', sessionId);          // contract item 1
     span.setAttribute('gen_ai.prompt', prompt);          // contract item 2
-    // The managed AgentCore Evaluate API's claude_agent_sdk mapper reads
-    // OpenInference attributes, not gen_ai.* — without these it rejects the
-    // session ("no spans ... have model/tool/agent invocation details"). Emit
-    // both so the span works for Observability AND Evaluation.
+
+    // --- OpenInference attributes (managed Evaluate API's claude_agent_sdk
+    // mapper reads these; without them Evaluate rejects the session). ---
     span.setAttribute('openinference.span.kind', 'AGENT');
     span.setAttribute('input.value', prompt);
     span.setAttribute('llm.input_messages.0.message.role', 'user');
     span.setAttribute('llm.input_messages.0.message.content', prompt);
-    // Roled input message body — SAES role-aware recovery reads this shape.
-    emitEvent('gen_ai.user.message', { message: { role: 'user', content: [{ text: prompt }] } }, span);
   } catch {
     return NOOP_TRACE;
   }
 
+  let toolIdx = 0;
   return {
     recordTool(name, input, result) {
       try {
-        const ctx = span.spanContext();
-        const toolUseId = `tooluse_${Math.random().toString(16).slice(2, 18)}`;
-        // Converse-shaped toolUse / toolResult event bodies — the exact shape the
-        // SAES tool supplement recovers for non-Strands agents.
-        emitEvent('gen_ai.tool.request', {
-          content: [{ toolUse: { toolUseId, name, input } }],
-        }, span);
-        emitEvent('gen_ai.tool.result', {
-          content: [{ toolResult: { toolUseId, content: [{ text: typeof result === 'string' ? result : JSON.stringify(result) }] } }],
-        }, span);
-        void ctx;
+        // A real CHILD span (parented to the invocation) so the tool call shows
+        // as its own step in the trace UI. execute_tool + gen_ai.tool.* are what
+        // the UI/eval read; input.value/output.value mirror it for OpenInference.
+        const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+        const inputText = typeof input === 'string' ? input : JSON.stringify(input);
+        const callId = `tooluse_${Math.random().toString(16).slice(2, 18)}`;
+        const toolSpan = getTracer().startSpan(`execute_tool ${name}`, undefined, rootCtx);
+        toolSpan.setAttribute('gen_ai.operation.name', 'execute_tool');
+        toolSpan.setAttribute('gen_ai.tool.name', name);
+        toolSpan.setAttribute('gen_ai.tool.call.id', callId);
+        toolSpan.setAttribute('gen_ai.tool.call.arguments', inputText);
+        toolSpan.setAttribute('gen_ai.tool.call.result', resultText);
+        toolSpan.setAttribute('openinference.span.kind', 'TOOL');
+        toolSpan.setAttribute('tool.name', name);
+        toolSpan.setAttribute('input.value', inputText);
+        toolSpan.setAttribute('output.value', resultText);
+        toolSpan.setStatus({ code: SpanStatusCode.OK });
+        toolSpan.end();
+
+        // Also emit the Converse-shaped toolUse/toolResult events (SAES tool
+        // supplement / log-side recovery reads these).
+        emitEvent('gen_ai.tool.request', { content: [{ toolUse: { toolUseId: callId, name, input } }] }, span);
+        emitEvent('gen_ai.tool.result', { content: [{ toolResult: { toolUseId: callId, content: [{ text: resultText }] } }] }, span);
+        toolIdx++;
       } catch { /* ignore */ }
     },
     end(answer, opts) {
       try {
+        // Agent Traces UI output content.
+        span.setAttribute('gen_ai.output.messages', JSON.stringify([{ role: 'assistant', content: [{ type: 'text', text: answer }] }]));
         span.setAttribute('gen_ai.completion', answer);   // contract item 3
-        // OpenInference output attributes (see beginInvocation note).
-        span.setAttribute('output.value', answer);
+        span.setAttribute('output.value', answer);        // OpenInference
         span.setAttribute('llm.output_messages.0.message.role', 'assistant');
         span.setAttribute('llm.output_messages.0.message.content', answer);
         if (opts?.tokenUsage) {
           if (opts.tokenUsage.input_tokens != null) span.setAttribute('gen_ai.usage.input_tokens', opts.tokenUsage.input_tokens);
           if (opts.tokenUsage.output_tokens != null) span.setAttribute('gen_ai.usage.output_tokens', opts.tokenUsage.output_tokens);
         }
-        emitEvent('gen_ai.assistant.message', { message: { role: 'assistant', content: [{ text: answer }] } }, span);
         span.setStatus({ code: opts?.isError ? SpanStatusCode.ERROR : SpanStatusCode.OK });
       } catch { /* ignore */ } finally {
         try { span.end(); } catch { /* ignore */ }
