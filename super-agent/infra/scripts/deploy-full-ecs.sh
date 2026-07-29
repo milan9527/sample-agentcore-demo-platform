@@ -1067,6 +1067,35 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
     echo "WARNING: Runtime not READY after 5 minutes (status: $RT_STATUS). Continuing anyway."
   fi
 
+  # --- 4d-3: Enable tracing delivery (CloudWatch vended log delivery) ---
+  # Flips the runtime's console "Tracing" toggle to Enabled and delivers OTEL
+  # spans to X-Ray + app logs to a vended log group. The container-side ADOT
+  # export already sends spans to aws/spans; this wires the per-runtime delivery
+  # so the console/GenAI Observability shows the agent as traced. Idempotent:
+  # put-delivery-source/destination overwrite, create-delivery is skipped if it
+  # already exists. Non-fatal on error (observability via aws/spans still works).
+  echo "  [4d-3] Enabling tracing delivery for the runtime..."
+  RT_VENDED_LG="/aws/vendedlogs/bedrock-agentcore/${RUNTIME_ID}"
+  RT_VENDED_LG_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${RT_VENDED_LG}"
+  aws logs create-log-group --region "$REGION" --log-group-name "$RT_VENDED_LG" 2>/dev/null || true
+  aws logs put-delivery-source --region "$REGION" --name "${RUNTIME_ID}-logs-source" \
+    --log-type APPLICATION_LOGS --resource-arn "$RUNTIME_ARN" >/dev/null 2>&1 || true
+  aws logs put-delivery-source --region "$REGION" --name "${RUNTIME_ID}-traces-source" \
+    --log-type TRACES --resource-arn "$RUNTIME_ARN" >/dev/null 2>&1 || true
+  aws logs put-delivery-destination --region "$REGION" --name "${RUNTIME_ID}-logs-dest" \
+    --delivery-destination-type CWL \
+    --delivery-destination-configuration "destinationResourceArn=$RT_VENDED_LG_ARN" >/dev/null 2>&1 || true
+  aws logs put-delivery-destination --region "$REGION" --name "${RUNTIME_ID}-traces-dest" \
+    --delivery-destination-type XRAY >/dev/null 2>&1 || true
+  # create-delivery fails if one already exists for the source — that's fine.
+  aws logs create-delivery --region "$REGION" \
+    --delivery-source-name "${RUNTIME_ID}-logs-source" \
+    --delivery-destination-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:delivery-destination:${RUNTIME_ID}-logs-dest" >/dev/null 2>&1 || true
+  aws logs create-delivery --region "$REGION" \
+    --delivery-source-name "${RUNTIME_ID}-traces-source" \
+    --delivery-destination-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:delivery-destination:${RUNTIME_ID}-traces-dest" >/dev/null 2>&1 || true
+  echo "  Tracing delivery configured (traces → X-Ray, app logs → $RT_VENDED_LG)."
+
   # --- 4e: Update ECS task with AgentCore env vars ---
   echo "  [4e] Enabling AgentCore mode in ECS task..."
 
