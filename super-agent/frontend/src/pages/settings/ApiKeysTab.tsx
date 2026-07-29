@@ -19,6 +19,7 @@ const SCOPE_KEYS: { id: string; labelKey: string }[] = [
   { id: 'workflow:read', labelKey: 'apiKeys.scopeWorkflowRead' },
   { id: 'workflow:write', labelKey: 'apiKeys.scopeWorkflowWrite' },
   { id: 'model:invoke', labelKey: 'apiKeys.scopeModelInvoke' },
+  { id: 'mcp:tools', labelKey: 'apiKeys.scopeMcpTools' },
 ];
 
 // Scope descriptions for the code example panel (not localized — code examples stay in English)
@@ -78,6 +79,19 @@ print(message.content[0].text)`,
   -H "Authorization: Bearer {API_KEY}" \\
   -H "Content-Type: application/json" \\
   -d '{"variables": {"input": "value"}}'`,
+  },
+  'mcp:tools': {
+    title: 'MCP Server (Kiro / Amazon Q)',
+    description: 'Connect an MCP client to Super Agent. Add this to your MCP config (e.g. .kiro/settings/mcp.json) to chat with agents from your IDE.',
+    code: `{
+  "mcpServers": {
+    "super-agent": {
+      "url": "{BASE_URL}/v1/mcp",
+      "headers": { "Authorization": "Bearer {API_KEY}" },
+      "autoApprove": ["list_scopes", "list_agents", "chat_result", "get_workspace"]
+    }
+  }
+}`,
   },
 };
 

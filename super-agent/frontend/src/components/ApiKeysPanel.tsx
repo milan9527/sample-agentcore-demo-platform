@@ -122,6 +122,8 @@ export function ApiKeysPanel({ onClose }: ApiKeysPanelProps) {
     { id: 'workflow:execute', label: t('apiKeys.scopeWorkflowExecute'), description: t('apiKeys.scopeExecuteDesc') },
     { id: 'workflow:read', label: t('apiKeys.scopeWorkflowRead'), description: t('apiKeys.scopeReadDesc') },
     { id: 'workflow:write', label: t('apiKeys.scopeWorkflowWrite'), description: t('apiKeys.scopeWriteDesc') },
+    { id: 'model:invoke', label: t('apiKeys.scopeModelInvoke'), description: t('apiKeys.scopeModelInvokeDesc') },
+    { id: 'mcp:tools', label: t('apiKeys.scopeMcpTools'), description: t('apiKeys.scopeMcpToolsDesc') },
   ];
 
   return (

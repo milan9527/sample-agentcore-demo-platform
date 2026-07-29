@@ -872,33 +872,43 @@ export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
 
       try {
         const { config: appConfig } = await import('../config/index.js');
-        let files;
+        type WsNode = import('../services/workspace-manager.js').WorkspaceFileNode;
+        let files: WsNode[] | null | undefined;
         if (appConfig.agentRuntime === 'agentcore') {
-          // Local-first strategy: return local workspace instantly if available,
-          // then let subsequent polls pick up the authoritative AgentCore/S3 data.
-          const localFiles = await workspaceManager.listWorkspaceFiles(
+          // In agentcore mode the authoritative workspace lives in the AgentCore
+          // microVM (while active) and in S3 (the synced snapshot). The backend's
+          // LOCAL disk only holds the scaffold staged at session-prep time
+          // (CLAUDE.md, .claude/, skills) — it never receives the files the agent
+          // produces in the container, so it must NOT short-circuit the lookup.
+          //
+          // Order: live container → S3 snapshot → local scaffold (last resort).
+          // Whichever yields the most files wins, so agent-produced files (docx,
+          // reports, etc.) that only exist in the container/S3 always show up.
+          let containerFiles: WsNode[] | null | undefined;
+          try {
+            const entries = await agentCoreCommandService.listWorkspaceFiles(session.id);
+            containerFiles = buildTreeFromEntries(entries);
+          } catch {
+            // No active microVM (idle) or command error — fall through to S3.
+          }
+
+          const s3Files = await workspaceManager.listWorkspaceFilesFromS3(
             request.user!.orgId,
             scopeIdForPath,
             session.id,
           );
 
-          if (localFiles && localFiles.length > 0) {
-            // Local workspace exists — return immediately with a short cache TTL.
-            // The next poll (after cache expires) will try AgentCore for fresh data.
-            const wsPath = workspaceManager.getSessionWorkspacePath(
-              request.user!.orgId, scopeIdForPath, session.id,
-            );
-            setCachedWorkspaceFiles(id, localFiles, wsPath);
-            return reply.status(200).send({ files: localFiles, workspacePath: wsPath });
-          }
+          // Prefer the source with the most files: an active container is
+          // freshest, but a fresh/empty microVM returns fewer files than the S3
+          // snapshot of a previous run — in that case S3 wins.
+          const countNodes = (nodes?: WsNode[] | null): number =>
+            (nodes ?? []).reduce((n, x) => n + (x.type === 'directory' ? countNodes(x.children) : 1), 0);
+          files = (countNodes(containerFiles) >= countNodes(s3Files)) ? containerFiles : s3Files;
 
-          // No local workspace — try AgentCore container, then S3
-          try {
-            const entries = await agentCoreCommandService.listWorkspaceFiles(session.id);
-            files = buildTreeFromEntries(entries);
-          } catch (cmdErr) {
-            // Expected when session has no active microVM (idle >15min or no messages yet).
-            files = await workspaceManager.listWorkspaceFilesFromS3(
+          // Last resort: if neither container nor S3 returned anything, fall back
+          // to the local scaffold so a brand-new session still shows something.
+          if (!files || files.length === 0) {
+            files = await workspaceManager.listWorkspaceFiles(
               request.user!.orgId,
               scopeIdForPath,
               session.id,

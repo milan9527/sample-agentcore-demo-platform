@@ -809,13 +809,20 @@ if [ "$SKIP_AGENTCORE" = false ]; then
           \"Sid\": \"CodeInterpreter\",
           \"Effect\": \"Allow\",
           \"Action\": [
+            \"bedrock-agentcore:CreateCodeInterpreter\",
+            \"bedrock-agentcore:ListCodeInterpreters\",
+            \"bedrock-agentcore:GetCodeInterpreter\",
+            \"bedrock-agentcore:DeleteCodeInterpreter\",
             \"bedrock-agentcore:StartCodeInterpreterSession\",
             \"bedrock-agentcore:InvokeCodeInterpreter\",
             \"bedrock-agentcore:StopCodeInterpreterSession\",
             \"bedrock-agentcore:GetCodeInterpreterSession\",
             \"bedrock-agentcore:ListCodeInterpreterSessions\"
           ],
-          \"Resource\": \"arn:aws:bedrock-agentcore:*:*:code-interpreter/*\"
+          \"Resource\": [
+            \"arn:aws:bedrock-agentcore:*:*:code-interpreter/*\",
+            \"arn:aws:bedrock-agentcore:*:*:code-interpreter-custom/*\"
+          ]
         }
       ]
     }"
@@ -920,6 +927,58 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   AGENTCORE_BROWSER_ID="${BROWSER_ID:-}"
   echo "  AGENTCORE_BROWSER_ID=$AGENTCORE_BROWSER_ID"
 
+  # --- 4c-3: Create AgentCore Code Interpreter ---
+  # The agentcore MCP tools server (awslabs.amazon-bedrock-agentcore-mcp-server)
+  # reads CODE_INTERPRETER_IDENTIFIER to pick the sandbox. We provision a custom
+  # code interpreter so the agent has a dedicated one; if creation fails the
+  # backend falls back to the AWS-managed aws.codeinterpreter.v1 default.
+  echo "  [4c-3] Ensuring AgentCore Code Interpreter..."
+  CI_NAME="${STACK_NAME}_code_interpreter"
+  CI_ID=$(aws bedrock-agentcore-control list-code-interpreters --region "$REGION" \
+    --query "codeInterpreterSummaries[?name=='${CI_NAME}'].codeInterpreterId" \
+    --output text 2>/dev/null || echo "")
+
+  if [ -z "$CI_ID" ] || [ "$CI_ID" = "None" ]; then
+    echo "  Creating new code interpreter: $CI_NAME"
+    for attempt in 1 2 3 4 5; do
+      CI_OUTPUT=$(aws bedrock-agentcore-control create-code-interpreter \
+        --name "$CI_NAME" \
+        --execution-role-arn "$ROLE_ARN" \
+        --network-configuration '{"networkMode":"PUBLIC"}' \
+        --description "Code interpreter for $STACK_NAME" \
+        --region "$REGION" --output json 2>&1) || true
+      CI_ID=$(echo "$CI_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['codeInterpreterId'])" 2>/dev/null || echo "")
+      if [ -n "$CI_ID" ] && [ "$CI_ID" != "None" ]; then
+        echo "  Code interpreter created: $CI_ID"
+        break
+      fi
+      echo "  Attempt $attempt/5 to create code interpreter failed (IAM may still be propagating), retrying in 10s..."
+      echo "    detail: $(echo "$CI_OUTPUT" | head -c 200)"
+      CI_ID=""
+      sleep 10
+    done
+    if [ -z "$CI_ID" ]; then
+      echo "  WARNING: Could not create code interpreter after retries; will fall back to managed aws.codeinterpreter.v1. Last output: $CI_OUTPUT"
+    fi
+  else
+    echo "  Code interpreter already exists: $CI_ID"
+  fi
+
+  # Wait for code interpreter to be READY
+  if [ -n "$CI_ID" ] && [ "$CI_ID" != "None" ]; then
+    echo "  Waiting for code interpreter to be READY..."
+    for i in $(seq 1 12); do
+      CI_STATUS=$(aws bedrock-agentcore-control get-code-interpreter \
+        --code-interpreter-id "$CI_ID" --region "$REGION" \
+        --query 'status' --output text 2>/dev/null || echo "UNKNOWN")
+      [ "$CI_STATUS" = "READY" ] && echo "  Code interpreter is READY." && break
+      echo "  Attempt $i/12 - status: $CI_STATUS, waiting 5s..."
+      sleep 5
+    done
+  fi
+  AGENTCORE_CODE_INTERPRETER_ID="${CI_ID:-}"
+  echo "  AGENTCORE_CODE_INTERPRETER_ID=$AGENTCORE_CODE_INTERPRETER_ID"
+
   # --- 4d: Create or Update AgentCore Runtime ---
   echo "  [4d] Creating/updating AgentCore Runtime..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
@@ -1000,6 +1059,9 @@ env['AGENTCORE_WORKSPACE_S3_BUCKET'] = '$WORKSPACE_BUCKET_NAME'
 browser_id = '$AGENTCORE_BROWSER_ID'
 if browser_id:
     env['AGENTCORE_BROWSER_IDENTIFIER'] = browser_id
+ci_id = '$AGENTCORE_CODE_INTERPRETER_ID'
+if ci_id:
+    env['AGENTCORE_CODE_INTERPRETER_IDENTIFIER'] = ci_id
 container['environment'] = [{'name': k, 'value': v} for k, v in env.items()]
 
 # Build register-task-definition input (remove read-only fields)
