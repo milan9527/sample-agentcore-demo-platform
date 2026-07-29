@@ -149,6 +149,10 @@ export function beginInvocation(sessionId: string, prompt: string): InvocationTr
         const id = callId || `tooluse_${Math.random().toString(16).slice(2, 18)}`;
         const toolSpan = getTracer().startSpan(`execute_tool ${name}`, undefined, rootCtx);
         toolSpan.setAttribute('gen_ai.operation.name', 'execute_tool');
+        // Child spans don't inherit the root's attributes; stamp session.id here
+        // too so tool spans are queryable by session and group correctly for
+        // SESSION-level evaluation (trace UI groups by traceId regardless).
+        toolSpan.setAttribute('session.id', sessionId);
         toolSpan.setAttribute('gen_ai.tool.name', name);
         toolSpan.setAttribute('gen_ai.tool.call.id', id);
         toolSpan.setAttribute('gen_ai.tool.call.arguments', inputText);
