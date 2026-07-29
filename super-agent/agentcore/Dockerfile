@@ -56,4 +56,10 @@ WORKDIR /workspace
 # AgentCore protocol requires port 8080
 EXPOSE 8080
 
-CMD ["node", "/app/dist/index.js"]
+# Preload the AWS Distro for OpenTelemetry (ADOT) register hook BEFORE the ESM
+# app loads. This CJS hook installs the global OTEL providers + the SigV4-signed
+# OTLP→CloudWatch export pipeline (gated on AGENT_OBSERVABILITY_ENABLED + OTEL_*
+# env vars set by the deploy script). Our ESM app then emits contract-compliant
+# spans/events through the global OTEL API. --require works with ESM apps; the
+# hook itself is CommonJS so it coexists with the ESM-only Claude Agent SDK.
+CMD ["node", "--require", "@aws/aws-distro-opentelemetry-node-autoinstrumentation/register", "/app/dist/index.js"]

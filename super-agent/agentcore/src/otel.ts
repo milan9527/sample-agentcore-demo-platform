@@ -27,52 +27,30 @@ import { logs, type Logger } from '@opentelemetry/api-logs';
 const SCOPE = 'claudesdk.agent';
 const OBSERVABILITY_ENABLED = process.env.AGENT_OBSERVABILITY_ENABLED === 'true';
 
-let initialized = false;
-
 /**
- * Initialize the global tracer + logger providers with OTLP export.
- * Idempotent. Safe to call when observability is disabled (becomes a no-op).
- * Providers are created dynamically so the OTEL SDK is only loaded when needed.
+ * Observability setup is NOT done here. The AWS Distro for OpenTelemetry (ADOT)
+ * Node package is preloaded via the container entrypoint:
+ *
+ *   node --require @aws/aws-distro-opentelemetry-node-autoinstrumentation/register dist/index.js
+ *
+ * That CJS `register` hook (loaded before this ESM app) installs the global
+ * TracerProvider + LoggerProvider and the SigV4-signed OTLP export pipeline that
+ * delivers to CloudWatch (the /aws/bedrock-agentcore/runtimes/<id> log group),
+ * reading AGENT_OBSERVABILITY_ENABLED + OTEL_* from the environment.
+ *
+ * Why not a self-built NodeTracerProvider: there is no standalone OTLP collector
+ * on AgentCore Runtime ("ADOT Collector not supported for agent observability")
+ * and plain OTEL-JS exporters can't SigV4-sign to CloudWatch. ADOT's register
+ * provides both. It's CJS (works via --require) so it coexists with our ESM app
+ * and the ESM-only Claude Agent SDK.
+ *
+ * This module therefore only EMITS spans/events through the global OTEL API,
+ * which resolves to whatever provider `register` installed (or a no-op provider
+ * when observability is disabled / register wasn't preloaded).
  */
 export async function initOtel(): Promise<void> {
-  if (initialized || !OBSERVABILITY_ENABLED) return;
-  initialized = true;
-
-  try {
-    const { defaultResource, resourceFromAttributes } = await import('@opentelemetry/resources');
-    const { NodeTracerProvider } = await import('@opentelemetry/sdk-trace-node');
-    const { BatchSpanProcessor } = await import('@opentelemetry/sdk-trace-base');
-    const { OTLPTraceExporter } = await import('@opentelemetry/exporter-trace-otlp-proto');
-    const {
-      LoggerProvider,
-      BatchLogRecordProcessor,
-    } = await import('@opentelemetry/sdk-logs');
-    const { OTLPLogExporter } = await import('@opentelemetry/exporter-logs-otlp-proto');
-
-    // service.name / aws.log.group.names also come from OTEL_RESOURCE_ATTRIBUTES
-    // set on the runtime container (merged into the default resource); we add a
-    // sensible default service.name for the local/unset case.
-    const resource = defaultResource().merge(
-      resourceFromAttributes({ 'service.name': process.env.OTEL_SERVICE_NAME ?? 'super-agent-runtime' }),
-    );
-
-    // OTEL 2.x: processors are passed to the constructor (no addSpanProcessor).
-    const tracerProvider = new NodeTracerProvider({
-      resource,
-      spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter())],
-    });
-    tracerProvider.register();
-
-    const loggerProvider = new LoggerProvider({
-      resource,
-      processors: [new BatchLogRecordProcessor(new OTLPLogExporter())],
-    });
-    logs.setGlobalLoggerProvider(loggerProvider);
-
-    console.log('[otel] Observability enabled — exporting spans + events via OTLP');
-  } catch (err) {
-    // Never let telemetry setup break the agent run.
-    console.warn('[otel] init failed, continuing without telemetry:', err instanceof Error ? err.message : err);
+  if (OBSERVABILITY_ENABLED) {
+    console.log('[otel] Observability enabled — emitting spans/events via the ADOT global provider');
   }
 }
 
