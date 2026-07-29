@@ -823,6 +823,21 @@ if [ "$SKIP_AGENTCORE" = false ]; then
             \"arn:aws:bedrock-agentcore:*:*:code-interpreter/*\",
             \"arn:aws:bedrock-agentcore:*:*:code-interpreter-custom/*\"
           ]
+        },
+        {
+          \"Sid\": \"Observability\",
+          \"Effect\": \"Allow\",
+          \"Action\": [
+            \"logs:CreateLogGroup\",
+            \"logs:CreateLogStream\",
+            \"logs:PutLogEvents\",
+            \"logs:DescribeLogStreams\",
+            \"logs:DescribeLogGroups\",
+            \"xray:PutTraceSegments\",
+            \"xray:PutTelemetryRecords\",
+            \"cloudwatch:PutMetricData\"
+          ],
+          \"Resource\": \"*\"
         }
       ]
     }"
@@ -982,19 +997,25 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   # --- 4d: Create or Update AgentCore Runtime ---
   echo "  [4d] Creating/updating AgentCore Runtime..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
+  RUNTIME_NAME="${STACK_NAME}Runtime"
 
   # Build environment variables JSON.
   # CLAUDE_CODE_DISABLE_THINKING=1: Opus 4.8 (and other newer models) reject the
   # legacy `thinking.type.enabled` param the CLI sends on Bedrock; disabling
   # thinking keeps the runtime compatible across models.
   ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-8\",\"CLAUDE_CODE_DISABLE_THINKING\":\"1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
+  # AgentCore Observability: the Node runtime emits OTEL spans/events (SAES/eval
+  # contract) from agent-runner via src/otel.ts. When hosted on AgentCore
+  # Runtime, the platform provides an OTLP receiver on localhost:4318 and
+  # forwards spans/logs to CloudWatch (the /aws/bedrock-agentcore/runtimes/<id>
+  # log group). We only need to switch our exporter on and point it there.
+  ENV_VARS="$ENV_VARS,\"AGENT_OBSERVABILITY_ENABLED\":\"true\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/protobuf\",\"OTEL_EXPORTER_OTLP_ENDPOINT\":\"http://localhost:4318\",\"OTEL_SERVICE_NAME\":\"${RUNTIME_NAME}\",\"OTEL_RESOURCE_ATTRIBUTES\":\"service.name=${RUNTIME_NAME}\""
   if [ -n "$BEDROCK_AK" ] && [ -n "$BEDROCK_SK" ]; then
     ENV_VARS="$ENV_VARS,\"AWS_ACCESS_KEY_ID\":\"$BEDROCK_AK\",\"AWS_SECRET_ACCESS_KEY\":\"$BEDROCK_SK\""
   fi
   ENV_VARS="$ENV_VARS}"
 
-  # Try to find existing runtime (stack-scoped name)
-  RUNTIME_NAME="${STACK_NAME}Runtime"
+  # Try to find existing runtime (stack-scoped name; RUNTIME_NAME set above)
   RUNTIME_ID=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
     --query "agentRuntimes[?agentRuntimeName=='${RUNTIME_NAME}'].agentRuntimeId" \
     --output text 2>/dev/null || echo "")

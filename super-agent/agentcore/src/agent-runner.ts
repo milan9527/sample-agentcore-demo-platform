@@ -14,6 +14,7 @@ import { syncWorkspaceToS3 } from './workspace-sync.js';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import type { AgentPayload, AgentEvent, ContentBlock } from './types.js';
+import { beginInvocation } from './otel.js';
 
 const DEFAULT_TOOLS = [
   'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -355,11 +356,17 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
     console.log(`[agent-runner] S3 sync hooks registered for s3://${bucket}/${prefix}`);
   }
 
+  // OTEL: one root span per invocation (= one trace per turn), carrying the
+  // SAES/AgentCore-Evaluation contract fields. Session correlation uses the
+  // AgentCore session id (chat_session_id / session_id from the backend).
+  const otelSessionId = payload.chat_session_id ?? payload.session_id ?? 'unknown-session';
+
   // Strategy: try Claude Code session resume first (fast, native history).
   // If resume fails (microVM was recycled), fallback to history-injected prompt.
   if (payload.session_id) {
     try {
-      yield* runWithOptions(payload.prompt, { ...baseOptions, resume: payload.session_id });
+      yield* runTraced(otelSessionId, payload.prompt,
+        runWithOptions(payload.prompt, { ...baseOptions, resume: payload.session_id }));
       return;
     } catch (err) {
       console.log(`[agent-runner] Session resume failed (${err}), falling back to history injection`);
@@ -367,7 +374,63 @@ export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEven
   }
 
   const prompt = buildContextualPrompt(payload);
-  yield* runWithOptions(prompt, baseOptions);
+  // Trace with the user's real prompt (not the history-augmented one) so the
+  // evaluated prompt matches what the user actually asked.
+  yield* runTraced(otelSessionId, payload.prompt, runWithOptions(prompt, baseOptions));
+}
+
+/**
+ * Wrap an agent event stream with an OTEL invocation trace. Observes the events
+ * as they pass through — capturing tool calls from `assistant` blocks and the
+ * final answer + token usage from `result` — then finalizes the contract span.
+ * Pass-through: yields every event unchanged.
+ */
+async function* runTraced(
+  sessionId: string,
+  prompt: string,
+  stream: AsyncGenerator<AgentEvent>,
+): AsyncGenerator<AgentEvent> {
+  const inv = beginInvocation(sessionId, prompt);
+  // Track tool_use id → {name,input} so we can pair a tool result on the next
+  // assistant/user turn. The SDK surfaces tool_use in assistant content and the
+  // tool_result in a subsequent block.
+  const pendingTools = new Map<string, { name: string; input: unknown }>();
+  let finalAnswer = '';
+  let isError = false;
+  let tokenUsage: Record<string, number> | undefined;
+  try {
+    for await (const event of stream) {
+      if (event.type === 'assistant' && Array.isArray(event.content)) {
+        for (const block of event.content) {
+          if (block.type === 'tool_use' && block.id) {
+            pendingTools.set(block.id, { name: block.name ?? 'unknown', input: block.input });
+          } else if (block.type === 'tool_result' && block.tool_use_id) {
+            const call = pendingTools.get(block.tool_use_id);
+            if (call) {
+              inv.recordTool(call.name, call.input, block.content ?? '');
+              pendingTools.delete(block.tool_use_id);
+            }
+          }
+        }
+      } else if (event.type === 'result') {
+        if (typeof event.result === 'string') finalAnswer = event.result;
+        if (event.is_error) isError = true;
+        if (event.token_usage) {
+          tokenUsage = {
+            input_tokens: event.token_usage.input_tokens,
+            output_tokens: event.token_usage.output_tokens,
+          };
+        }
+      }
+      yield event;
+    }
+  } catch (err) {
+    isError = true;
+    finalAnswer = finalAnswer || `error: ${err instanceof Error ? err.message : String(err)}`;
+    throw err;
+  } finally {
+    inv.end(finalAnswer, { isError, tokenUsage });
+  }
 }
 
 // ---------------------------------------------------------------------------

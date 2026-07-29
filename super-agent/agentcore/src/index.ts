@@ -22,6 +22,7 @@ import { S3Client } from '@aws-sdk/client-s3';
 import { runAgent } from './agent-runner.js';
 import { restoreWorkspaceFromS3 } from './workspace-sync.js';
 import { createGitBaseline } from './agent-runner.js';
+import { initOtel } from './otel.js';
 import type { AgentPayload, AgentEvent } from './types.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -139,6 +140,10 @@ const server = http.createServer(async (req, res) => {
     }
   }
 });
+
+// Initialize OpenTelemetry (no-op unless AGENT_OBSERVABILITY_ENABLED=true).
+// Fire-and-forget: sets up global providers before the first invocation.
+void initOtel();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[agentcore-runner] Listening on 0.0.0.0:${PORT}`);
