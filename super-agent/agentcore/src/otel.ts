@@ -86,8 +86,15 @@ function emitEvent(name: string, body: unknown, span?: Span): void {
  * attach to it. Returned by beginInvocation; caller must call end().
  */
 export interface InvocationTrace {
-  /** Record a tool call: emits Converse-shaped toolUse/toolResult event bodies. */
-  recordTool(name: string, input: unknown, result: unknown): void;
+  /**
+   * Record a tool call as a child span. Called when the tool_use block is seen
+   * (root span still active). `callId` is the SDK's tool_use id — pass it so a
+   * later tool_result can be matched via recordToolResult. `result` is usually
+   * '' at this point (results arrive later / out of band).
+   */
+  recordTool(name: string, input: unknown, result: unknown, callId?: string): void;
+  /** Attach a tool's result to its already-recorded span (matched by callId). */
+  recordToolResult(callId: string, result: unknown): void;
   /** Finalize with the assistant's final answer + optional token usage. */
   end(answer: string, opts?: { isError?: boolean; tokenUsage?: Record<string, number> }): void;
 }
@@ -128,38 +135,61 @@ export function beginInvocation(sessionId: string, prompt: string): InvocationTr
     return NOOP_TRACE;
   }
 
-  let toolIdx = 0;
+    // Open tool spans awaiting their result (keyed by the SDK tool_use id).
+    // Kept open so a later tool_result can attach; closed in end() otherwise.
+    const openToolSpans = new Map<string, Span>();
   return {
-    recordTool(name, input, result) {
+    recordTool(name, input, result, callId) {
       try {
-        // A real CHILD span (parented to the invocation) so the tool call shows
-        // as its own step in the trace UI. execute_tool + gen_ai.tool.* are what
-        // the UI/eval read; input.value/output.value mirror it for OpenInference.
-        const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+        // A real CHILD span (parented to the invocation via rootCtx) so the tool
+        // call shows as its own step in the trace UI. execute_tool + gen_ai.tool.*
+        // are what the UI/eval read; input/output.value mirror it for OpenInference.
         const inputText = typeof input === 'string' ? input : JSON.stringify(input);
-        const callId = `tooluse_${Math.random().toString(16).slice(2, 18)}`;
+        const resultText = result == null || result === '' ? '' : (typeof result === 'string' ? result : JSON.stringify(result));
+        const id = callId || `tooluse_${Math.random().toString(16).slice(2, 18)}`;
         const toolSpan = getTracer().startSpan(`execute_tool ${name}`, undefined, rootCtx);
         toolSpan.setAttribute('gen_ai.operation.name', 'execute_tool');
         toolSpan.setAttribute('gen_ai.tool.name', name);
-        toolSpan.setAttribute('gen_ai.tool.call.id', callId);
+        toolSpan.setAttribute('gen_ai.tool.call.id', id);
         toolSpan.setAttribute('gen_ai.tool.call.arguments', inputText);
-        toolSpan.setAttribute('gen_ai.tool.call.result', resultText);
         toolSpan.setAttribute('openinference.span.kind', 'TOOL');
         toolSpan.setAttribute('tool.name', name);
         toolSpan.setAttribute('input.value', inputText);
+        if (resultText) {
+          toolSpan.setAttribute('gen_ai.tool.call.result', resultText);
+          toolSpan.setAttribute('output.value', resultText);
+        }
+        emitEvent('gen_ai.tool.request', { content: [{ toolUse: { toolUseId: id, name, input } }] }, span);
+        if (resultText) {
+          emitEvent('gen_ai.tool.result', { content: [{ toolResult: { toolUseId: id, content: [{ text: resultText }] } }] }, span);
+          toolSpan.setStatus({ code: SpanStatusCode.OK });
+          toolSpan.end();
+        } else {
+          // Leave open for a possible recordToolResult; end() closes it if not.
+          openToolSpans.set(id, toolSpan);
+        }
+      } catch { /* ignore */ }
+    },
+    recordToolResult(callId, result) {
+      try {
+        const toolSpan = openToolSpans.get(callId);
+        if (!toolSpan) return;
+        const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+        toolSpan.setAttribute('gen_ai.tool.call.result', resultText);
         toolSpan.setAttribute('output.value', resultText);
         toolSpan.setStatus({ code: SpanStatusCode.OK });
         toolSpan.end();
-
-        // Also emit the Converse-shaped toolUse/toolResult events (SAES tool
-        // supplement / log-side recovery reads these).
-        emitEvent('gen_ai.tool.request', { content: [{ toolUse: { toolUseId: callId, name, input } }] }, span);
+        openToolSpans.delete(callId);
         emitEvent('gen_ai.tool.result', { content: [{ toolResult: { toolUseId: callId, content: [{ text: resultText }] } }] }, span);
-        toolIdx++;
       } catch { /* ignore */ }
     },
     end(answer, opts) {
       try {
+        // Close any tool spans whose result never arrived.
+        for (const ts of openToolSpans.values()) {
+          try { ts.setStatus({ code: SpanStatusCode.OK }); ts.end(); } catch { /* ignore */ }
+        }
+        openToolSpans.clear();
         // Agent Traces UI output content.
         span.setAttribute('gen_ai.output.messages', JSON.stringify([{ role: 'assistant', content: [{ type: 'text', text: answer }] }]));
         span.setAttribute('gen_ai.completion', answer);   // contract item 3
@@ -180,5 +210,6 @@ export function beginInvocation(sessionId: string, prompt: string): InvocationTr
 
 const NOOP_TRACE: InvocationTrace = {
   recordTool() { /* no-op */ },
+  recordToolResult() { /* no-op */ },
   end() { /* no-op */ },
 };

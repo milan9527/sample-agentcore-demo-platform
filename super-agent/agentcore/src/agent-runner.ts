@@ -398,13 +398,17 @@ async function* runTraced(
   // (some tools echo it in assistant content), enrich the recorded call.
   // toolUseId → {name, input} captured from the assistant's tool_use block, and
   // whether we've already recorded a span for it. The Claude Agent SDK returns
-  // tool RESULTS in a `user`-role message that runWithOptions doesn't surface,
-  // so we can't reliably pair result↔call. Strategy: remember the call on
-  // tool_use; if a tool_result block shows up (rare, in assistant content),
-  // record with the result; otherwise flush all unresolved calls at the end
-  // (result unknown). Either way every tool call yields a span.
-  const pending = new Map<string, { name: string; input: unknown }>();
-  const done = new Set<string>();
+  // tool RESULTS come back in a `user`-role message that runWithOptions doesn't
+  // surface, so we can't reliably pair result↔call. Record the tool span
+  // IMMEDIATELY when the tool_use block is seen — at that point we're mid-stream
+  // and the invocation root span is active/recording, so the child span attaches
+  // correctly. (Deferring to an end-of-stream flush proved unreliable: the
+  // generator's finally can run after the root span's context is no longer
+  // active, yielding non-recording tool spans / empty trace ids.) If a
+  // tool_result block later appears in assistant content, update the recorded
+  // span's result; otherwise the span carries args only, which still shows the
+  // tool step + selection in the trace.
+  const seen = new Map<string, string>(); // tool_use_id → tool name (dedupe)
   let finalAnswer = '';
   let isError = false;
   let tokenUsage: Record<string, number> | undefined;
@@ -412,14 +416,11 @@ async function* runTraced(
     for await (const event of stream) {
       if (event.type === 'assistant' && Array.isArray(event.content)) {
         for (const block of event.content) {
-          if (block.type === 'tool_use' && block.id) {
-            pending.set(block.id, { name: block.name ?? 'unknown', input: block.input });
-          } else if (block.type === 'tool_result' && block.tool_use_id) {
-            const call = pending.get(block.tool_use_id);
-            if (call && !done.has(block.tool_use_id)) {
-              inv.recordTool(call.name, call.input, block.content ?? '');
-              done.add(block.tool_use_id);
-            }
+          if (block.type === 'tool_use' && block.id && !seen.has(block.id)) {
+            seen.set(block.id, block.name ?? 'unknown');
+            inv.recordTool(block.name ?? 'unknown', block.input, '', block.id);
+          } else if (block.type === 'tool_result' && block.tool_use_id && seen.has(block.tool_use_id)) {
+            inv.recordToolResult(block.tool_use_id, block.content ?? '');
           }
         }
       } else if (event.type === 'result') {
@@ -439,12 +440,6 @@ async function* runTraced(
     finalAnswer = finalAnswer || `error: ${err instanceof Error ? err.message : String(err)}`;
     throw err;
   } finally {
-    // Flush any tool_use calls whose result never arrived (the common case,
-    // since tool results come back in unsurfaced user messages) so each tool
-    // still shows as a span in the trace.
-    for (const [id, call] of pending) {
-      if (!done.has(id)) inv.recordTool(call.name, call.input, '');
-    }
     inv.end(finalAnswer, { isError, tokenUsage });
   }
 }
