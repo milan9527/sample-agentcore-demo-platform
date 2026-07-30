@@ -823,6 +823,21 @@ if [ "$SKIP_AGENTCORE" = false ]; then
             \"arn:aws:bedrock-agentcore:*:*:code-interpreter/*\",
             \"arn:aws:bedrock-agentcore:*:*:code-interpreter-custom/*\"
           ]
+        },
+        {
+          \"Sid\": \"Observability\",
+          \"Effect\": \"Allow\",
+          \"Action\": [
+            \"logs:CreateLogGroup\",
+            \"logs:CreateLogStream\",
+            \"logs:PutLogEvents\",
+            \"logs:DescribeLogStreams\",
+            \"logs:DescribeLogGroups\",
+            \"xray:PutTraceSegments\",
+            \"xray:PutTelemetryRecords\",
+            \"cloudwatch:PutMetricData\"
+          ],
+          \"Resource\": \"*\"
         }
       ]
     }"
@@ -982,19 +997,32 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   # --- 4d: Create or Update AgentCore Runtime ---
   echo "  [4d] Creating/updating AgentCore Runtime..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
+  RUNTIME_NAME="${STACK_NAME}Runtime"
 
   # Build environment variables JSON.
   # CLAUDE_CODE_DISABLE_THINKING=1: Opus 4.8 (and other newer models) reject the
   # legacy `thinking.type.enabled` param the CLI sends on Bedrock; disabling
   # thinking keeps the runtime compatible across models.
   ENV_VARS="{\"CLAUDE_CODE_USE_BEDROCK\":\"1\",\"ANTHROPIC_MODEL\":\"global.anthropic.claude-opus-4-8\",\"CLAUDE_CODE_DISABLE_THINKING\":\"1\",\"AWS_REGION\":\"$REGION\",\"WORKSPACE_S3_REGION\":\"$REGION\""
+  # AgentCore Observability: the Node runtime emits OTEL spans/events (SAES/eval
+  # contract) from agent-runner via src/otel.ts, exported by the ADOT register
+  # hook preloaded in the Dockerfile CMD. ADOT (when AGENT_OBSERVABILITY_ENABLED
+  # =true) auto-configures the SigV4-signed OTLP export to the AWS endpoints
+  # (https://xray.<region>.../v1/traces, https://logs.<region>.../v1/logs) and
+  # sets OTEL_TRACES_EXPORTER + sampler itself.
+  # IMPORTANT: do NOT set OTEL_EXPORTER_OTLP_ENDPOINT — ADOT only auto-configures
+  # the AWS endpoints when that var is UNSET (register.js:110). Setting it (e.g.
+  # to localhost:4318) suppresses auto-config and spans go nowhere.
+  # OTEL_RESOURCE_ATTRIBUTES carries the per-agent log group so spans/logs land
+  # in /aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT (id filled in after
+  # the runtime exists — see the post-create env sync below).
+  ENV_VARS="$ENV_VARS,\"AGENT_OBSERVABILITY_ENABLED\":\"true\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/protobuf\",\"OTEL_SERVICE_NAME\":\"${RUNTIME_NAME}\",\"OTEL_RESOURCE_ATTRIBUTES\":\"service.name=${RUNTIME_NAME}\""
   if [ -n "$BEDROCK_AK" ] && [ -n "$BEDROCK_SK" ]; then
     ENV_VARS="$ENV_VARS,\"AWS_ACCESS_KEY_ID\":\"$BEDROCK_AK\",\"AWS_SECRET_ACCESS_KEY\":\"$BEDROCK_SK\""
   fi
   ENV_VARS="$ENV_VARS}"
 
-  # Try to find existing runtime (stack-scoped name)
-  RUNTIME_NAME="${STACK_NAME}Runtime"
+  # Try to find existing runtime (stack-scoped name; RUNTIME_NAME set above)
   RUNTIME_ID=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
     --query "agentRuntimes[?agentRuntimeName=='${RUNTIME_NAME}'].agentRuntimeId" \
     --output text 2>/dev/null || echo "")
@@ -1037,6 +1065,68 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
 
   if [ "$RT_STATUS" != "READY" ]; then
     echo "WARNING: Runtime not READY after 5 minutes (status: $RT_STATUS). Continuing anyway."
+  fi
+
+  # --- 4d-3: Enable tracing delivery (CloudWatch vended log delivery) ---
+  # Flips the runtime's console "Tracing" toggle to Enabled and delivers OTEL
+  # spans to X-Ray + app logs to a vended log group. The container-side ADOT
+  # export already sends spans to aws/spans; this wires the per-runtime delivery
+  # so the console/GenAI Observability shows the agent as traced. Idempotent:
+  # put-delivery-source/destination overwrite, create-delivery is skipped if it
+  # already exists. Non-fatal on error (observability via aws/spans still works).
+  echo "  [4d-3] Enabling tracing delivery for the runtime..."
+  RT_VENDED_LG="/aws/vendedlogs/bedrock-agentcore/${RUNTIME_ID}"
+  RT_VENDED_LG_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${RT_VENDED_LG}"
+  aws logs create-log-group --region "$REGION" --log-group-name "$RT_VENDED_LG" 2>/dev/null || true
+  aws logs put-delivery-source --region "$REGION" --name "${RUNTIME_ID}-logs-source" \
+    --log-type APPLICATION_LOGS --resource-arn "$RUNTIME_ARN" >/dev/null 2>&1 || true
+  aws logs put-delivery-source --region "$REGION" --name "${RUNTIME_ID}-traces-source" \
+    --log-type TRACES --resource-arn "$RUNTIME_ARN" >/dev/null 2>&1 || true
+  aws logs put-delivery-destination --region "$REGION" --name "${RUNTIME_ID}-logs-dest" \
+    --delivery-destination-type CWL \
+    --delivery-destination-configuration "destinationResourceArn=$RT_VENDED_LG_ARN" >/dev/null 2>&1 || true
+  aws logs put-delivery-destination --region "$REGION" --name "${RUNTIME_ID}-traces-dest" \
+    --delivery-destination-type XRAY >/dev/null 2>&1 || true
+  # create-delivery fails if one already exists for the source — that's fine.
+  aws logs create-delivery --region "$REGION" \
+    --delivery-source-name "${RUNTIME_ID}-logs-source" \
+    --delivery-destination-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:delivery-destination:${RUNTIME_ID}-logs-dest" >/dev/null 2>&1 || true
+  aws logs create-delivery --region "$REGION" \
+    --delivery-source-name "${RUNTIME_ID}-traces-source" \
+    --delivery-destination-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:delivery-destination:${RUNTIME_ID}-traces-dest" >/dev/null 2>&1 || true
+  echo "  Tracing delivery configured (traces → X-Ray, app logs → $RT_VENDED_LG)."
+
+  # --- 4d-4: Sync OTEL_RESOURCE_ATTRIBUTES with the now-known runtime id ---
+  # ENV_VARS was built before the runtime existed, so OTEL_RESOURCE_ATTRIBUTES
+  # couldn't include aws.log.group.names (needs the runtime id). Re-apply the env
+  # with the per-runtime log group so app logs + spans associate to this agent's
+  # own group in the GenAI Observability console. Idempotent; skipped if the env
+  # already carries the correct value (avoids a redundant runtime update/READY
+  # wait on repeat deploys).
+  RT_DEFAULT_LG="/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}-DEFAULT"
+  DESIRED_RESATTR="service.name=${RUNTIME_NAME},aws.log.group.names=${RT_DEFAULT_LG}"
+  CURRENT_RESATTR=$(aws bedrock-agentcore-control get-agent-runtime \
+    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --query "environmentVariables.OTEL_RESOURCE_ATTRIBUTES" --output text 2>/dev/null || echo "")
+  if [ "$CURRENT_RESATTR" != "$DESIRED_RESATTR" ]; then
+    echo "  [4d-4] Syncing OTEL_RESOURCE_ATTRIBUTES with runtime log group..."
+    SYNCED_ENV=$(printf '%s' "$ENV_VARS" | python3 -c "
+import sys, json
+env = json.load(sys.stdin)
+env['OTEL_RESOURCE_ATTRIBUTES'] = '$DESIRED_RESATTR'
+print(json.dumps(env))
+")
+    aws bedrock-agentcore-control update-agent-runtime \
+      --agent-runtime-id "$RUNTIME_ID" \
+      --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"$AGENTCORE_ECR_URI:latest\"}}" \
+      --role-arn "$ROLE_ARN" \
+      --network-configuration '{"networkMode":"PUBLIC"}' \
+      --environment-variables "$SYNCED_ENV" \
+      --region "$REGION" >/dev/null 2>&1 \
+      && echo "  OTEL_RESOURCE_ATTRIBUTES synced." \
+      || echo "  WARNING: resource-attr sync failed (tracing still works via aws/spans)."
+  else
+    echo "  [4d-4] OTEL_RESOURCE_ATTRIBUTES already correct — skipping."
   fi
 
   # --- 4e: Update ECS task with AgentCore env vars ---
