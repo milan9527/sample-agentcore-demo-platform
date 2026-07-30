@@ -1129,6 +1129,114 @@ print(json.dumps(env))
     echo "  [4d-4] OTEL_RESOURCE_ATTRIBUTES already correct — skipping."
   fi
 
+  # --- 4d-5: Ensure an online evaluation config with the CORRECT data source ---
+  # AgentCore Evaluation scores completed sessions. The data source MUST point at
+  # where our spans actually land, else the eval engine discovers 0 sessions and
+  # produces no results (silent — the job/config shows ACTIVE/COMPLETED but empty).
+  #   * Spans go to the SHARED `aws/spans` log group (container ADOT default;
+  #     the per-agent `/aws/bedrock-agentcore/runtimes/<id>-DEFAULT` `spans`
+  #     stream stays empty unless UNIFIED_TRACES_DESTINATION_ENABLED=true).
+  #   * service.name = OTEL_SERVICE_NAME = ${RUNTIME_NAME} (NO ".DEFAULT" suffix;
+  #     the {RuntimeName}.DEFAULT convention does NOT match our spans).
+  # A wrong data source (per-agent DEFAULT group + "<name>.DEFAULT" service) is
+  # the classic "评估看不到结果" cause. Idempotent: reuse the config if present,
+  # else create it; always reconcile the data source. Non-fatal on error.
+  echo "  [4d-5] Ensuring online evaluation config (data source: aws/spans + ${RUNTIME_NAME})..."
+  EVAL_ROLE_NAME="agentcore-eval-role-${STACK_NAME}"
+  EVAL_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EVAL_ROLE_NAME}"
+  EVAL_CFG_NAME="${STACK_NAME}_online_eval"
+  EVAL_DS="{\"cloudWatchLogs\":{\"logGroupNames\":[\"aws/spans\"],\"serviceNames\":[\"${RUNTIME_NAME}\"]}}"
+  EVAL_RULE='{"samplingConfig":{"samplingPercentage":100.0},"sessionConfig":{"sessionTimeoutMinutes":5}}'
+  EVAL_EVALUATORS='[{"evaluatorId":"Builtin.Helpfulness"},{"evaluatorId":"Builtin.Correctness"},{"evaluatorId":"Builtin.ResponseRelevance"},{"evaluatorId":"Builtin.GoalSuccessRate"},{"evaluatorId":"Builtin.ToolSelectionAccuracy"},{"evaluatorId":"Builtin.ToolParameterAccuracy"}]'
+
+  # Eval execution role — assumed by the AgentCore evaluation service (NOT the
+  # runtime role). Needs Logs Insights read on aws/spans, write to the results
+  # log group, and Bedrock invoke for the LLM-as-judge evaluators.
+  if ! aws iam get-role --role-name "$EVAL_ROLE_NAME" 2>/dev/null >/dev/null; then
+    echo "    Creating eval execution role $EVAL_ROLE_NAME..."
+    aws iam create-role --role-name "$EVAL_ROLE_NAME" \
+      --assume-role-policy-document "{
+        \"Version\":\"2012-10-17\",
+        \"Statement\":[{
+          \"Effect\":\"Allow\",
+          \"Principal\":{\"Service\":\"bedrock-agentcore.amazonaws.com\"},
+          \"Action\":\"sts:AssumeRole\",
+          \"Condition\":{
+            \"StringEquals\":{\"aws:SourceAccount\":\"${ACCOUNT_ID}\"},
+            \"ArnLike\":{\"aws:SourceArn\":[
+              \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:evaluator/*\",
+              \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:online-evaluation-config/*\",
+              \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:batch-evaluate/*\"
+            ]}
+          }
+        }]
+      }" \
+      --description "AgentCore Evaluation execution role ($STACK_NAME)" >/dev/null 2>&1 || true
+  fi
+  aws iam put-role-policy --role-name "$EVAL_ROLE_NAME" --policy-name "eval-permissions-${STACK_NAME}" \
+    --policy-document "{
+      \"Version\":\"2012-10-17\",
+      \"Statement\":[
+        {\"Effect\":\"Allow\",\"Action\":[\"logs:StartQuery\",\"logs:GetQueryResults\",\"logs:DescribeLogGroups\"],\"Resource\":\"*\"},
+        {\"Effect\":\"Allow\",\"Action\":[\"logs:DescribeIndexPolicies\",\"logs:PutIndexPolicy\"],\"Resource\":[\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:aws/spans\",\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:aws/spans:*\"]},
+        {\"Effect\":\"Allow\",\"Action\":[\"logs:CreateLogGroup\",\"logs:CreateLogStream\",\"logs:PutLogEvents\"],\"Resource\":\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/evaluations/*\"},
+        {\"Effect\":\"Allow\",\"Action\":[\"bedrock:InvokeModel\",\"bedrock:InvokeModelWithResponseStream\"],\"Resource\":[\"arn:aws:bedrock:*::foundation-model/*\",\"arn:aws:bedrock:*:${ACCOUNT_ID}:inference-profile/*\"]}
+      ]
+    }" >/dev/null 2>&1 || true
+
+  # Find an existing config for THIS runtime — match either by our canonical name
+  # OR by any config whose data-source serviceNames references this runtime
+  # (covers a config created earlier by hand, incl. the wrong "<name>.DEFAULT"
+  # form). Matching by service adopts it instead of creating a duplicate, which
+  # would double-score every session. Falls back to name-only if the enumeration
+  # can't read data sources.
+  EVAL_CFG_ID=$(aws bedrock-agentcore-control list-online-evaluation-configs --region "$REGION" --output json 2>/dev/null \
+    | RUNTIME_NAME="$RUNTIME_NAME" EVAL_CFG_NAME="$EVAL_CFG_NAME" REGION="$REGION" python3 -c "
+import sys, json, os, subprocess
+want_svc = {os.environ['RUNTIME_NAME'], os.environ['RUNTIME_NAME'] + '.DEFAULT'}
+want_name = os.environ['EVAL_CFG_NAME']; region = os.environ['REGION']
+try:
+    cfgs = json.load(sys.stdin).get('onlineEvaluationConfigs', [])
+except Exception:
+    cfgs = []
+by_name = ''
+for c in cfgs:
+    cid = c.get('onlineEvaluationConfigId', '')
+    if c.get('onlineEvaluationConfigName') == want_name:
+        by_name = cid
+    try:
+        d = json.loads(subprocess.check_output([
+            'aws','bedrock-agentcore-control','get-online-evaluation-config',
+            '--online-evaluation-config-id', cid, '--region', region, '--output','json'],
+            stderr=subprocess.DEVNULL))
+        svcs = set(d.get('dataSourceConfig', {}).get('cloudWatchLogs', {}).get('serviceNames', []))
+        if svcs & want_svc:
+            print(cid); sys.exit(0)
+    except Exception:
+        pass
+print(by_name)
+" 2>/dev/null || echo "")
+  if [ -z "$EVAL_CFG_ID" ] || [ "$EVAL_CFG_ID" = "None" ]; then
+    echo "    Creating online eval config $EVAL_CFG_NAME..."
+    aws bedrock-agentcore-control create-online-evaluation-config --region "$REGION" \
+      --online-evaluation-config-name "$EVAL_CFG_NAME" \
+      --description "Online eval for ${RUNTIME_NAME} (data source: aws/spans + ${RUNTIME_NAME})" \
+      --rule "$EVAL_RULE" \
+      --data-source-config "$EVAL_DS" \
+      --evaluators "$EVAL_EVALUATORS" \
+      --evaluation-execution-role-arn "$EVAL_ROLE_ARN" \
+      --enable-on-create >/dev/null 2>&1 \
+      && echo "    Online eval config created (ENABLED)." \
+      || echo "    NOTE: create online eval config failed (may need IAM propagation; re-run deploy)."
+  else
+    echo "    Reconciling data source on existing config $EVAL_CFG_ID..."
+    aws bedrock-agentcore-control update-online-evaluation-config --region "$REGION" \
+      --online-evaluation-config-id "$EVAL_CFG_ID" \
+      --data-source-config "$EVAL_DS" >/dev/null 2>&1 \
+      && echo "    Data source reconciled → aws/spans + ${RUNTIME_NAME}." \
+      || echo "    NOTE: update online eval config failed (non-fatal)."
+  fi
+
   # --- 4e: Update ECS task with AgentCore env vars ---
   echo "  [4e] Enabling AgentCore mode in ECS task..."
 
