@@ -91,7 +91,10 @@ async function handleInvocations(
   });
 
   try {
-    for await (const event of runAgent(payload)) {
+    // Pass the inbound HTTP headers so OTEL can extract any forwarded trace
+    // context (traceparent / X-Amzn-Trace-Id) and parent our spans on the
+    // platform's AgentCore.Runtime.Invoke span → one connected trace per turn.
+    for await (const event of runAgent(payload, req.headers as Record<string, unknown>)) {
       res.write(`data: ${JSON.stringify(event)}\n\n`);
     }
   } catch (err) {
