@@ -14,7 +14,7 @@ import { syncWorkspaceToS3 } from './workspace-sync.js';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import type { AgentPayload, AgentEvent, ContentBlock } from './types.js';
-import { beginInvocation, type InvocationTrace } from './otel.js';
+import { beginInvocation, parentContextFromHeaders, type InvocationTrace } from './otel.js';
 
 const DEFAULT_TOOLS = [
   'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -275,12 +275,19 @@ function extractAndUploadDiff(bucket: string, prefix: string): void {
 // Agent execution
 // ---------------------------------------------------------------------------
 
-export async function* runAgent(payload: AgentPayload): AsyncGenerator<AgentEvent> {
+export async function* runAgent(
+  payload: AgentPayload,
+  requestHeaders?: Record<string, unknown>,
+): AsyncGenerator<AgentEvent> {
   // One OTEL invocation trace per turn. Created up front so PreToolUse/PostToolUse
   // hooks (registered below) can attach tool spans to it. Session correlation
   // uses the AgentCore session id (chat_session_id / session_id from backend).
+  // If the platform forwarded a trace context (traceparent/X-Amzn-Trace-Id),
+  // parent our root span on it so the platform's AgentCore.Runtime.Invoke span
+  // and our spans form ONE connected trace instead of two disconnected roots.
   const otelSessionId = payload.chat_session_id ?? payload.session_id ?? 'unknown-session';
-  const inv = beginInvocation(otelSessionId, payload.prompt);
+  const parentCtx = parentContextFromHeaders(requestHeaders);
+  const inv = beginInvocation(otelSessionId, payload.prompt, parentCtx);
 
   const baseOptions: Record<string, unknown> = {
     systemPrompt: payload.system_prompt ?? undefined,
