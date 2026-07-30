@@ -998,6 +998,14 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   echo "  [4d] Creating/updating AgentCore Runtime..."
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME"
   RUNTIME_NAME="${STACK_NAME}Runtime"
+  # The OTEL service.name our container reports MUST match the identity the
+  # platform's own auto-instrumented `AgentCore.Runtime.Invoke` span uses,
+  # otherwise the GenAI Observability console groups one turn under TWO agents
+  # (= two "sessions" for a single utterance). For a runtime the documented
+  # convention is "<runtime-name>.<endpoint-name>" = "${RUNTIME_NAME}.DEFAULT"
+  # (DEFAULT is the qualifier). Used for OTEL_SERVICE_NAME, the resource-attr
+  # service.name, AND the eval data-source serviceNames — all three in lockstep.
+  SERVICE_NAME="${RUNTIME_NAME}.DEFAULT"
 
   # Build environment variables JSON.
   # CLAUDE_CODE_DISABLE_THINKING=1: Opus 4.8 (and other newer models) reject the
@@ -1016,7 +1024,7 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   # OTEL_RESOURCE_ATTRIBUTES carries the per-agent log group so spans/logs land
   # in /aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT (id filled in after
   # the runtime exists — see the post-create env sync below).
-  ENV_VARS="$ENV_VARS,\"AGENT_OBSERVABILITY_ENABLED\":\"true\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/protobuf\",\"OTEL_SERVICE_NAME\":\"${RUNTIME_NAME}\",\"OTEL_RESOURCE_ATTRIBUTES\":\"service.name=${RUNTIME_NAME}\""
+  ENV_VARS="$ENV_VARS,\"AGENT_OBSERVABILITY_ENABLED\":\"true\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/protobuf\",\"OTEL_SERVICE_NAME\":\"${SERVICE_NAME}\",\"OTEL_RESOURCE_ATTRIBUTES\":\"service.name=${SERVICE_NAME}\""
   if [ -n "$BEDROCK_AK" ] && [ -n "$BEDROCK_SK" ]; then
     ENV_VARS="$ENV_VARS,\"AWS_ACCESS_KEY_ID\":\"$BEDROCK_AK\",\"AWS_SECRET_ACCESS_KEY\":\"$BEDROCK_SK\""
   fi
@@ -1104,7 +1112,7 @@ print(','.join([x.get('platform',{}).get('architecture','') for x in m.get('mani
   # already carries the correct value (avoids a redundant runtime update/READY
   # wait on repeat deploys).
   RT_DEFAULT_LG="/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}-DEFAULT"
-  DESIRED_RESATTR="service.name=${RUNTIME_NAME},aws.log.group.names=${RT_DEFAULT_LG}"
+  DESIRED_RESATTR="service.name=${SERVICE_NAME},aws.log.group.names=${RT_DEFAULT_LG}"
   CURRENT_RESATTR=$(aws bedrock-agentcore-control get-agent-runtime \
     --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
     --query "environmentVariables.OTEL_RESOURCE_ATTRIBUTES" --output text 2>/dev/null || echo "")
@@ -1136,16 +1144,23 @@ print(json.dumps(env))
   #   * Spans go to the SHARED `aws/spans` log group (container ADOT default;
   #     the per-agent `/aws/bedrock-agentcore/runtimes/<id>-DEFAULT` `spans`
   #     stream stays empty unless UNIFIED_TRACES_DESTINATION_ENABLED=true).
-  #   * service.name = OTEL_SERVICE_NAME = ${RUNTIME_NAME} (NO ".DEFAULT" suffix;
-  #     the {RuntimeName}.DEFAULT convention does NOT match our spans).
-  # A wrong data source (per-agent DEFAULT group + "<name>.DEFAULT" service) is
-  # the classic "评估看不到结果" cause. Idempotent: reuse the config if present,
+  #   * service.name = OTEL_SERVICE_NAME = ${SERVICE_NAME} (the "${RUNTIME_NAME}
+  #     .DEFAULT" form — matches the identity the platform's own
+  #     AgentCore.Runtime.Invoke span uses, so one turn stays ONE session in the
+  #     console AND the eval filter matches. Earlier we used the bare
+  #     ${RUNTIME_NAME}: eval still worked, but the console then showed one turn
+  #     as TWO sessions because the platform span used ".DEFAULT" and ours didn't).
+  # A data source whose serviceNames don't match the span service.name is the
+  # classic "评估看不到结果" cause. Idempotent: reuse the config if present,
   # else create it; always reconcile the data source. Non-fatal on error.
-  echo "  [4d-5] Ensuring online evaluation config (data source: aws/spans + ${RUNTIME_NAME})..."
+  echo "  [4d-5] Ensuring online evaluation config (data source: aws/spans + ${SERVICE_NAME})..."
   EVAL_ROLE_NAME="agentcore-eval-role-${STACK_NAME}"
   EVAL_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EVAL_ROLE_NAME}"
   EVAL_CFG_NAME="${STACK_NAME}_online_eval"
-  EVAL_DS="{\"cloudWatchLogs\":{\"logGroupNames\":[\"aws/spans\"],\"serviceNames\":[\"${RUNTIME_NAME}\"]}}"
+  # serviceNames MUST match the container's OTEL service.name (= ${SERVICE_NAME},
+  # the ".DEFAULT" form), else the eval engine filters on a name no span carries
+  # and discovers 0 sessions.
+  EVAL_DS="{\"cloudWatchLogs\":{\"logGroupNames\":[\"aws/spans\"],\"serviceNames\":[\"${SERVICE_NAME}\"]}}"
   EVAL_RULE='{"samplingConfig":{"samplingPercentage":100.0},"sessionConfig":{"sessionTimeoutMinutes":5}}'
   EVAL_EVALUATORS='[{"evaluatorId":"Builtin.Helpfulness"},{"evaluatorId":"Builtin.Correctness"},{"evaluatorId":"Builtin.ResponseRelevance"},{"evaluatorId":"Builtin.GoalSuccessRate"},{"evaluatorId":"Builtin.ToolSelectionAccuracy"},{"evaluatorId":"Builtin.ToolParameterAccuracy"}]'
 
@@ -1220,7 +1235,7 @@ print(by_name)
     echo "    Creating online eval config $EVAL_CFG_NAME..."
     aws bedrock-agentcore-control create-online-evaluation-config --region "$REGION" \
       --online-evaluation-config-name "$EVAL_CFG_NAME" \
-      --description "Online eval for ${RUNTIME_NAME} (data source: aws/spans + ${RUNTIME_NAME})" \
+      --description "Online eval for ${RUNTIME_NAME} (data source: aws/spans + ${SERVICE_NAME})" \
       --rule "$EVAL_RULE" \
       --data-source-config "$EVAL_DS" \
       --evaluators "$EVAL_EVALUATORS" \
@@ -1233,7 +1248,7 @@ print(by_name)
     aws bedrock-agentcore-control update-online-evaluation-config --region "$REGION" \
       --online-evaluation-config-id "$EVAL_CFG_ID" \
       --data-source-config "$EVAL_DS" >/dev/null 2>&1 \
-      && echo "    Data source reconciled → aws/spans + ${RUNTIME_NAME}." \
+      && echo "    Data source reconciled → aws/spans + ${SERVICE_NAME}." \
       || echo "    NOTE: update online eval config failed (non-fatal)."
   fi
 

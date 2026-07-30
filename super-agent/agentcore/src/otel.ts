@@ -21,7 +21,16 @@
  * harness installs in-memory providers first.
  */
 
-import { trace, context, type Span, type Tracer, SpanStatusCode } from '@opentelemetry/api';
+import {
+  trace,
+  context,
+  propagation,
+  ROOT_CONTEXT,
+  type Span,
+  type Tracer,
+  type Context,
+  SpanStatusCode,
+} from '@opentelemetry/api';
 import { logs, type Logger } from '@opentelemetry/api-logs';
 
 // The managed AgentCore Evaluate API only accepts spans whose instrumentation
@@ -66,6 +75,40 @@ function getLogger(): Logger {
   return logs.getLogger(SCOPE);
 }
 
+/**
+ * Extract an OTEL parent Context from the inbound invocation's HTTP headers.
+ *
+ * AgentCore's platform emits its own `AgentCore.Runtime.Invoke` span and can
+ * forward the W3C `traceparent` (and X-Ray `X-Amzn-Trace-Id`) into the
+ * container. Without extracting it, our root span starts a NEW trace, so one
+ * turn shows as two disconnected traces (platform span + our span) under the
+ * same session. Extracting it makes our `agent.invocation` a CHILD of the
+ * platform span — one connected trace per turn.
+ *
+ * ADOT's `register` hook installs the global propagator (W3C + X-Ray), so
+ * `propagation.extract` understands both header formats. Returns undefined when
+ * no usable trace context is present (→ caller starts a fresh root, today's
+ * behavior). Never throws.
+ */
+export function parentContextFromHeaders(headers: Record<string, unknown> | undefined): Context | undefined {
+  if (!OBSERVABILITY_ENABLED || !headers) return undefined;
+  try {
+    // Normalize to a lowercase string→string carrier (getter is case-sensitive).
+    const carrier: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+      if (v == null) continue;
+      carrier[k.toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);
+    }
+    if (!carrier.traceparent && !carrier['x-amzn-trace-id']) return undefined;
+    const ctx = propagation.extract(ROOT_CONTEXT, carrier);
+    const sc = trace.getSpanContext(ctx);
+    // Only use it if extraction yielded a valid remote span context.
+    return sc && sc.traceId ? ctx : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Emit an OTEL log record (used as an "event" — the contract's event bodies). */
 function emitEvent(name: string, body: unknown, span?: Span): void {
   try {
@@ -104,14 +147,19 @@ export interface InvocationTrace {
  * the three contract attributes. Returns a no-op handle when observability is
  * off. Never throws — telemetry failures must not affect the agent.
  */
-export function beginInvocation(sessionId: string, prompt: string): InvocationTrace {
+export function beginInvocation(sessionId: string, prompt: string, parentCtx?: Context): InvocationTrace {
   if (!OBSERVABILITY_ENABLED) return NOOP_TRACE;
 
   let span: Span;
   let rootCtx: ReturnType<typeof trace.setSpan>;
   try {
-    span = getTracer().startSpan('agent.invocation');
-    rootCtx = trace.setSpan(context.active(), span);
+    // If the caller extracted a parent context from the inbound headers (the
+    // platform's AgentCore.Runtime.Invoke span), start our root INSIDE it so the
+    // whole turn is one connected trace. Otherwise start a fresh root (the span
+    // gets its own trace — the pre-propagation behavior).
+    const startCtx = parentCtx ?? context.active();
+    span = getTracer().startSpan('agent.invocation', undefined, startCtx);
+    rootCtx = trace.setSpan(startCtx, span);
 
     // --- Agent Traces UI rendering (gen_ai.* semantic conventions) ---
     // gen_ai.operation.name categorizes the span so the UI renders it as an
