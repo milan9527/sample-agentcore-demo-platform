@@ -83,7 +83,8 @@ function getLogger(): Logger {
  * container. Without extracting it, our root span starts a NEW trace, so one
  * turn shows as two disconnected traces (platform span + our span) under the
  * same session. Extracting it makes our `agent.invocation` a CHILD of the
- * platform span — one connected trace per turn.
+ * platform span — one connected trace per turn (the console groups a session's
+ * work into one trace this way).
  *
  * ADOT's `register` hook installs the global propagator (W3C + X-Ray), so
  * `propagation.extract` understands both header formats. Returns undefined when
@@ -138,8 +139,74 @@ export interface InvocationTrace {
   recordTool(name: string, input: unknown, result: unknown, callId?: string): void;
   /** Attach a tool's result to its already-recorded span (matched by callId). */
   recordToolResult(callId: string, result: unknown): void;
-  /** Finalize with the assistant's final answer + optional token usage. */
-  end(answer: string, opts?: { isError?: boolean; tokenUsage?: Record<string, number> }): void;
+  /**
+   * Finalize with the assistant's final answer + optional model / token usage.
+   * When a model and/or usage is present, ALSO emits a terminal `chat {model}`
+   * child span carrying the token counters + model — the LLM client span the
+   * AgentCore GenAI console reads model + token metrics from. The invoke_agent
+   * span alone does not populate those columns.
+   */
+  end(answer: string, opts?: { isError?: boolean; model?: string; numTurns?: number; tokenUsage?: Record<string, number> }): void;
+}
+
+/** Provider constant for the gen_ai.system / gen_ai.provider.name attributes. */
+const PROVIDER = 'anthropic';
+
+/**
+ * Stamp the four aws/spans token counters the AgentCore console sums. These
+ * `gen_ai.usage.*` keys drive the SESSION/space-level token metrics
+ * (ApplicationSignals InputTokens/OutputTokens); the platform's span processor
+ * also derives `aws.genai.token_count_total` from them. The SDK's
+ * `cache_creation_input_tokens` maps to the convention's `cache_write` counter.
+ * `usage` is our TokenUsage shape (see types.ts). Missing values default to 0.
+ *
+ * NOTE on the trace-detail "Tokens" column: it stays 0 for our spans and that
+ * is expected/unavoidable here. That per-trace rollup only counts spans the
+ * console recognizes as LLM `chat` calls, and recognition is gated on the
+ * instrumentation SCOPE. Our scope `openinference.instrumentation
+ * .claude_agent_sdk` is not on AWS's recognized list (strands.telemetry.tracer
+ * / *.langchain), so our chat span is excluded from the rollup no matter which
+ * token keys it carries. We keep this scope because the managed Evaluate API
+ * (GoalSuccessRate) requires it. Use the SESSION/space token metrics for usage
+ * — those work. See git history / the OTEL investigation for the full analysis.
+ */
+function stampUsage(span: Span, usage: Record<string, number>): void {
+  span.setAttribute('gen_ai.usage.input_tokens', Math.trunc(usage.input_tokens ?? 0));
+  span.setAttribute('gen_ai.usage.output_tokens', Math.trunc(usage.output_tokens ?? 0));
+  span.setAttribute('gen_ai.usage.cache_read_input_tokens', Math.trunc(usage.cache_read_input_tokens ?? 0));
+  span.setAttribute('gen_ai.usage.cache_write_input_tokens', Math.trunc(usage.cache_creation_input_tokens ?? 0));
+}
+
+/**
+ * Emit one terminal `chat {model}` LLM span as a child of the invocation.
+ *
+ * The Claude Agent SDK drives Bedrock through a subprocess, so no per-LLM-call
+ * span is captured for free — but the AgentCore GenAI console reads its model
+ * and token columns from a span with `gen_ai.operation.name=chat`. Without this
+ * span the dashboard shows no model / no tokens even though invoke_agent carries
+ * them. The SDK reports usage once per query (ResultMessage.usage, summed across
+ * turns), so this is a single honest aggregate span per turn. No-op when neither
+ * model nor usage is present.
+ */
+function emitChatSpan(
+  sessionId: string,
+  parentCtx: Context,
+  opts?: { model?: string; numTurns?: number; tokenUsage?: Record<string, number> },
+): void {
+  if (!opts?.model && !opts?.tokenUsage) return;
+  try {
+    const model = opts.model ?? 'unknown';
+    const chatSpan = getTracer().startSpan(`chat ${model}`, undefined, parentCtx);
+    chatSpan.setAttribute('gen_ai.operation.name', 'chat');
+    chatSpan.setAttribute('gen_ai.system', PROVIDER);
+    chatSpan.setAttribute('gen_ai.provider.name', PROVIDER);
+    chatSpan.setAttribute('gen_ai.request.model', model);
+    chatSpan.setAttribute('session.id', sessionId);
+    if (opts.tokenUsage) stampUsage(chatSpan, opts.tokenUsage);
+    if (opts.numTurns != null) chatSpan.setAttribute('gen_ai.agent.num_turns', Math.trunc(opts.numTurns));
+    chatSpan.setStatus({ code: SpanStatusCode.OK });
+    chatSpan.end();
+  } catch { /* telemetry must never throw into the agent path */ }
 }
 
 /**
@@ -186,6 +253,11 @@ export function beginInvocation(sessionId: string, prompt: string, parentCtx?: C
     // Open tool spans awaiting their result (keyed by the SDK tool_use id).
     // Kept open so a later tool_result can attach; closed in end() otherwise.
     const openToolSpans = new Map<string, Span>();
+    // Guard against a double end() (e.g. a retry path calling end() twice on the
+    // same handle): the first end() finalizes; later ones are ignored so we never
+    // re-close the span, overwrite good token totals with zeros, or emit a
+    // duplicate chat span.
+    let ended = false;
   return {
     recordTool(name, input, result, callId) {
       try {
@@ -236,6 +308,8 @@ export function beginInvocation(sessionId: string, prompt: string, parentCtx?: C
       } catch { /* ignore */ }
     },
     end(answer, opts) {
+      if (ended) return;
+      ended = true;
       try {
         // Close any tool spans whose result never arrived.
         for (const ts of openToolSpans.values()) {
@@ -248,11 +322,14 @@ export function beginInvocation(sessionId: string, prompt: string, parentCtx?: C
         span.setAttribute('output.value', answer);        // OpenInference
         span.setAttribute('llm.output_messages.0.message.role', 'assistant');
         span.setAttribute('llm.output_messages.0.message.content', answer);
-        if (opts?.tokenUsage) {
-          if (opts.tokenUsage.input_tokens != null) span.setAttribute('gen_ai.usage.input_tokens', opts.tokenUsage.input_tokens);
-          if (opts.tokenUsage.output_tokens != null) span.setAttribute('gen_ai.usage.output_tokens', opts.tokenUsage.output_tokens);
-        }
+        // Stamp model + usage on the invoke_agent span too (queryable there),
+        // and emit the dedicated `chat` LLM span the console reads for its
+        // model/token columns.
+        if (opts?.model) span.setAttribute('gen_ai.request.model', opts.model);
+        if (opts?.numTurns != null) span.setAttribute('gen_ai.agent.num_turns', opts.numTurns);
+        if (opts?.tokenUsage) stampUsage(span, opts.tokenUsage);
         span.setStatus({ code: opts?.isError ? SpanStatusCode.ERROR : SpanStatusCode.OK });
+        emitChatSpan(sessionId, rootCtx, opts);
       } catch { /* ignore */ } finally {
         try { span.end(); } catch { /* ignore */ }
       }

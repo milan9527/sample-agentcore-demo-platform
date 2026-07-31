@@ -284,7 +284,8 @@ export async function* runAgent(
   // uses the AgentCore session id (chat_session_id / session_id from backend).
   // If the platform forwarded a trace context (traceparent/X-Amzn-Trace-Id),
   // parent our root span on it so the platform's AgentCore.Runtime.Invoke span
-  // and our spans form ONE connected trace instead of two disconnected roots.
+  // and our spans form ONE connected trace (the console groups a session's work
+  // into one trace this way) instead of two disconnected roots.
   const otelSessionId = payload.chat_session_id ?? payload.session_id ?? 'unknown-session';
   const parentCtx = parentContextFromHeaders(requestHeaders);
   const inv = beginInvocation(otelSessionId, payload.prompt, parentCtx);
@@ -394,17 +395,19 @@ export async function* runAgent(
   // OTEL: one root span per invocation (= one trace per turn), carrying the
   // SAES/AgentCore-Evaluation contract fields. Session correlation uses the
   // AgentCore session id (chat_session_id / session_id from the backend).
-  // Strategy: try Claude Code session resume first (fast, native history).
-  // If resume fails (microVM was recycled), fallback to history-injected prompt.
-  if (payload.session_id) {
-    try {
-      yield* runTraced(inv, runWithOptions(payload.prompt, { ...baseOptions, resume: payload.session_id }));
-      return;
-    } catch (err) {
-      console.log(`[agent-runner] Session resume failed (${err}), falling back to history injection`);
-    }
-  }
-
+  //
+  // Conversation continuity comes from history injection (buildContextualPrompt
+  // replays payload.history), NOT Claude Code's native `resume`. We deliberately
+  // do NOT attempt resume first: AgentCore microVMs are frequently recycled
+  // between turns, so `resume: <session_id>` almost always fails with "Claude
+  // Code process exited with code 1", and the old try/resume-then-fallback path
+  // (a) wasted a full failed invocation per turn and (b) polluted telemetry —
+  // the failed run's runTraced.finally called inv.end() (error, 0 tokens) and
+  // closed the single root span, so the successful fallback's real token usage
+  // never landed on `agent.invocation` (it showed 0 every multi-turn turn).
+  // History injection is one clean run: one agent.invocation span with the
+  // correct model + token totals, one chat span. See git history for the
+  // resume path if native session continuity is ever needed again.
   const prompt = buildContextualPrompt(payload);
   yield* runTraced(inv, runWithOptions(prompt, baseOptions));
 }
@@ -423,16 +426,26 @@ async function* runTraced(
 ): AsyncGenerator<AgentEvent> {
   let finalAnswer = '';
   let isError = false;
+  let model: string | undefined;
+  let numTurns: number | undefined;
   let tokenUsage: Record<string, number> | undefined;
   try {
     for await (const event of stream) {
+      // The model id surfaces on assistant events (msg.message.model); capture
+      // the latest so the invoke_agent / chat spans can report it.
+      if (event.type === 'assistant' && event.model) model = event.model;
       if (event.type === 'result') {
         if (typeof event.result === 'string') finalAnswer = event.result;
         if (event.is_error) isError = true;
+        if (event.num_turns != null) numTurns = event.num_turns;
         if (event.token_usage) {
+          // Forward the full usage (incl. cache read/write) so the chat span
+          // carries all four counters the console sums — not just in/out.
           tokenUsage = {
             input_tokens: event.token_usage.input_tokens,
             output_tokens: event.token_usage.output_tokens,
+            cache_read_input_tokens: event.token_usage.cache_read_input_tokens,
+            cache_creation_input_tokens: event.token_usage.cache_creation_input_tokens,
           };
         }
       }
@@ -443,7 +456,7 @@ async function* runTraced(
     finalAnswer = finalAnswer || `error: ${err instanceof Error ? err.message : String(err)}`;
     throw err;
   } finally {
-    inv.end(finalAnswer, { isError, tokenUsage });
+    inv.end(finalAnswer, { isError, model, numTurns, tokenUsage });
   }
 }
 
