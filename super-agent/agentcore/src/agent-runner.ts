@@ -423,16 +423,26 @@ async function* runTraced(
 ): AsyncGenerator<AgentEvent> {
   let finalAnswer = '';
   let isError = false;
+  let model: string | undefined;
+  let numTurns: number | undefined;
   let tokenUsage: Record<string, number> | undefined;
   try {
     for await (const event of stream) {
+      // The model id surfaces on assistant events (msg.message.model); capture
+      // the latest so the invoke_agent / chat spans can report it.
+      if (event.type === 'assistant' && event.model) model = event.model;
       if (event.type === 'result') {
         if (typeof event.result === 'string') finalAnswer = event.result;
         if (event.is_error) isError = true;
+        if (event.num_turns != null) numTurns = event.num_turns;
         if (event.token_usage) {
+          // Forward the full usage (incl. cache read/write) so the chat span
+          // carries all four counters the console sums — not just in/out.
           tokenUsage = {
             input_tokens: event.token_usage.input_tokens,
             output_tokens: event.token_usage.output_tokens,
+            cache_read_input_tokens: event.token_usage.cache_read_input_tokens,
+            cache_creation_input_tokens: event.token_usage.cache_creation_input_tokens,
           };
         }
       }
@@ -443,7 +453,7 @@ async function* runTraced(
     finalAnswer = finalAnswer || `error: ${err instanceof Error ? err.message : String(err)}`;
     throw err;
   } finally {
-    inv.end(finalAnswer, { isError, tokenUsage });
+    inv.end(finalAnswer, { isError, model, numTurns, tokenUsage });
   }
 }
 
