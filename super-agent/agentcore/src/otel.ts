@@ -83,7 +83,8 @@ function getLogger(): Logger {
  * container. Without extracting it, our root span starts a NEW trace, so one
  * turn shows as two disconnected traces (platform span + our span) under the
  * same session. Extracting it makes our `agent.invocation` a CHILD of the
- * platform span — one connected trace per turn.
+ * platform span — one connected trace per turn (the console groups a session's
+ * work into one trace this way).
  *
  * ADOT's `register` hook installs the global propagator (W3C + X-Ray), so
  * `propagation.extract` understands both header formats. Returns undefined when
@@ -152,9 +153,22 @@ export interface InvocationTrace {
 const PROVIDER = 'anthropic';
 
 /**
- * Stamp the four aws/spans token counters the AgentCore console sums. The SDK's
+ * Stamp the four aws/spans token counters the AgentCore console sums. These
+ * `gen_ai.usage.*` keys drive the SESSION/space-level token metrics
+ * (ApplicationSignals InputTokens/OutputTokens); the platform's span processor
+ * also derives `aws.genai.token_count_total` from them. The SDK's
  * `cache_creation_input_tokens` maps to the convention's `cache_write` counter.
  * `usage` is our TokenUsage shape (see types.ts). Missing values default to 0.
+ *
+ * NOTE on the trace-detail "Tokens" column: it stays 0 for our spans and that
+ * is expected/unavoidable here. That per-trace rollup only counts spans the
+ * console recognizes as LLM `chat` calls, and recognition is gated on the
+ * instrumentation SCOPE. Our scope `openinference.instrumentation
+ * .claude_agent_sdk` is not on AWS's recognized list (strands.telemetry.tracer
+ * / *.langchain), so our chat span is excluded from the rollup no matter which
+ * token keys it carries. We keep this scope because the managed Evaluate API
+ * (GoalSuccessRate) requires it. Use the SESSION/space token metrics for usage
+ * — those work. See git history / the OTEL investigation for the full analysis.
  */
 function stampUsage(span: Span, usage: Record<string, number>): void {
   span.setAttribute('gen_ai.usage.input_tokens', Math.trunc(usage.input_tokens ?? 0));
@@ -239,6 +253,11 @@ export function beginInvocation(sessionId: string, prompt: string, parentCtx?: C
     // Open tool spans awaiting their result (keyed by the SDK tool_use id).
     // Kept open so a later tool_result can attach; closed in end() otherwise.
     const openToolSpans = new Map<string, Span>();
+    // Guard against a double end() (e.g. a retry path calling end() twice on the
+    // same handle): the first end() finalizes; later ones are ignored so we never
+    // re-close the span, overwrite good token totals with zeros, or emit a
+    // duplicate chat span.
+    let ended = false;
   return {
     recordTool(name, input, result, callId) {
       try {
@@ -289,6 +308,8 @@ export function beginInvocation(sessionId: string, prompt: string, parentCtx?: C
       } catch { /* ignore */ }
     },
     end(answer, opts) {
+      if (ended) return;
+      ended = true;
       try {
         // Close any tool spans whose result never arrived.
         for (const ts of openToolSpans.values()) {
